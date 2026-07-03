@@ -50,6 +50,7 @@
 - 核心功能：新增 `MEALCIRCUIT_HOME`、动态私人设置、完整私人总纲覆盖、`init`、`doctor`、`migrate-data`；迁移使用 SQLite Backup API、完整性检查、逻辑摘要和 SHA-256 文件清单；Web 增加非回环监听门禁、Origin/Host 校验和安全响应头。
 - 数据迁移：真实数据已复制到操作系统私人数据目录，另有迁移前独立备份；源/目标数据库完整性均为 `ok`，表行数一致，核心记录逐行一致，总纲哈希一致，媒体文件可解析；验证后已清除源码目录内的私人副本。
 - 验证：`.\test.ps1` 19 项测试全部通过；`python tools\release_check.py` 零命中；真实服务的 `/`、`/daily`、照片、原材料、食品库和概览页面均返回 200，显示 MealCircuit 且不显示旧品牌，并包含 CSP、`X-Frame-Options`、`X-Content-Type-Options` 和 Referrer Policy。内置浏览器控制因本地运行环境路径错误未能初始化，因此本轮没有完成视觉截图检查。
+- CI 修复：GitHub Windows Runner 会把同一临时目录分别表示为 8.3 短路径和长路径；初始化测试改为使用 `Path.samefile()` 比较文件身份，避免依赖路径字符串表现形式。
 - 仍未实现：未创建远程公开仓库；MealCircuit 的正式商标清查不属于代码验证范围。域名是否可用也不作为本地开源发布门禁。
 - 下一最小任务：在本地 Git 发布门禁通过后，根据用户选定的托管账号创建公开远程仓库；正式商标清查仍需独立完成。
 - 用户用法：先运行 `python -m mealcircuit.agent_cli init` 并填写私人设置；用 `doctor` 查看实际数据位置；日常仍可运行 `.\start.ps1` 并在 Agent 中说“处理 MealCircuit 待办任务”。
