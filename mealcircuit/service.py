@@ -8,6 +8,7 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import BinaryIO
 
+from . import checkins
 from .configuration import load_doctrine, load_settings
 from .db import connect, init_db, row_dict
 from .storage import resolve_data_path, store_data_path, upload_root
@@ -285,35 +286,284 @@ def _record_ids_for_date(conn, record_date: str) -> list[str]:
     ).fetchall()]
 
 
-def _queue_daily_review(conn, record_date: str) -> None:
+def _checkin_versions_for_date(conn, record_date: str) -> dict[str, int]:
+    rows = conn.execute(
+        """SELECT m.module_key,m.version FROM daily_checkin_modules m
+           JOIN daily_checkins c ON c.id=m.checkin_id
+           WHERE c.checkin_date=? AND m.version>0 ORDER BY m.module_key""",
+        (record_date,),
+    ).fetchall()
+    return {row["module_key"]: row["version"] for row in rows}
+
+
+def _queue_daily_review(conn, record_date: str, archive_reason: str = "new_daily_record") -> None:
     timestamp = now()
     source_ids = _record_ids_for_date(conn, record_date)
     source_json = json.dumps(source_ids, ensure_ascii=False)
+    checkin_versions_json = json.dumps(_checkin_versions_for_date(conn, record_date), ensure_ascii=False, sort_keys=True)
     review = conn.execute("SELECT * FROM daily_reviews WHERE review_date=?", (record_date,)).fetchone()
     if review is None:
         conn.execute(
             """INSERT INTO daily_reviews(
-                id,review_date,status,source_record_ids_json,result_version,created_at,updated_at
-            ) VALUES(?,?,?,?,?,?,?)""",
-            (new_id("review"), record_date, "pending", source_json, 0, timestamp, timestamp),
+                id,review_date,status,source_record_ids_json,source_checkin_versions_json,
+                result_version,created_at,updated_at
+            ) VALUES(?,?,?,?,?,?,?,?)""",
+            (new_id("review"), record_date, "pending", source_json, checkin_versions_json, 0, timestamp, timestamp),
         )
         return
     if review["status"] == "completed" and review["result_json"]:
         conn.execute(
             """INSERT INTO daily_review_history(
-                id,review_id,version,source_record_ids_json,result_json,completed_at,archived_at,archive_reason
-            ) VALUES(?,?,?,?,?,?,?,?)""",
+                id,review_id,version,source_record_ids_json,source_checkin_versions_json,
+                result_json,completed_at,archived_at,archive_reason
+            ) VALUES(?,?,?,?,?,?,?,?,?)""",
             (
                 new_id("review_history"), review["id"], review["result_version"],
-                review["source_record_ids_json"], review["result_json"], review["completed_at"], timestamp,
-                "new_daily_record",
+                review["source_record_ids_json"], review["source_checkin_versions_json"],
+                review["result_json"], review["completed_at"], timestamp, archive_reason,
             ),
         )
     conn.execute(
-        """UPDATE daily_reviews SET status='pending',source_record_ids_json=?,result_json=NULL,
+        """UPDATE daily_reviews SET status='pending',source_record_ids_json=?,source_checkin_versions_json=?,result_json=NULL,
            updated_at=?,completed_at=NULL WHERE review_date=?""",
-        (source_json, timestamp, record_date),
+        (source_json, checkin_versions_json, timestamp, record_date),
     )
+
+
+def _validate_checkin_date(value: str) -> str:
+    try:
+        parsed = date.fromisoformat(value)
+    except ValueError as exc:
+        raise ValidationError("日期必须是 YYYY-MM-DD") from exc
+    if parsed > date.today():
+        raise ValidationError("不能填写未来日期的每日状态")
+    return value
+
+
+def checkin_module_settings() -> list[dict]:
+    init_db()
+    with connect() as conn:
+        return [dict(row) for row in conn.execute(
+            "SELECT module_key,enabled,sort_order,frequency,updated_at FROM checkin_module_settings ORDER BY sort_order,module_key"
+        ).fetchall()]
+
+
+def update_checkin_module_settings(items: list[dict]) -> list[dict]:
+    if not isinstance(items, list) or {item.get("module_key") for item in items} != set(checkins.MODULE_BY_KEY):
+        raise ValidationError("模块设置必须完整覆盖五个标准模块")
+    cleaned = []
+    for sort_order, item in enumerate(items):
+        enabled = item.get("enabled")
+        frequency = item.get("frequency")
+        if not isinstance(enabled, bool) or frequency not in {"daily", "optional"}:
+            raise ValidationError("模块设置值无效")
+        cleaned.append((item["module_key"], int(enabled), sort_order, frequency))
+    timestamp = now()
+    init_db()
+    with connect() as conn:
+        for module_key, enabled, sort_order, frequency in cleaned:
+            conn.execute(
+                "UPDATE checkin_module_settings SET enabled=?,sort_order=?,frequency=?,updated_at=? WHERE module_key=?",
+                (enabled, sort_order, frequency, timestamp, module_key),
+            )
+    return checkin_module_settings()
+
+
+def _get_or_create_checkin(conn, checkin_date: str):
+    row = conn.execute("SELECT * FROM daily_checkins WHERE checkin_date=?", (checkin_date,)).fetchone()
+    if row is None:
+        timestamp = now()
+        checkin_id = new_id("checkin")
+        conn.execute(
+            "INSERT INTO daily_checkins(id,checkin_date,created_at,updated_at) VALUES(?,?,?,?)",
+            (checkin_id, checkin_date, timestamp, timestamp),
+        )
+        row = conn.execute("SELECT * FROM daily_checkins WHERE id=?", (checkin_id,)).fetchone()
+    return row
+
+
+def _get_or_create_checkin_module(conn, checkin_date: str, module_key: str):
+    checkins.module_definition(module_key)
+    checkin = _get_or_create_checkin(conn, checkin_date)
+    row = conn.execute(
+        "SELECT * FROM daily_checkin_modules WHERE checkin_id=? AND module_key=?",
+        (checkin["id"], module_key),
+    ).fetchone()
+    if row is None:
+        timestamp = now()
+        module_id = new_id("checkin_module")
+        conn.execute(
+            """INSERT INTO daily_checkin_modules(
+                id,checkin_id,module_key,status,schema_version,version,created_at,updated_at
+            ) VALUES(?,?,?,'not_started',?,0,?,?)""",
+            (module_id, checkin["id"], module_key, checkins.SCHEMA_VERSION, timestamp, timestamp),
+        )
+        row = conn.execute("SELECT * FROM daily_checkin_modules WHERE id=?", (module_id,)).fetchone()
+    return row
+
+
+def _module_payload(row, include_draft: bool = True) -> dict:
+    item = row_dict(row)
+    answers = item.get("answers_json") or {}
+    draft = item.get("draft_json") if include_draft else None
+    item["summary"] = checkins.summarize(item["module_key"], answers, item["status"]) if item["version"] else ""
+    item["has_draft"] = draft is not None
+    item["active_answers"] = draft if draft is not None else answers
+    item["next_question"] = checkins.next_question(item["module_key"], item["active_answers"])
+    item["ready"] = item["next_question"] is None and bool(item["active_answers"])
+    return item
+
+
+def get_checkin_module(checkin_date: str, module_key: str) -> dict:
+    _validate_checkin_date(checkin_date)
+    checkins.module_definition(module_key)
+    init_db()
+    with connect() as conn:
+        row = conn.execute(
+            """SELECT m.* FROM daily_checkin_modules m JOIN daily_checkins c ON c.id=m.checkin_id
+               WHERE c.checkin_date=? AND m.module_key=?""",
+            (checkin_date, module_key),
+        ).fetchone()
+        if row is None:
+            return {
+                "module_key": module_key, "status": "not_started", "answers_json": {}, "draft_json": None,
+                "schema_version": checkins.SCHEMA_VERSION, "version": 0, "summary": "", "has_draft": False,
+                "active_answers": {}, "next_question": checkins.next_question(module_key, {}), "ready": False,
+                "history": [],
+            }
+        payload = _module_payload(row)
+        payload["history"] = [row_dict(item) for item in conn.execute(
+            "SELECT * FROM daily_checkin_module_history WHERE module_id=? ORDER BY version", (row["id"],)
+        ).fetchall()]
+        return payload
+
+
+def get_checkin_state(checkin_date: str) -> dict:
+    _validate_checkin_date(checkin_date)
+    init_db()
+    settings = checkin_module_settings()
+    with connect() as conn:
+        rows = conn.execute(
+            """SELECT m.* FROM daily_checkin_modules m JOIN daily_checkins c ON c.id=m.checkin_id
+               WHERE c.checkin_date=?""", (checkin_date,)
+        ).fetchall()
+    by_key = {row["module_key"]: _module_payload(row) for row in rows}
+    modules = []
+    for setting in settings:
+        module_key = setting["module_key"]
+        item = by_key.get(module_key) or {
+            "module_key": module_key, "status": "not_started", "version": 0, "summary": "",
+            "has_draft": False, "active_answers": {}, "answers_json": {}, "draft_json": None,
+        }
+        modules.append({**setting, **item, **checkins.module_definition(module_key)})
+    due = [item for item in modules if item["enabled"] and item["frequency"] == "daily"]
+    handled = [item for item in due if item["version"] > 0 and item["status"] in {"completed", "skipped"}]
+    return {
+        "date": checkin_date,
+        "modules": modules,
+        "coverage": {
+            "due": len(due), "handled": len(handled),
+            "completed": [item["module_key"] for item in due if item["status"] == "completed" and item["version"]],
+            "skipped": [item["module_key"] for item in due if item["status"] == "skipped" and item["version"]],
+            "missing": [item["module_key"] for item in due if not item["version"]],
+        },
+    }
+
+
+def save_checkin_answer(checkin_date: str, module_key: str, question_id: str, value: object, expected_version: int) -> dict:
+    _validate_checkin_date(checkin_date)
+    init_db()
+    with connect() as conn:
+        row = _get_or_create_checkin_module(conn, checkin_date, module_key)
+        if row["version"] != expected_version:
+            raise ValidationError("答案版本已变化，请刷新页面后重试")
+        current = row_dict(row)
+        active = current.get("draft_json")
+        if active is None:
+            active = dict(current.get("answers_json") or {})
+        question = checkins.question_definition(module_key, question_id, active)
+        active[question_id] = checkins.validate_answer(question, value)
+        active = checkins.prune_answers(module_key, active)
+        status = current["status"] if current["version"] else "in_progress"
+        timestamp = now()
+        conn.execute(
+            "UPDATE daily_checkin_modules SET status=?,draft_json=?,updated_at=? WHERE id=?",
+            (status, json.dumps(active, ensure_ascii=False), timestamp, row["id"]),
+        )
+        conn.execute("UPDATE daily_checkins SET updated_at=? WHERE id=?", (timestamp, row["checkin_id"]))
+    return get_checkin_module(checkin_date, module_key)
+
+
+def complete_checkin_module(checkin_date: str, module_key: str, expected_version: int) -> dict:
+    _validate_checkin_date(checkin_date)
+    init_db()
+    with connect() as conn:
+        row = _get_or_create_checkin_module(conn, checkin_date, module_key)
+        current = row_dict(row)
+        if current["version"] != expected_version:
+            raise ValidationError("答案版本已变化，请刷新页面后重试")
+        if current.get("draft_json") is None:
+            raise ValidationError("没有可提交的问答草稿")
+        answers = checkins.validate_module_answers(module_key, current["draft_json"])
+        timestamp = now()
+        if current["version"] > 0:
+            conn.execute(
+                """INSERT INTO daily_checkin_module_history(
+                    id,module_id,version,status,answers_json,archived_at,archive_reason
+                ) VALUES(?,?,?,?,?,?,?)""",
+                (new_id("checkin_history"), row["id"], current["version"], current["status"],
+                 json.dumps(current.get("answers_json") or {}, ensure_ascii=False), timestamp, "module_updated"),
+            )
+        conn.execute(
+            """UPDATE daily_checkin_modules SET status='completed',answers_json=?,draft_json=NULL,
+               schema_version=?,version=version+1,updated_at=?,completed_at=? WHERE id=?""",
+            (json.dumps(answers, ensure_ascii=False), checkins.SCHEMA_VERSION, timestamp, timestamp, row["id"]),
+        )
+        conn.execute("UPDATE daily_checkins SET updated_at=? WHERE id=?", (timestamp, row["checkin_id"]))
+        _queue_daily_review(conn, checkin_date, "checkin_module_updated")
+    return get_checkin_module(checkin_date, module_key)
+
+
+def skip_checkin_module(checkin_date: str, module_key: str, expected_version: int) -> dict:
+    _validate_checkin_date(checkin_date)
+    init_db()
+    with connect() as conn:
+        row = _get_or_create_checkin_module(conn, checkin_date, module_key)
+        current = row_dict(row)
+        if current["version"] != expected_version:
+            raise ValidationError("答案版本已变化，请刷新页面后重试")
+        timestamp = now()
+        if current["version"] > 0:
+            conn.execute(
+                """INSERT INTO daily_checkin_module_history(
+                    id,module_id,version,status,answers_json,archived_at,archive_reason
+                ) VALUES(?,?,?,?,?,?,?)""",
+                (new_id("checkin_history"), row["id"], current["version"], current["status"],
+                 json.dumps(current.get("answers_json") or {}, ensure_ascii=False), timestamp, "module_skipped"),
+            )
+        conn.execute(
+            """UPDATE daily_checkin_modules SET status='skipped',answers_json=NULL,draft_json=NULL,
+               schema_version=?,version=version+1,updated_at=?,completed_at=? WHERE id=?""",
+            (checkins.SCHEMA_VERSION, timestamp, timestamp, row["id"]),
+        )
+        conn.execute("UPDATE daily_checkins SET updated_at=? WHERE id=?", (timestamp, row["checkin_id"]))
+        _queue_daily_review(conn, checkin_date, "checkin_module_skipped")
+    return get_checkin_module(checkin_date, module_key)
+
+
+def discard_checkin_draft(checkin_date: str, module_key: str, expected_version: int) -> dict:
+    _validate_checkin_date(checkin_date)
+    init_db()
+    with connect() as conn:
+        row = _get_or_create_checkin_module(conn, checkin_date, module_key)
+        if row["version"] != expected_version:
+            raise ValidationError("答案版本已变化，请刷新页面后重试")
+        status = row["status"] if row["version"] else "not_started"
+        conn.execute(
+            "UPDATE daily_checkin_modules SET status=?,draft_json=NULL,updated_at=? WHERE id=?",
+            (status, now(), row["id"]),
+        )
+    return get_checkin_module(checkin_date, module_key)
 
 
 def add_daily_record(record_date: str, raw_input: str, structured: dict | None = None) -> dict:
@@ -338,8 +588,8 @@ def ensure_daily_review(review_date: str) -> dict:
         raise ValidationError("日期必须是 YYYY-MM-DD") from exc
     init_db()
     with connect() as conn:
-        if not _record_ids_for_date(conn, review_date):
-            raise ValidationError("该日期没有每日记录")
+        if not _record_ids_for_date(conn, review_date) and not _checkin_versions_for_date(conn, review_date):
+            raise ValidationError("该日期没有每日记录或已发布状态")
         existing = conn.execute("SELECT id FROM daily_reviews WHERE review_date=?", (review_date,)).fetchone()
         if existing is None:
             _queue_daily_review(conn, review_date)
@@ -358,11 +608,13 @@ def requeue_daily_review(review_date: str, reason: str) -> dict:
         current = conn.execute("SELECT * FROM daily_reviews WHERE review_date=?", (review_date,)).fetchone()
         conn.execute(
             """INSERT INTO daily_review_history(
-                id,review_id,version,source_record_ids_json,result_json,completed_at,archived_at,archive_reason
-            ) VALUES(?,?,?,?,?,?,?,?)""",
+                id,review_id,version,source_record_ids_json,source_checkin_versions_json,
+                result_json,completed_at,archived_at,archive_reason
+            ) VALUES(?,?,?,?,?,?,?,?,?)""",
             (
                 new_id("review_history"), current["id"], current["result_version"],
-                current["source_record_ids_json"], current["result_json"], current["completed_at"], timestamp, reason,
+                current["source_record_ids_json"], current["source_checkin_versions_json"],
+                current["result_json"], current["completed_at"], timestamp, reason,
             ),
         )
         conn.execute(
@@ -439,11 +691,40 @@ def daily_review_context(review_date: str, days: int = 14) -> dict:
         adjustments = [dict(row) for row in conn.execute(
             "SELECT * FROM adjustments WHERE active=1 ORDER BY updated_at DESC"
         ).fetchall()]
+        checkin_rows = conn.execute(
+            """SELECT c.checkin_date,m.module_key,m.status,m.answers_json,m.version,m.completed_at
+               FROM daily_checkins c JOIN daily_checkin_modules m ON m.checkin_id=c.id
+               WHERE c.checkin_date BETWEEN ? AND ? AND m.version>0
+               ORDER BY c.checkin_date,m.module_key""",
+            (cutoff, review_date),
+        ).fetchall()
+    recent_checkins = []
+    for row in checkin_rows:
+        item = row_dict(row)
+        answers = item.get("answers_json") or {}
+        item["summary"] = checkins.summarize(item["module_key"], answers, item["status"])
+        recent_checkins.append(item)
+    target_state = get_checkin_state(review_date)
+    target_modules = [
+        {
+            "module_key": item["module_key"], "label": item["label"], "status": item["status"],
+            "version": item["version"], "answers": item.get("answers_json") or None,
+            "summary": item["summary"] or None,
+        }
+        for item in target_state["modules"] if item["version"] > 0
+    ]
     return {
         "daily_review": review,
         "doctrine": doctrine,
         "recent_days": days,
         "recent_records": records,
+        "target_checkin": {"date": review_date, "modules": target_modules},
+        "checkin_coverage": target_state["coverage"],
+        "recent_checkins": recent_checkins,
+        "checkin_resolution_note": (
+            "同一日期、同一模块以最新已发布问答为准；它可以补充早期记录中的‘未提供’，"
+            "但跳过和缺失仍表示未知。若实际值互相冲突，必须同时说明来源与时间，不得静默覆盖。"
+        ),
         "long_term_memories": memories,
         "current_adjustments": adjustments,
         "priority_foods": list_priority_foods(),

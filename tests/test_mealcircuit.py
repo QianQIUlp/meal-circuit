@@ -15,7 +15,7 @@ from contextlib import redirect_stderr
 from datetime import date, timedelta
 from pathlib import Path
 
-from mealcircuit import service
+from mealcircuit import checkins, service
 from mealcircuit import storage
 from mealcircuit.configuration import configuration_status, initialize_private_home
 from mealcircuit.db import init_db
@@ -230,6 +230,135 @@ class MealCircuitTest(unittest.TestCase):
         invalid["tomorrow_menu"]["protein_target_g"] = [200, 220]
         with self.assertRaises(ValidationError):
             service.complete_daily_review(today, invalid)
+
+    def test_checkin_draft_publish_and_day_context(self):
+        today = date.today().isoformat()
+        first = service.save_checkin_answer(today, "weight", "measured", "yes", 0)
+        self.assertTrue(first["has_draft"])
+        self.assertEqual(first["version"], 0)
+        with self.assertRaises(ValidationError):
+            service.daily_review_context(today)
+        service.save_checkin_answer(today, "weight", "weight_kg", "72.4", 0)
+        ready = service.save_checkin_answer(today, "weight", "measurement_context", "morning_fasted", 0)
+        self.assertTrue(ready["ready"])
+        published = service.complete_checkin_module(today, "weight", 0)
+        self.assertEqual(published["version"], 1)
+        self.assertEqual(published["answers_json"]["weight_kg"], 72.4)
+        review = service.get_daily_review(today)
+        self.assertEqual(review["source_record_ids_json"], [])
+        self.assertEqual(review["source_checkin_versions_json"], {"weight": 1})
+        context = service.daily_review_context(today)
+        self.assertEqual(context["target_checkin"]["modules"][0]["summary"], "72.4 kg · 晨起空腹")
+        self.assertEqual(context["recent_checkins"][0]["version"], 1)
+        self.assertNotIn("draft_json", context["recent_checkins"][0])
+
+    def test_checkin_branch_update_history_and_stale_version(self):
+        today = date.today().isoformat()
+        answers = (
+            ("trained", "yes"),
+            ("training_types", ["strength"]),
+            ("body_parts", ["chest", "biceps"]),
+            ("duration", "60_90"),
+            ("effort", "normal"),
+        )
+        for question_id, value in answers:
+            service.save_checkin_answer(today, "training", question_id, value, 0)
+        service.complete_checkin_module(today, "training", 0)
+        changed = service.save_checkin_answer(today, "training", "trained", "no", 1)
+        self.assertEqual(changed["active_answers"], {"trained": "no"})
+        service.save_checkin_answer(today, "training", "rest_reason", "rest_day", 1)
+        updated = service.complete_checkin_module(today, "training", 1)
+        self.assertEqual(updated["version"], 2)
+        self.assertEqual(len(updated["history"]), 1)
+        self.assertEqual(updated["history"][0]["answers_json"]["body_parts"], ["chest", "biceps"])
+        with self.assertRaises(ValidationError):
+            service.save_checkin_answer(today, "training", "trained", "yes", 1)
+
+    def test_checkin_all_module_schemas_skip_settings_and_future_date(self):
+        valid = {
+            "weight": {"measured": "no"},
+            "training": {"trained": "no", "rest_reason": "recovery"},
+            "hunger": {"hunger_level": "3", "hunger_time": "afternoon", "satiety": "comfortable", "cravings": "none"},
+            "sleep": {"sleep_duration": 7.5, "sleep_quality": "4", "awakenings": "once", "morning_energy": "okay"},
+            "gut": {"gut_state": "symptoms", "symptoms": ["bloating"], "severity": "mild", "timing": ["after_meal"], "bowel_state": "normal"},
+        }
+        for module_key, answers in valid.items():
+            self.assertEqual(checkins.validate_module_answers(module_key, answers), answers)
+        other_gut = {**valid["gut"], "symptoms": {"values": ["other"], "other_text": "餐后轻微绞痛"}}
+        self.assertEqual(checkins.validate_module_answers("gut", other_gut), other_gut)
+        invalid_other = {**valid["gut"], "symptoms": ["other"]}
+        with self.assertRaises(ValidationError):
+            checkins.validate_module_answers("gut", invalid_other)
+        with self.assertRaises(ValidationError):
+            checkins.validate_module_answers("gut", {"gut_state": "none", "severity": "severe"})
+        today = date.today().isoformat()
+        skipped = service.skip_checkin_module(today, "gut", 0)
+        self.assertEqual(skipped["status"], "skipped")
+        self.assertEqual(skipped["summary"], "用户选择今天不提供")
+        settings = service.checkin_module_settings()
+        reordered = []
+        for item in reversed(settings):
+            reordered.append({
+                "module_key": item["module_key"],
+                "enabled": item["module_key"] != "weight",
+                "frequency": "optional" if item["module_key"] == "gut" else "daily",
+            })
+        updated = service.update_checkin_module_settings(reordered)
+        self.assertEqual(updated[0]["module_key"], "gut")
+        state = service.get_checkin_state(today)
+        self.assertEqual(state["coverage"]["due"], 3)
+        self.assertEqual(state["coverage"]["handled"], 0)
+        with self.assertRaises(ValidationError):
+            service.get_checkin_state((date.today() + timedelta(days=1)).isoformat())
+
+    def test_checkin_requeues_completed_review_only_once(self):
+        today = date.today().isoformat()
+        service.add_daily_record(today, "测试饮食记录")
+        service.complete_daily_review(today, daily_review_result(today))
+        service.save_checkin_answer(today, "weight", "measured", "no", 0)
+        service.complete_checkin_module(today, "weight", 0)
+        first_requeue = service.get_daily_review(today)
+        self.assertEqual(first_requeue["status"], "pending")
+        self.assertEqual(len(first_requeue["history"]), 1)
+        service.skip_checkin_module(today, "gut", 0)
+        second_update = service.get_daily_review(today)
+        self.assertEqual(len(second_update["history"]), 1)
+        self.assertEqual(second_update["source_checkin_versions_json"], {"gut": 1, "weight": 1})
+
+    def test_checkin_schema_migrates_existing_review_tables(self):
+        legacy_path = Path(self.temp.name) / "legacy-checkin.db"
+        conn = sqlite3.connect(legacy_path)
+        try:
+            conn.executescript(
+                """
+                CREATE TABLE daily_reviews (
+                    id TEXT PRIMARY KEY, review_date TEXT NOT NULL UNIQUE, status TEXT NOT NULL,
+                    source_record_ids_json TEXT NOT NULL DEFAULT '[]', result_json TEXT,
+                    result_version INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL, completed_at TEXT
+                );
+                CREATE TABLE daily_review_history (
+                    id TEXT PRIMARY KEY, review_id TEXT NOT NULL, version INTEGER NOT NULL,
+                    source_record_ids_json TEXT NOT NULL, result_json TEXT NOT NULL,
+                    completed_at TEXT, archived_at TEXT NOT NULL, archive_reason TEXT NOT NULL DEFAULT ''
+                );
+                """
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        init_db(legacy_path)
+        init_db(legacy_path)
+        conn = sqlite3.connect(legacy_path)
+        try:
+            review_columns = {row[1] for row in conn.execute("PRAGMA table_info(daily_reviews)")}
+            history_columns = {row[1] for row in conn.execute("PRAGMA table_info(daily_review_history)")}
+            checkin_tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'daily_checkin%'")}
+        finally:
+            conn.close()
+        self.assertIn("source_checkin_versions_json", review_columns)
+        self.assertIn("source_checkin_versions_json", history_columns)
+        self.assertEqual(checkin_tables, {"daily_checkins", "daily_checkin_modules", "daily_checkin_module_history"})
 
     def test_init_doctor_and_dynamic_settings(self):
         settings_path = Path(self.temp.name) / "settings.json"
@@ -454,6 +583,41 @@ class WebAppTest(unittest.TestCase):
         self.assertIn("最近建议", decoded_overview)
         self.assertIn("review-card", decoded_overview)
         self.assertNotIn("今天蛋白很多", decoded_overview)
+
+    def test_checkin_web_question_flow_settings_and_origin(self):
+        today = date.today().isoformat()
+        status, _, hub = self.request("GET", f"/check-ins/{today}")
+        decoded = hub.decode("utf-8")
+        self.assertEqual(status, 200)
+        for label in ("每日状态", "体重", "训练", "饥饿与饱腹", "睡眠", "肠胃反应", "0/5"):
+            self.assertIn(label, decoded)
+        status, _, question = self.request("GET", f"/check-ins/{today}/weight")
+        self.assertEqual(status, 200)
+        self.assertIn("今天测体重了吗", question.decode("utf-8"))
+        headers = {"Content-Type": "application/x-www-form-urlencoded"}
+        first = urllib.parse.urlencode({"question_id": "measured", "expected_version": "0", "value": "yes"}).encode()
+        status, response_headers, _ = self.request("POST", f"/check-ins/{today}/weight/answer", first, headers)
+        self.assertEqual(status, 303)
+        self.assertEqual(response_headers["Location"], f"/check-ins/{today}/weight?q=weight_kg")
+        second = urllib.parse.urlencode({"question_id": "weight_kg", "expected_version": "0", "value": "72.4"}).encode()
+        status, response_headers, _ = self.request("POST", f"/check-ins/{today}/weight/answer", second, headers)
+        self.assertEqual(response_headers["Location"], f"/check-ins/{today}/weight?q=measurement_context")
+        last = urllib.parse.urlencode({"question_id": "measurement_context", "expected_version": "0", "value": "morning_fasted"}).encode()
+        status, response_headers, _ = self.request("POST", f"/check-ins/{today}/weight/answer", last, headers)
+        self.assertEqual(status, 303)
+        self.assertEqual(response_headers["Location"], f"/check-ins/{today}")
+        status, _, completed_hub = self.request("GET", f"/check-ins/{today}")
+        self.assertIn("72.4 kg", completed_hub.decode("utf-8"))
+        status, _, settings = self.request("GET", "/check-ins/settings")
+        self.assertEqual(status, 200)
+        self.assertIn("每日状态设置", settings.decode("utf-8"))
+        rejected = urllib.parse.urlencode({"expected_version": "0"}).encode()
+        status, _, response = self.request(
+            "POST", f"/check-ins/{today}/gut/skip", rejected,
+            {"Content-Type": "application/x-www-form-urlencoded", "Origin": "https://attacker.invalid"},
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("拒绝跨来源写入请求", response.decode("utf-8"))
 
     def test_cross_origin_post_is_rejected(self):
         body = urllib.parse.urlencode({"materials": "synthetic"}).encode()
