@@ -1,0 +1,7 @@
+interface:
+  display_name: "Draft PR Delivery"
+  short_description: "Ship every repository change through a draft PR"
+  default_prompt: "Use $ship-changes-via-draft-pr to make this repository change on a fresh branch, commit it atomically, push it, and open a draft PR."
+
+policy:
+  allow_implicit_invocation: true
