@@ -347,7 +347,7 @@ class WebAppTest(unittest.TestCase):
             conn.close()
 
     def test_pages_and_material_form(self):
-        for path in ("/", "/daily", "/tasks/photo", "/tasks/material", "/foods", "/overview"):
+        for path in ("/", "/daily", "/history", "/tasks/photo", "/tasks/material", "/foods", "/overview"):
             status, _, body = self.request("GET", path)
             self.assertEqual(status, 200)
             self.assertIn(b"MealCircuit", body)
@@ -355,6 +355,8 @@ class WebAppTest(unittest.TestCase):
         decoded_home = home.decode("utf-8")
         for label in ("今日建议", "食物照片", "原材料分析"):
             self.assertIn(label, decoded_home)
+        self.assertIn('href="/history"', decoded_home)
+        self.assertNotIn("最近任务", decoded_home)
         status, _, daily = self.request("GET", "/daily")
         self.assertIn("尚未记录", daily.decode("utf-8"))
         body = "materials=" + urllib.parse.quote("鸡胸肉 300g")
@@ -440,6 +442,18 @@ class WebAppTest(unittest.TestCase):
         status, _, daily = self.request("GET", "/daily")
         self.assertEqual(status, 200)
         self.assertIn("今日建议与明日菜单", daily.decode("utf-8"))
+        status, _, history = self.request("GET", "/history")
+        decoded_history = history.decode("utf-8")
+        self.assertEqual(status, 200)
+        self.assertIn("历史建议", decoded_history)
+        self.assertIn("review-card", decoded_history)
+        self.assertIn(review_date, decoded_history)
+        self.assertIn(f'/reviews/{review_date}', decoded_history)
+        status, _, overview = self.request("GET", "/overview")
+        decoded_overview = overview.decode("utf-8")
+        self.assertIn("最近建议", decoded_overview)
+        self.assertIn("review-card", decoded_overview)
+        self.assertNotIn("今天蛋白很多", decoded_overview)
 
     def test_cross_origin_post_is_rejected(self):
         body = urllib.parse.urlencode({"materials": "synthetic"}).encode()
