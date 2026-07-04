@@ -200,6 +200,59 @@ pre {
 .metric { color: var(--accent); font-size: clamp(2.75rem, 8vw, 4.5rem); font-weight: 720; line-height: .95; }
 .structured-list { margin: 8px 0 20px; padding-left: 22px; }
 .structured-list li { margin: 7px 0; padding-left: 4px; }
+.eyebrow {
+  margin: 0 0 6px; color: var(--accent); font: 700 .72rem/1.2 Consolas, monospace;
+  letter-spacing: .12em; text-transform: uppercase;
+}
+.section-header, .history-heading, .review-card__top, .review-card__footer {
+  display: flex; align-items: center; justify-content: space-between; gap: 16px;
+}
+.section-header { margin-bottom: 18px; }
+.section-header h2 { margin: 0; }
+.history-heading {
+  align-items: flex-end; margin-bottom: 20px; padding: clamp(22px, 4vw, 34px);
+  background: var(--surface-strong); border: 1px solid var(--border-strong); border-radius: var(--radius-md);
+}
+.history-heading h1 { margin-bottom: 8px; }
+.history-heading p:last-child { margin: 0; }
+.history-count {
+  flex: 0 0 auto; padding: 7px 11px; border: 1px solid var(--border-strong); border-radius: var(--radius-sm);
+  color: var(--muted); font: 700 .78rem/1.2 Consolas, monospace; white-space: nowrap;
+}
+.review-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+.review-card {
+  position: relative; min-width: 0; overflow: hidden; display: flex; flex-direction: column; gap: 14px;
+  padding: 20px 20px 18px; background: var(--surface-strong); border: 1px solid var(--border);
+  border-radius: var(--radius-md); transition: border-color 160ms ease-out, transform 160ms ease-out;
+}
+.review-card::before {
+  content: ""; position: absolute; inset: 0 auto 0 0; width: 4px; background: var(--blue);
+}
+.review-card[data-status="stable"]::before { background: var(--success); }
+.review-card[data-status="observe"]::before { background: var(--amber); }
+.review-card[data-status="adjust"]::before, .review-card[data-status="risk"]::before { background: var(--danger); }
+.review-card:hover { border-color: var(--border-strong); transform: translateY(-2px); }
+.review-date { color: var(--text); font: 720 1.08rem/1.2 Bahnschrift, "Microsoft YaHei UI", sans-serif; }
+.review-signal {
+  display: inline-flex; align-items: center; gap: 7px; color: var(--muted);
+  font: 700 .75rem/1.2 Consolas, monospace;
+}
+.review-signal::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+.review-card[data-status="stable"] .review-signal { color: var(--success); }
+.review-card[data-status="observe"] .review-signal { color: var(--amber); }
+.review-card[data-status="adjust"] .review-signal, .review-card[data-status="risk"] .review-signal { color: var(--danger); }
+.review-summary {
+  margin: 0; color: var(--text); font-size: 1.03rem; font-weight: 680; line-height: 1.55;
+  display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden;
+}
+.review-advice {
+  margin: 0; color: var(--muted); font-size: .9rem; line-height: 1.6;
+  display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3; overflow: hidden;
+}
+.review-card__footer { margin-top: auto; padding-top: 13px; border-top: 1px solid var(--border); }
+.review-meta { color: var(--muted); font: 600 .75rem/1.3 Consolas, monospace; }
+.review-link { font-size: .875rem; font-weight: 720; text-decoration: none; white-space: nowrap; }
+.review-empty { grid-column: 1 / -1; margin: 0; padding: 24px; border: 1px dashed var(--border-strong); border-radius: var(--radius-md); color: var(--muted); }
 details { margin-top: 24px; border-top: 1px solid var(--border); padding-top: 16px; }
 summary { width: fit-content; color: var(--accent); font-weight: 650; cursor: pointer; }
 @media (max-width: 760px) {
@@ -215,10 +268,14 @@ summary { width: fit-content; color: var(--accent); font-weight: 650; cursor: po
   .actions > .section-heading { flex-basis: 100%; }
   .table-scroll { margin-inline: -12px; padding-inline: 12px; }
   th, td { padding: 12px 10px; }
+  .review-grid { grid-template-columns: 1fr; }
+  .history-heading { align-items: flex-start; }
 }
 @media (max-width: 420px) {
   .actions .button, .actions button { flex: 1 1 auto; }
   .search-control { flex-basis: 100%; }
+  .section-header, .history-heading { align-items: stretch; flex-direction: column; }
+  .section-header .button { width: 100%; }
 }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; transition-duration: .01ms !important; }
@@ -233,6 +290,7 @@ def esc(value: object) -> str:
 def layout(title: str, body: str) -> bytes:
     nav_items = (
         ("/daily", "今日建议", title in {"今日建议与明日菜单", "每日复盘"}),
+        ("/history", "历史建议", title == "历史建议"),
         ("/tasks/photo", "食物照片", title == "上传食物照片"),
         ("/tasks/material", "原材料分析", title == "原材料分析"),
         ("/foods", "营养库", title in {"食品营养库", "新增食品", "编辑食品"}),
@@ -255,6 +313,34 @@ def task_table(tasks: list[dict]) -> str:
         for t in tasks
     )
     return f'<div class="table-scroll" tabindex="0" role="region" aria-label="任务列表"><table><thead><tr><th scope="col">任务</th><th scope="col">类型</th><th scope="col">状态</th><th scope="col">创建时间</th></tr></thead><tbody>{rows}</tbody></table></div>'
+
+
+def render_review_cards(reviews: list[dict]) -> str:
+    status_labels = {
+        "stable": "稳定", "observe": "观察", "adjust": "需调整", "risk": "风险",
+        "pending": "待生成",
+    }
+    cards = []
+    for review in reviews:
+        result = review.get("result_json") or {}
+        completed = review.get("status") == "completed" and bool(result)
+        signal = result.get("system_status", "pending") if completed else "pending"
+        summary = result.get("one_line_review") or "记录已保存，等待生成当日建议。"
+        advice_items = result.get("core_advice") or []
+        advice = advice_items[0] if advice_items else "生成后将在这里显示最重要的一条建议。"
+        menu = result.get("tomorrow_menu") or {}
+        menu_date = menu.get("date")
+        meta = f'次日菜单 · {esc(menu_date)}' if menu_date else "等待复盘"
+        review_date = esc(review["review_date"])
+        cards.append(
+            f'<article class="review-card" data-status="{esc(signal)}">'
+            f'<header class="review-card__top"><time class="review-date" datetime="{review_date}">{review_date}</time>'
+            f'<span class="review-signal">{esc(status_labels.get(signal, signal))}</span></header>'
+            f'<p class="review-summary">{esc(summary)}</p><p class="review-advice">{esc(advice)}</p>'
+            f'<footer class="review-card__footer"><span class="review-meta">{meta}</span>'
+            f'<a class="review-link" href="/reviews/{review_date}">打开复盘 <span aria-hidden="true">→</span></a></footer></article>'
+        )
+    return '<div class="review-grid">' + ("".join(cards) or '<p class="review-empty">还没有历史建议。保存每日记录后，复盘会按日期出现在这里。</p>') + "</div>"
 
 
 def food_form(item: dict | None = None) -> str:
@@ -481,7 +567,7 @@ class Handler(BaseHTTPRequestHandler):
                     daily_status = '<p>今日记录已保存，等待 Agent 生成核心建议和明日菜单。</p>'
                 else:
                     daily_status = '<p>今天尚未记录，进入后可直接提交自然语言饮食记录。</p>'
-                body = f'''<section class="hero"><h1>本地饮食反馈工作台</h1><p>记录一餐，校准长期趋势。</p></section><div class="grid"><section class="card"><h2>今日建议</h2>{daily_status}<a class="button" href="/daily">查看建议与菜单</a></section><section class="card"><h2>食物照片</h2><p>上传餐食照片，记录份量区间与营养估算。</p><a class="button" href="/tasks/photo">上传食物照片</a></section><section class="card"><h2>原材料分析</h2><p>输入现有食材，获取低失败率组合与调整。</p><a class="button" href="/tasks/material">分析现有食材</a></section></div><section class="card workflow-card"><h2>待办状态</h2><div class="metric">{pending}</div><p class="muted">待 Agent 处理</p><code>python -m mealcircuit.agent_cli pending</code></section><section class="card"><h2>待生成每日复盘</h2>{review_links}</section><section class="card"><h2>最近任务</h2>{task_table(tasks[:10])}</section>'''
+                body = f'''<section class="hero"><h1>本地饮食反馈工作台</h1><p>记录一餐，校准长期趋势。</p></section><div class="grid"><section class="card"><h2>今日建议</h2>{daily_status}<div class="actions"><a class="button" href="/daily">查看建议与菜单</a><a class="button secondary" href="/history">历史建议</a></div></section><section class="card"><h2>食物照片</h2><p>上传餐食照片，记录份量区间与营养估算。</p><a class="button" href="/tasks/photo">上传食物照片</a></section><section class="card"><h2>原材料分析</h2><p>输入现有食材，获取低失败率组合与调整。</p><a class="button" href="/tasks/material">分析现有食材</a></section></div><section class="card workflow-card"><h2>待办状态</h2><div class="metric">{pending}</div><p class="muted">待 Agent 处理</p><code>python -m mealcircuit.agent_cli pending</code></section><section class="card"><h2>待生成每日复盘</h2>{review_links}</section>'''
                 self.send_html("首页", body)
             elif path == "/daily":
                 daily = service.daily_state()
@@ -499,7 +585,16 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     state = '<p><span class="status pending">尚未记录</span></p>'
                     content = f'''<p>直接记录今天吃了什么和身体状态，保存后系统会创建每日复盘待办。</p><form method="post" action="/records"><input type="hidden" name="record_date" value="{esc(daily["date"])}"><label for="daily-input">今日自然语言记录</label><textarea id="daily-input" name="raw_input" required></textarea><div class="form-actions"><button>保存并创建复盘</button></div></form>'''
-                self.send_html("今日建议与明日菜单", f'<section class="card"><h1>今日建议与明日菜单</h1>{state}</section><section class="card">{content}</section>')
+                self.send_html("今日建议与明日菜单", f'<section class="card"><div class="section-header"><div><h1>今日建议与明日菜单</h1>{state}</div><a class="button secondary" href="/history">查看历史建议</a></div></section><section class="card">{content}</section>')
+            elif path == "/history":
+                reviews = service.list_daily_reviews()
+                body = (
+                    '<section class="history-heading"><div><p class="eyebrow">Advice archive</p>'
+                    '<h1>历史建议</h1><p class="muted">按日期回看系统判断、核心动作和次日菜单，不再翻阅冗长的原始记录。</p></div>'
+                    f'<span class="history-count">{len(reviews)} 天</span></section>'
+                    + render_review_cards(reviews)
+                )
+                self.send_html("历史建议", body)
             elif path == "/tasks/photo":
                 self.send_html("上传食物照片", '<section class="card"><h1>食物识别任务</h1><p class="muted">照片仅用于候选识别与区间估算。看不见的油、酱汁、重量和品牌必须列为未知项。</p><form method="post" enctype="multipart/form-data" action="/tasks/photo"><label for="task-photo">食物照片 *</label><input id="task-photo" type="file" name="photo" accept="image/jpeg,image/png,image/gif,image/webp" required><label for="task-note">补充说明</label><textarea id="task-note" name="note" placeholder="例如：这是训练后外食；酱汁没有全部吃完"></textarea><div class="form-actions"><button type="submit">创建待处理任务</button></div></form></section>')
             elif path == "/tasks/material":
@@ -533,16 +628,10 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_html("编辑食品", f'<section class="card"><h1>编辑食品 / 原料</h1>{food_form(food)}<form method="post" action="/foods/{esc(food["id"])}/delete" onsubmit="return confirm(\'确认删除？历史仍会保留。\')"><button class="danger">删除</button></form></section>')
             elif path == "/overview":
                 info = service.overview()
-                reviews_by_date = {r["review_date"]: r for r in info["daily_reviews"]}
-                records = "".join(
-                    f'<li><strong>{esc(r["record_date"])}</strong> {esc(r["raw_input"])} '
-                    f'<a href="/reviews/{esc(r["record_date"])}">'
-                    f'{"查看核心建议与菜单" if reviews_by_date.get(r["record_date"], {}).get("status") == "completed" else "等待生成复盘"}</a></li>'
-                    for r in info["records"]
-                ) or '<li class="muted">暂无记录</li>'
                 memories = "".join(f'<li><strong>{esc(m["kind"])}</strong> {esc(m["content"])} <span class="muted">{esc(m["evidence"])}</span></li>' for m in info["memories"]) or '<li class="muted">暂无长期记忆</li>'
                 adjustments = "".join(f'<li>{esc(a["content"])} <span class="muted">{esc(a["reason"])}</span></li>' for a in info["adjustments"]) or '<li class="muted">暂无当前调整</li>'
-                body = f'''<div class="grid"><section class="card"><h1>新增每日记录</h1><form method="post" action="/records"><label for="record-date">日期</label><input id="record-date" type="date" name="record_date" value="{date.today().isoformat()}" required><label for="record-input">自然语言记录</label><textarea id="record-input" name="raw_input" required></textarea><div class="form-actions"><button>保存</button></div></form></section><section class="card"><h2>新增长期记忆</h2><form method="post" action="/memories"><label for="memory-kind">类型</label><select id="memory-kind" name="kind"><option value="preference">已验证偏好</option><option value="gut_trigger">肠胃触发</option><option value="constraint">约束</option><option value="other">其他</option></select><label for="memory-content">内容</label><textarea id="memory-content" name="content" required></textarea><label for="memory-evidence">证据</label><input id="memory-evidence" name="evidence"><div class="form-actions"><button>保存</button></div></form></section><section class="card"><h2>新增当前有效调整</h2><form method="post" action="/adjustments"><label for="adjustment-content">调整内容</label><textarea id="adjustment-content" name="content" required></textarea><label for="adjustment-reason">原因</label><input id="adjustment-reason" name="reason"><div class="form-actions"><button>保存</button></div></form></section></div><section class="card"><h2>近 30 条每日记录</h2><ul>{records}</ul></section><section class="card"><h2>长期记忆</h2><ul>{memories}</ul></section><section class="card"><h2>当前有效调整</h2><ul>{adjustments}</ul></section>'''
+                recent_reviews = info["daily_reviews"][:6]
+                body = f'''<div class="grid"><section class="card"><h1>新增每日记录</h1><form method="post" action="/records"><label for="record-date">日期</label><input id="record-date" type="date" name="record_date" value="{date.today().isoformat()}" required><label for="record-input">自然语言记录</label><textarea id="record-input" name="raw_input" required></textarea><div class="form-actions"><button>保存</button></div></form></section><section class="card"><h2>新增长期记忆</h2><form method="post" action="/memories"><label for="memory-kind">类型</label><select id="memory-kind" name="kind"><option value="preference">已验证偏好</option><option value="gut_trigger">肠胃触发</option><option value="constraint">约束</option><option value="other">其他</option></select><label for="memory-content">内容</label><textarea id="memory-content" name="content" required></textarea><label for="memory-evidence">证据</label><input id="memory-evidence" name="evidence"><div class="form-actions"><button>保存</button></div></form></section><section class="card"><h2>新增当前有效调整</h2><form method="post" action="/adjustments"><label for="adjustment-content">调整内容</label><textarea id="adjustment-content" name="content" required></textarea><label for="adjustment-reason">原因</label><input id="adjustment-reason" name="reason"><div class="form-actions"><button>保存</button></div></form></section></div><section class="card"><div class="section-header"><div><p class="eyebrow">Advice archive</p><h2>最近建议</h2></div><a class="button secondary" href="/history">查看全部</a></div>{render_review_cards(recent_reviews)}</section><section class="card"><h2>长期记忆</h2><ul>{memories}</ul></section><section class="card"><h2>当前有效调整</h2><ul>{adjustments}</ul></section>'''
                 self.send_html("记录与记忆", body)
             elif path.startswith("/reviews/"):
                 review_date = path.split("/")[2]
