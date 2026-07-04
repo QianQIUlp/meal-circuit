@@ -15,7 +15,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from . import service
+from . import checkins, service
 from .db import init_db
 from .storage import port_value, upload_root
 from .validation import ValidationError, nutrition_number
@@ -105,7 +105,7 @@ code { color: #d8f7a9; }
 .nav-links a {
   min-height: 44px; display: inline-flex; align-items: center; padding: 8px 12px;
   color: var(--muted); font-size: .925rem; font-weight: 600; text-decoration: none;
-  border-radius: var(--radius-sm); transition: color 160ms ease-out, background 160ms ease-out;
+  border-radius: var(--radius-sm); transition: color 160ms ease-out, background 160ms ease-out; white-space: nowrap;
 }
 .nav-links a:hover { color: var(--text); background: var(--surface-raised); }
 .nav-links a[aria-current="page"] { color: var(--text); background: var(--surface-raised); }
@@ -255,13 +255,77 @@ pre {
 .review-empty { grid-column: 1 / -1; margin: 0; padding: 24px; border: 1px dashed var(--border-strong); border-radius: var(--radius-md); color: var(--muted); }
 details { margin-top: 24px; border-top: 1px solid var(--border); padding-top: 16px; }
 summary { width: fit-content; color: var(--accent); font-weight: 650; cursor: pointer; }
-@media (max-width: 760px) {
-  .wrap { width: min(100% - 32px, 1184px); }
+.checkin-hero {
+  display: flex; align-items: flex-end; justify-content: space-between; gap: 24px;
+  padding: clamp(22px, 4vw, 34px); margin-bottom: 20px;
+  background: var(--surface-strong); border: 1px solid var(--border-strong); border-radius: var(--radius-md);
+}
+.checkin-hero h1 { margin-bottom: 8px; }
+.checkin-hero > div:first-child { min-width: 0; }
+.checkin-date { white-space: nowrap; }
+.checkin-progress { min-width: 124px; text-align: right; }
+.checkin-progress strong { display: block; color: var(--accent); font: 720 2rem/1 Bahnschrift, sans-serif; }
+.progress-track { height: 4px; margin-top: 12px; overflow: hidden; background: var(--border); border-radius: 2px; }
+.progress-fill { display: block; height: 100%; background: var(--accent); }
+.signal-list { position: relative; max-width: 780px; margin: 0 auto 24px; padding: 0; list-style: none; }
+.signal-list::before { content: ""; position: absolute; top: 28px; bottom: 28px; left: 17px; width: 2px; background: var(--border-strong); }
+.signal-item { position: relative; padding-left: 52px; margin-bottom: 12px; }
+.signal-node {
+  position: absolute; z-index: 1; top: 24px; left: 9px; width: 18px; height: 18px;
+  border: 3px solid var(--bg); border-radius: 50%; background: var(--border-strong); box-shadow: 0 0 0 1px var(--border-strong);
+}
+.signal-item[data-state="completed"] .signal-node { background: var(--success); box-shadow: 0 0 0 1px var(--success); }
+.signal-item[data-state="skipped"] .signal-node { background: var(--amber); box-shadow: 0 0 0 1px var(--amber); }
+.signal-item[data-state="in_progress"] .signal-node { background: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+.signal-card {
+  display: flex; align-items: center; justify-content: space-between; gap: 20px; min-height: 76px;
+  padding: 16px 18px; color: var(--text); text-decoration: none; background: var(--surface);
+  border: 1px solid var(--border); border-radius: var(--radius-md); transition: border-color 180ms ease-out, transform 180ms ease-out;
+}
+.signal-card:hover { color: var(--text); border-color: var(--border-strong); transform: translateX(3px); }
+.signal-card h2 { margin: 0 0 3px; font-size: 1.08rem; }
+.signal-card p { margin: 0; color: var(--muted); font-size: .875rem; }
+.signal-state { flex: 0 0 auto; color: var(--muted); font-size: .82rem; font-weight: 700; }
+.quiz-shell { max-width: 720px; margin: 0 auto; }
+.quiz-card { position: relative; overflow: hidden; padding: clamp(22px, 4vw, 36px); background: var(--surface-strong); border: 1px solid var(--border-strong); border-radius: var(--radius-md); box-shadow: var(--shadow); }
+.quiz-card::before { content: ""; position: absolute; inset: 0 0 auto; height: 3px; background: var(--accent); }
+.quiz-top { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 28px; }
+.quiz-step { margin: 0; color: var(--muted); font: 700 .76rem/1.3 Consolas, monospace; letter-spacing: .06em; text-transform: uppercase; }
+.skip-form { margin: 0; }
+.skip-link-button { min-height: 36px; padding: 6px 10px; border-color: transparent; background: transparent; color: var(--muted); font-size: .85rem; }
+.skip-link-button:hover { color: var(--text); background: var(--surface-raised); border-color: var(--border); }
+.question-title { max-width: 22ch; margin-bottom: 24px; font-size: clamp(1.45rem, 4vw, 2rem); }
+.option-list { display: grid; gap: 10px; margin: 0; padding: 0; border: 0; }
+.option-button { width: 100%; justify-content: flex-start; min-height: 52px; text-align: left; background: var(--surface); border-color: var(--border-strong); color: var(--text); }
+.option-button:hover { background: var(--surface-raised); border-color: var(--accent); color: var(--text); }
+.choice-row { position: relative; }
+.choice-row input { position: absolute; opacity: 0; pointer-events: none; }
+.choice-row label { display: block; margin: 0; padding: 13px 15px 13px 46px; background: var(--surface); border: 1px solid var(--border-strong); border-radius: var(--radius-sm); cursor: pointer; }
+.choice-row label::before { content: ""; position: absolute; top: 17px; left: 16px; width: 17px; height: 17px; border: 2px solid var(--muted); border-radius: 4px; }
+.choice-row input:checked + label { border-color: var(--accent); background: rgba(184, 242, 91, .07); }
+.choice-row input:checked + label::before { border-color: var(--accent); background: var(--accent); box-shadow: inset 0 0 0 3px var(--surface); }
+.choice-row input:focus-visible + label { outline: 3px solid var(--focus); outline-offset: 3px; }
+.quiz-actions { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 24px; }
+.quiz-actions .back-link { color: var(--muted); font-weight: 650; }
+.duration-exact { margin-top: 18px; padding-top: 18px; border-top: 1px solid var(--border); }
+.danger-note { margin-top: 20px; padding: 14px 16px; border-left: 3px solid var(--danger); background: rgba(255,146,151,.08); color: #ffd4d6; }
+.settings-list { display: grid; gap: 12px; }
+.settings-row { display: grid; grid-template-columns: minmax(150px,1fr) auto minmax(140px,auto) auto; align-items: center; gap: 12px; padding: 14px 16px; background: var(--surface-strong); border: 1px solid var(--border); border-radius: var(--radius-sm); }
+.settings-row label { margin: 0; }
+.settings-row > label { display: flex; align-items: center; gap: 8px; }
+.settings-row input[type="checkbox"] { width: 18px; min-height: 18px; margin: 0; flex: 0 0 auto; }
+.settings-row select { min-width: 140px; }
+.move-actions { display: flex; gap: 6px; }
+.move-actions button { min-width: 42px; padding-inline: 10px; }
+@media (max-width: 980px) {
   .nav-shell { display: block; padding: 12px 0 8px; }
   .brand { min-height: 44px; }
   .nav-links { justify-content: flex-start; margin: 4px -8px 0; overflow-x: auto; scrollbar-width: none; }
   .nav-links::-webkit-scrollbar { display: none; }
   .nav-links a { flex: 0 0 auto; }
+}
+@media (max-width: 760px) {
+  .wrap { width: min(100% - 32px, 1184px); }
   main.wrap { padding-block: 24px 40px; }
   .hero { padding-left: 28px; }
   .row { grid-template-columns: 1fr; }
@@ -270,12 +334,22 @@ summary { width: fit-content; color: var(--accent); font-weight: 650; cursor: po
   th, td { padding: 12px 10px; }
   .review-grid { grid-template-columns: 1fr; }
   .history-heading { align-items: flex-start; }
+  .settings-row { grid-template-columns: 1fr auto; }
+  .settings-row select, .move-actions { grid-column: 1 / -1; }
 }
 @media (max-width: 420px) {
   .actions .button, .actions button { flex: 1 1 auto; }
   .search-control { flex-basis: 100%; }
   .section-header, .history-heading { align-items: stretch; flex-direction: column; }
   .section-header .button { width: 100%; }
+  .checkin-hero { align-items: stretch; flex-direction: column; }
+  .checkin-progress { text-align: left; }
+  .signal-item { padding-left: 42px; }
+  .signal-list::before { left: 12px; }
+  .signal-node { left: 4px; }
+  .signal-card { align-items: flex-start; flex-direction: column; gap: 8px; }
+  .quiz-actions { align-items: stretch; flex-direction: column-reverse; }
+  .quiz-actions button { width: 100%; }
 }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; transition-duration: .01ms !important; }
@@ -290,6 +364,7 @@ def esc(value: object) -> str:
 def layout(title: str, body: str) -> bytes:
     nav_items = (
         ("/daily", "今日建议", title in {"今日建议与明日菜单", "每日复盘"}),
+        (f"/check-ins/{date.today().isoformat()}", "今日状态", title in {"今日状态", "状态问答", "状态设置"}),
         ("/history", "历史建议", title == "历史建议"),
         ("/tasks/photo", "食物照片", title == "上传食物照片"),
         ("/tasks/material", "原材料分析", title == "原材料分析"),
@@ -341,6 +416,199 @@ def render_review_cards(reviews: list[dict]) -> str:
             f'<a class="review-link" href="/reviews/{review_date}">打开复盘 <span aria-hidden="true">→</span></a></footer></article>'
         )
     return '<div class="review-grid">' + ("".join(cards) or '<p class="review-empty">还没有历史建议。保存每日记录后，复盘会按日期出现在这里。</p>') + "</div>"
+
+
+def render_checkin_callout(checkin_date: str) -> str:
+    state = service.get_checkin_state(checkin_date)
+    coverage = state["coverage"]
+    due, handled = coverage["due"], coverage["handled"]
+    label = "今日状态已补全" if due == handled else f"今日状态 {handled}/{due}"
+    action = "查看或更新" if handled else "开始记录"
+    return (
+        f'<section class="card"><div class="section-header"><div><p class="eyebrow">Daily signals</p>'
+        f'<h2>{esc(label)}</h2><p class="muted">用点击补充体重、训练、饥饿饱腹、睡眠和肠胃反应。</p></div>'
+        f'<a class="button secondary" href="/check-ins/{esc(checkin_date)}">{action}</a></div></section>'
+    )
+
+
+def render_checkin_hub(checkin_date: str) -> str:
+    state = service.get_checkin_state(checkin_date)
+    daily = service.daily_state(checkin_date)
+    coverage = state["coverage"]
+    due, handled = coverage["due"], coverage["handled"]
+    percent = round(handled / due * 100) if due else 100
+    cards = []
+    status_labels = {
+        "not_started": "待填写", "in_progress": "进行中", "completed": "已完成", "skipped": "已跳过",
+    }
+    for module in state["modules"]:
+        if not module["enabled"]:
+            continue
+        display_state = "in_progress" if module["has_draft"] else module["status"]
+        if module["has_draft"] and module["version"]:
+            state_text = "有未提交修改"
+        else:
+            state_text = status_labels.get(display_state, display_state)
+        frequency = "按需记录" if module["frequency"] == "optional" else "每日"
+        summary = module["summary"] or module["description"]
+        cards.append(
+            f'<li class="signal-item" data-state="{esc(display_state)}"><span class="signal-node" aria-hidden="true"></span>'
+            f'<a class="signal-card" href="/check-ins/{esc(checkin_date)}/{esc(module["module_key"])}">'
+            f'<span><h2>{esc(module["label"])}</h2><p>{esc(summary)}</p></span>'
+            f'<span class="signal-state">{esc(state_text)} · {frequency}</span></a></li>'
+        )
+    empty = '<p class="card muted">所有模块都已隐藏。可进入设置重新启用。</p>'
+    review_link = (
+        f'<a class="button secondary" href="/reviews/{esc(checkin_date)}">查看当日复盘</a>'
+        if daily["review"] is not None else ""
+    )
+    return (
+        f'<section class="checkin-hero"><div><p class="eyebrow">Daily signal circuit</p>'
+        f'<h1>每日状态 · <span class="checkin-date">{esc(checkin_date)}</span></h1><p class="muted">每次只回答一个问题，途中退出也会保留草稿。</p></div>'
+        f'<div class="checkin-progress" role="status"><strong>{handled}/{due}</strong><span>每日模块已处理</span>'
+        f'<div class="progress-track" aria-hidden="true"><span class="progress-fill" style="width:{percent}%"></span></div></div></section>'
+        + ('<ol class="signal-list">' + "".join(cards) + "</ol>" if cards else empty)
+        + f'<div class="actions"><a class="button secondary" href="/check-ins/settings">调整模块</a>'
+        f'{review_link}</div>'
+    )
+
+
+def _question_value(module: dict, question_id: str):
+    return (module.get("active_answers") or {}).get(question_id)
+
+
+def render_checkin_question(checkin_date: str, module_key: str, requested_question: str | None = None) -> str:
+    module = service.get_checkin_module(checkin_date, module_key)
+    definition = checkins.module_definition(module_key)
+    active = module["active_answers"]
+    questions = checkins.applicable_questions(module_key, active)
+    if requested_question:
+        question = checkins.question_definition(module_key, requested_question, active)
+    else:
+        question = module.get("next_question") or questions[0]
+    question_ids = [item["id"] for item in questions]
+    index = question_ids.index(question["id"])
+    previous = question_ids[index - 1] if index else None
+    common = (
+        f'<input type="hidden" name="question_id" value="{esc(question["id"])}">'
+        f'<input type="hidden" name="expected_version" value="{esc(module["version"])}">'
+    )
+    current = _question_value(module, question["id"])
+    if question["type"] == "single" and not question.get("allow_other_text"):
+        options = []
+        for option in question["options"]:
+            selected = ' <span class="muted">· 当前答案</span>' if current == option["value"] else ""
+            options.append(
+                f'<form method="post" action="/check-ins/{esc(checkin_date)}/{esc(module_key)}/answer">{common}'
+                f'<button class="option-button" type="submit" name="value" value="{esc(option["value"])}">'
+                f'{esc(option["label"])}{selected}</button></form>'
+            )
+        control = '<div class="option-list">' + "".join(options) + "</div>"
+    elif question["type"] in {"single", "multi"}:
+        if isinstance(current, dict):
+            other_text = current.get("other_text", "")
+            current_value = current.get("values") if question["type"] == "multi" else current.get("value")
+        else:
+            other_text = ""
+            current_value = current
+        selected = set(current_value or []) if question["type"] == "multi" else {current_value}
+        choices = []
+        for option in question["options"]:
+            checked = " checked" if option["value"] in selected else ""
+            field_id = f'{module_key}-{question["id"]}-{option["value"]}'
+            input_type = "checkbox" if question["type"] == "multi" else "radio"
+            choices.append(
+                f'<div class="choice-row"><input id="{esc(field_id)}" type="{input_type}" name="value" '
+                f'value="{esc(option["value"])}"{checked}><label for="{esc(field_id)}">{esc(option["label"])}</label></div>'
+            )
+        other = (
+            f'<div class="duration-exact"><label for="other-text">其他说明</label>'
+            f'<input id="other-text" name="other_text" maxlength="200" value="{esc(other_text)}" '
+            f'placeholder="选择“其他”时填写"></div>' if question.get("allow_other_text") else ""
+        )
+        legend = "可多选" if question["type"] == "multi" else "请选择一项"
+        control = (
+            f'<form method="post" action="/check-ins/{esc(checkin_date)}/{esc(module_key)}/answer">{common}'
+            f'<fieldset class="option-list"><legend class="small muted">{legend}</legend>{"".join(choices)}</fieldset>{other}'
+            f'<div class="quiz-actions"><span></span><button type="submit">下一题</button></div></form>'
+        )
+    elif question["type"] == "number":
+        value = "" if current is None else esc(current)
+        control = (
+            f'<form method="post" action="/check-ins/{esc(checkin_date)}/{esc(module_key)}/answer">{common}'
+            f'<label for="question-number">体重（kg）</label><input id="question-number" name="value" type="number" '
+            f'min="{esc(question["min"])}" max="{esc(question["max"])}" step="{esc(question["step"])}" value="{value}" required autofocus>'
+            f'<div class="quiz-actions"><span></span><button type="submit">下一题</button></div></form>'
+        )
+    else:
+        exact = current if isinstance(current, (int, float)) else ""
+        radios = []
+        for option in question["options"]:
+            checked = " checked" if current == option["value"] else ""
+            field_id = f'sleep-{option["value"]}'
+            radios.append(
+                f'<div class="choice-row"><input id="{esc(field_id)}" type="radio" name="value" '
+                f'value="{esc(option["value"])}"{checked}><label for="{esc(field_id)}">{esc(option["label"])}</label></div>'
+            )
+        control = (
+            f'<form method="post" action="/check-ins/{esc(checkin_date)}/{esc(module_key)}/answer">{common}'
+            f'<fieldset class="option-list"><legend class="small muted">选择区间</legend>{"".join(radios)}</fieldset>'
+            f'<div class="duration-exact"><label for="sleep-exact">或者精确填写小时数</label>'
+            f'<input id="sleep-exact" type="number" name="exact_value" min="0" max="24" step="0.1" value="{esc(exact)}"></div>'
+            f'<div class="quiz-actions"><span></span><button type="submit">下一题</button></div></form>'
+        )
+    back_href = f'/check-ins/{checkin_date}/{module_key}?q={previous}' if previous else f'/check-ins/{checkin_date}'
+    severe = '<p class="danger-note" role="note">严重或持续症状需要停止自行加压并寻求医疗判断；这里仅记录信号，不做诊断。</p>' if module_key == "gut" and active.get("severity") == "severe" else ""
+    history = ""
+    if module.get("history"):
+        items = "".join(
+            f'<li>版本 {esc(item["version"])} · {esc(item["status"])} · {esc(item["archived_at"])}</li>'
+            for item in module["history"]
+        )
+        history = f'<details><summary>查看旧版本</summary><ul class="structured-list">{items}</ul></details>'
+    return (
+        f'<div class="quiz-shell"><section class="quiz-card"><div class="quiz-top">'
+        f'<p class="quiz-step">{esc(definition["label"])} · {index + 1}/{esc(definition["max_steps"])}</p>'
+        f'<form class="skip-form" method="post" action="/check-ins/{esc(checkin_date)}/{esc(module_key)}/skip">'
+        f'<input type="hidden" name="expected_version" value="{esc(module["version"])}">'
+        f'<button class="skip-link-button" type="submit">跳过本模块</button></form></div>'
+        f'<h1 class="question-title">{esc(question["label"])}</h1>{control}{severe}'
+        f'<div class="quiz-actions"><a class="back-link" href="{esc(back_href)}">← 返回</a>'
+        + (f'<form method="post" action="/check-ins/{esc(checkin_date)}/{esc(module_key)}/discard-draft">'
+           f'<input type="hidden" name="expected_version" value="{esc(module["version"])}">'
+           f'<button class="secondary" type="submit">放弃草稿</button></form>' if module["has_draft"] else '<span></span>')
+        + f'</div></section>{history}</div>'
+    )
+
+
+def render_checkin_settings() -> str:
+    settings = service.checkin_module_settings()
+    rows = []
+    for index, setting in enumerate(settings):
+        definition = checkins.module_definition(setting["module_key"])
+        key = setting["module_key"]
+        checked = " checked" if setting["enabled"] else ""
+        daily = " selected" if setting["frequency"] == "daily" else ""
+        optional = " selected" if setting["frequency"] == "optional" else ""
+        move = []
+        if index:
+            move.append(f'<button class="secondary" name="move" value="{esc(key)}:up" aria-label="上移{esc(definition["label"])}">↑</button>')
+        if index < len(settings) - 1:
+            move.append(f'<button class="secondary" name="move" value="{esc(key)}:down" aria-label="下移{esc(definition["label"])}">↓</button>')
+        rows.append(
+            f'<div class="settings-row"><label><input type="checkbox" name="enabled_{esc(key)}" value="1"{checked}> '
+            f'{esc(definition["label"])}</label><span class="muted small">{esc(definition["description"])}</span>'
+            f'<select name="frequency_{esc(key)}" aria-label="{esc(definition["label"])}询问频率">'
+            f'<option value="daily"{daily}>每日</option><option value="optional"{optional}>按需</option></select>'
+            f'<div class="move-actions">{"".join(move)}</div></div>'
+        )
+    return (
+        '<section class="card"><div class="section-header"><div><p class="eyebrow">Signal preferences</p>'
+        '<h1>每日状态设置</h1><p class="muted">隐藏、排序或把模块改为按需记录。</p></div>'
+        f'<a class="button secondary" href="/check-ins/{date.today().isoformat()}">返回今日状态</a></div>'
+        f'<form method="post" action="/check-ins/settings"><div class="settings-list">{"".join(rows)}</div>'
+        '<div class="form-actions"><button type="submit">保存设置</button></div></form></section>'
+    )
 
 
 def food_form(item: dict | None = None) -> str:
@@ -518,11 +786,15 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValidationError("拒绝跨来源写入请求")
 
     def read_urlencoded(self) -> dict[str, str]:
+        values = self.read_urlencoded_values()
+        return {key: items[-1] for key, items in values.items()}
+
+    def read_urlencoded_values(self) -> dict[str, list[str]]:
         length = int(self.headers.get("Content-Length", "0"))
         if length > 2 * 1024 * 1024:
             raise ValidationError("表单过大")
         raw = self.rfile.read(length).decode("utf-8")
-        return {key: values[-1] for key, values in urllib.parse.parse_qs(raw, keep_blank_values=True).items()}
+        return urllib.parse.parse_qs(raw, keep_blank_values=True)
 
     def read_multipart(self) -> tuple[dict[str, str], dict[str, tuple[str, bytes]]]:
         content_type = self.headers.get("Content-Type", "")
@@ -567,7 +839,7 @@ class Handler(BaseHTTPRequestHandler):
                     daily_status = '<p>今日记录已保存，等待 Agent 生成核心建议和明日菜单。</p>'
                 else:
                     daily_status = '<p>今天尚未记录，进入后可直接提交自然语言饮食记录。</p>'
-                body = f'''<section class="hero"><h1>本地饮食反馈工作台</h1><p>记录一餐，校准长期趋势。</p></section><div class="grid"><section class="card"><h2>今日建议</h2>{daily_status}<div class="actions"><a class="button" href="/daily">查看建议与菜单</a><a class="button secondary" href="/history">历史建议</a></div></section><section class="card"><h2>食物照片</h2><p>上传餐食照片，记录份量区间与营养估算。</p><a class="button" href="/tasks/photo">上传食物照片</a></section><section class="card"><h2>原材料分析</h2><p>输入现有食材，获取低失败率组合与调整。</p><a class="button" href="/tasks/material">分析现有食材</a></section></div><section class="card workflow-card"><h2>待办状态</h2><div class="metric">{pending}</div><p class="muted">待 Agent 处理</p><code>python -m mealcircuit.agent_cli pending</code></section><section class="card"><h2>待生成每日复盘</h2>{review_links}</section>'''
+                body = f'''<section class="hero"><h1>本地饮食反馈工作台</h1><p>记录一餐，校准长期趋势。</p></section><div class="grid"><section class="card"><h2>今日建议</h2>{daily_status}<div class="actions"><a class="button" href="/daily">查看建议与菜单</a><a class="button secondary" href="/history">历史建议</a></div></section><section class="card"><h2>食物照片</h2><p>上传餐食照片，记录份量区间与营养估算。</p><a class="button" href="/tasks/photo">上传食物照片</a></section><section class="card"><h2>原材料分析</h2><p>输入现有食材，获取低失败率组合与调整。</p><a class="button" href="/tasks/material">分析现有食材</a></section></div>{render_checkin_callout(date.today().isoformat())}<section class="card workflow-card"><h2>待办状态</h2><div class="metric">{pending}</div><p class="muted">待 Agent 处理</p><code>python -m mealcircuit.agent_cli pending</code></section><section class="card"><h2>待生成每日复盘</h2>{review_links}</section>'''
                 self.send_html("首页", body)
             elif path == "/daily":
                 daily = service.daily_state()
@@ -585,7 +857,7 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     state = '<p><span class="status pending">尚未记录</span></p>'
                     content = f'''<p>直接记录今天吃了什么和身体状态，保存后系统会创建每日复盘待办。</p><form method="post" action="/records"><input type="hidden" name="record_date" value="{esc(daily["date"])}"><label for="daily-input">今日自然语言记录</label><textarea id="daily-input" name="raw_input" required></textarea><div class="form-actions"><button>保存并创建复盘</button></div></form>'''
-                self.send_html("今日建议与明日菜单", f'<section class="card"><div class="section-header"><div><h1>今日建议与明日菜单</h1>{state}</div><a class="button secondary" href="/history">查看历史建议</a></div></section><section class="card">{content}</section>')
+                self.send_html("今日建议与明日菜单", f'<section class="card"><div class="section-header"><div><h1>今日建议与明日菜单</h1>{state}</div><a class="button secondary" href="/history">查看历史建议</a></div></section>{render_checkin_callout(daily["date"])}<section class="card">{content}</section>')
             elif path == "/history":
                 reviews = service.list_daily_reviews()
                 body = (
@@ -595,6 +867,19 @@ class Handler(BaseHTTPRequestHandler):
                     + render_review_cards(reviews)
                 )
                 self.send_html("历史建议", body)
+            elif path == "/check-ins":
+                self.redirect(f"/check-ins/{date.today().isoformat()}")
+            elif path == "/check-ins/settings":
+                self.send_html("状态设置", render_checkin_settings())
+            elif path.startswith("/check-ins/"):
+                parts = path.strip("/").split("/")
+                if len(parts) == 2:
+                    self.send_html("今日状态", render_checkin_hub(parts[1]))
+                elif len(parts) == 3:
+                    requested = query.get("q", [None])[0]
+                    self.send_html("状态问答", render_checkin_question(parts[1], parts[2], requested))
+                else:
+                    self.send_html("未找到", '<section class="card"><h1>404</h1><p>页面不存在。</p></section>', 404)
             elif path == "/tasks/photo":
                 self.send_html("上传食物照片", '<section class="card"><h1>食物识别任务</h1><p class="muted">照片仅用于候选识别与区间估算。看不见的油、酱汁、重量和品牌必须列为未知项。</p><form method="post" enctype="multipart/form-data" action="/tasks/photo"><label for="task-photo">食物照片 *</label><input id="task-photo" type="file" name="photo" accept="image/jpeg,image/png,image/gif,image/webp" required><label for="task-note">补充说明</label><textarea id="task-note" name="note" placeholder="例如：这是训练后外食；酱汁没有全部吃完"></textarea><div class="form-actions"><button type="submit">创建待处理任务</button></div></form></section>')
             elif path == "/tasks/material":
@@ -648,7 +933,8 @@ class Handler(BaseHTTPRequestHandler):
                     f'<section class="card"><h1>{esc(review_date)} 每日复盘</h1>'
                     f'<p><span class="status {esc(review["status"])}">{esc(review["status"])}</span> · '
                     f'版本 {esc(review["result_version"])}</p></section>'
-                    f'<section class="card"><h2>核心建议与次日菜单</h2>{result}</section>'
+                    + render_checkin_callout(review_date)
+                    + f'<section class="card"><h2>核心建议与次日菜单</h2>{result}</section>'
                 )
                 self.send_html("每日复盘", body)
             elif path.startswith("/media/"):
@@ -692,7 +978,73 @@ class Handler(BaseHTTPRequestHandler):
         path = urllib.parse.urlparse(self.path).path.rstrip("/") or "/"
         try:
             self.validate_origin()
-            if path == "/tasks/photo":
+            if path == "/check-ins/settings":
+                values = self.read_urlencoded_values()
+                current = service.checkin_module_settings()
+                ordered_keys = [item["module_key"] for item in current]
+                move = (values.get("move") or [""])[-1]
+                if ":" in move:
+                    module_key, direction = move.split(":", 1)
+                    if module_key in ordered_keys:
+                        index = ordered_keys.index(module_key)
+                        swap = index - 1 if direction == "up" else index + 1
+                        if 0 <= swap < len(ordered_keys):
+                            ordered_keys[index], ordered_keys[swap] = ordered_keys[swap], ordered_keys[index]
+                by_key = {item["module_key"]: item for item in current}
+                settings = []
+                for module_key in ordered_keys:
+                    frequency = (values.get(f"frequency_{module_key}") or [by_key[module_key]["frequency"]])[-1]
+                    settings.append({
+                        "module_key": module_key,
+                        "enabled": f"enabled_{module_key}" in values,
+                        "frequency": frequency,
+                    })
+                service.update_checkin_module_settings(settings)
+                self.redirect("/check-ins/settings")
+            elif path.startswith("/check-ins/"):
+                parts = path.strip("/").split("/")
+                if len(parts) != 4:
+                    raise ValidationError("每日状态路径无效")
+                _, checkin_date, module_key, action = parts
+                values = self.read_urlencoded_values()
+                expected_version = int((values.get("expected_version") or ["0"])[-1])
+                if action == "answer":
+                    question_id = (values.get("question_id") or [""])[-1]
+                    module = service.get_checkin_module(checkin_date, module_key)
+                    question = checkins.question_definition(module_key, question_id, module["active_answers"])
+                    exact = (values.get("exact_value") or [""])[-1].strip()
+                    other_text = (values.get("other_text") or [""])[-1].strip()
+                    if question["type"] == "duration" and exact:
+                        value: object = float(exact)
+                    elif question["type"] == "multi":
+                        selected_values = values.get("value") or []
+                        value = {"values": selected_values, "other_text": other_text} if question.get("allow_other_text") else selected_values
+                    else:
+                        selected_value = (values.get("value") or [""])[-1]
+                        value = {"value": selected_value, "other_text": other_text} if question.get("allow_other_text") else selected_value
+                    updated = service.save_checkin_answer(
+                        checkin_date, module_key, question_id, value, expected_version
+                    )
+                    questions = checkins.applicable_questions(module_key, updated["active_answers"])
+                    question_ids = [item["id"] for item in questions]
+                    current_index = question_ids.index(question_id)
+                    if current_index == len(question_ids) - 1:
+                        service.complete_checkin_module(checkin_date, module_key, expected_version)
+                        self.redirect(f"/check-ins/{checkin_date}")
+                    else:
+                        self.redirect(f"/check-ins/{checkin_date}/{module_key}?q={question_ids[current_index + 1]}")
+                elif action == "complete":
+                    service.complete_checkin_module(checkin_date, module_key, expected_version)
+                    self.redirect(f"/check-ins/{checkin_date}")
+                elif action == "skip":
+                    service.skip_checkin_module(checkin_date, module_key, expected_version)
+                    self.redirect(f"/check-ins/{checkin_date}")
+                elif action == "discard-draft":
+                    service.discard_checkin_draft(checkin_date, module_key, expected_version)
+                    self.redirect(f"/check-ins/{checkin_date}")
+                else:
+                    raise ValidationError("未知的每日状态操作")
+            elif path == "/tasks/photo":
                 fields, files = self.read_multipart()
                 if "photo" not in files:
                     raise ValidationError("请选择食物照片")

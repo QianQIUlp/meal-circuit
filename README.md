@@ -24,7 +24,7 @@
   <a href="LICENSE"><img src="https://img.shields.io/github/license/QianQIUlp/meal-circuit?style=flat-square&labelColor=13231E&color=74CFAE" alt="MIT license"></a>
 </p>
 
-MealCircuit 是一个**本地优先、Agent-in-the-loop** 的长期饮食反馈工作台。它把餐食照片、原材料、每日记录、食品营养库和用户更正串成一条可追溯的反馈回路，再结合近 14 天趋势、长期记忆与个人总纲，生成结构化判断和下一日菜单。
+MealCircuit 是一个**本地优先、Agent-in-the-loop** 的长期饮食反馈工作台。它把餐食照片、原材料、每日状态问答、食品营养库和用户更正串成一条可追溯的反馈回路，再结合近 14 天趋势、长期记忆与个人总纲，生成结构化判断和下一日菜单。
 
 > [!IMPORTANT]
 > MealCircuit 自身不调用外部模型 API，也不要求 API Key。它负责保存事实、组装上下文和校验结果；Codex、Claude Code 或其他 Agent 负责在用户发起任务后完成分析。
@@ -73,12 +73,15 @@ flowchart LR
 | 入口 | 解决的问题 |
 | :--- | :--- |
 | **今日建议** | 汇总当天状态，查看核心建议、风险信号与次日三餐菜单 |
+| **今日状态** | 通过逐题卡片记录体重、训练、饥饿饱腹、睡眠和肠胃反应；支持草稿、跳过和版本历史 |
 | **食物照片** | 上传真实餐食，由 Agent 按可见证据估算营养区间并列出未知项 |
 | **原材料分析** | 结合食品库中的用户数据，判断食材用途、份量与风险 |
 | **食品营养库** | 管理品牌标签、默认份量、优先级、使用条件及历史版本 |
 | **记录与记忆** | 保存每日饮食、长期趋势、当前调整和复盘版本历史 |
 
 每日菜单固定覆盖早餐、午餐、晚餐、条件加餐、训练日调整和肠胃异常调整。高优先级食品必须逐项给出 `use` 或 `skip`，不会因为“优先”二字机械塞进菜单。
+
+“今日状态”默认显示五个每日模块。每次只回答一个问题，单题草稿会自动保留；完成整个模块后，答案才会进入 Agent 上下文并重新排队当日复盘。模块可以在“调整模块”中隐藏、排序或改为按需记录。明确跳过只表示用户不提供，系统不会据此推断“未训练”或“没有症状”。
 
 ## ⌁ Agent 工作流
 
@@ -102,7 +105,7 @@ python -m mealcircuit.agent_cli day-complete 2026-01-01 --file result.json
 python -m mealcircuit.agent_cli correct <任务ID> --text "用户确认的更正"
 ```
 
-Agent 应严格遵循上下文中的 `doctrine.content` 与 `result_schema`。照片分析使用营养区间；无法判断的区间为 `null`，不可见信息进入 `unknowns`。
+Agent 应严格遵循上下文中的 `doctrine.content` 与 `result_schema`。每日复盘还必须读取 `target_checkin`、`checkin_coverage` 和 `recent_checkins`；草稿不会被导出，跳过与缺失保持未知。照片分析使用营养区间；无法判断的区间为 `null`，不可见信息进入 `unknowns`。
 
 ## ⛨ 数据与边界
 
@@ -145,7 +148,7 @@ python -m mealcircuit.agent_cli migrate-data --from-repo <旧工程路径> --app
 python tools\release_check.py
 ```
 
-测试覆盖数据持久化、上下文组装、结果校验、防覆盖、每日复盘、优先食品裁决、HTTP 关键路径和开源发布边界。项目坚持 Python 标准库方案，依赖或架构变化需要单独评估。
+测试覆盖数据持久化、状态问答草稿与版本、上下文组装、结果校验、防覆盖、每日复盘、优先食品裁决、HTTP 关键路径和开源发布边界。项目坚持 Python 标准库方案，依赖或架构变化需要单独评估。
 
 ```text
 mealcircuit/   应用、数据、校验、服务与 CLI

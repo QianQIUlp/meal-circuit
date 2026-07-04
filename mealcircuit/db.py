@@ -87,6 +87,42 @@ def init_db(path: Path | None = None) -> None:
                 structured_json TEXT,
                 created_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS daily_checkins (
+                id TEXT PRIMARY KEY,
+                checkin_date TEXT NOT NULL UNIQUE,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS daily_checkin_modules (
+                id TEXT PRIMARY KEY,
+                checkin_id TEXT NOT NULL REFERENCES daily_checkins(id),
+                module_key TEXT NOT NULL CHECK (module_key IN ('weight','training','hunger','sleep','gut')),
+                status TEXT NOT NULL DEFAULT 'not_started' CHECK (status IN ('not_started','in_progress','completed','skipped')),
+                answers_json TEXT,
+                draft_json TEXT,
+                schema_version INTEGER NOT NULL DEFAULT 1,
+                version INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                completed_at TEXT,
+                UNIQUE(checkin_id,module_key)
+            );
+            CREATE TABLE IF NOT EXISTS daily_checkin_module_history (
+                id TEXT PRIMARY KEY,
+                module_id TEXT NOT NULL REFERENCES daily_checkin_modules(id),
+                version INTEGER NOT NULL,
+                status TEXT NOT NULL CHECK (status IN ('completed','skipped')),
+                answers_json TEXT,
+                archived_at TEXT NOT NULL,
+                archive_reason TEXT NOT NULL DEFAULT ''
+            );
+            CREATE TABLE IF NOT EXISTS checkin_module_settings (
+                module_key TEXT PRIMARY KEY CHECK (module_key IN ('weight','training','hunger','sleep','gut')),
+                enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0,1)),
+                sort_order INTEGER NOT NULL,
+                frequency TEXT NOT NULL DEFAULT 'daily' CHECK (frequency IN ('daily','optional')),
+                updated_at TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS daily_reviews (
                 id TEXT PRIMARY KEY,
                 review_date TEXT NOT NULL UNIQUE,
@@ -127,6 +163,9 @@ def init_db(path: Path | None = None) -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status, created_at);
             CREATE INDEX IF NOT EXISTS idx_records_date ON daily_records(record_date);
+            CREATE INDEX IF NOT EXISTS idx_checkins_date ON daily_checkins(checkin_date);
+            CREATE INDEX IF NOT EXISTS idx_checkin_modules ON daily_checkin_modules(checkin_id,module_key);
+            CREATE INDEX IF NOT EXISTS idx_checkin_history ON daily_checkin_module_history(module_id,version);
             CREATE INDEX IF NOT EXISTS idx_daily_reviews_status ON daily_reviews(status, review_date);
             CREATE INDEX IF NOT EXISTS idx_daily_review_history ON daily_review_history(review_id, version);
             CREATE INDEX IF NOT EXISTS idx_food_name ON food_items(name, brand);
@@ -148,6 +187,18 @@ def init_db(path: Path | None = None) -> None:
         history_columns = {row["name"] for row in conn.execute("PRAGMA table_info(daily_review_history)")}
         if "archive_reason" not in history_columns:
             conn.execute("ALTER TABLE daily_review_history ADD COLUMN archive_reason TEXT NOT NULL DEFAULT ''")
+        review_columns = {row["name"] for row in conn.execute("PRAGMA table_info(daily_reviews)")}
+        if "source_checkin_versions_json" not in review_columns:
+            conn.execute("ALTER TABLE daily_reviews ADD COLUMN source_checkin_versions_json TEXT NOT NULL DEFAULT '{}'")
+        history_columns = {row["name"] for row in conn.execute("PRAGMA table_info(daily_review_history)")}
+        if "source_checkin_versions_json" not in history_columns:
+            conn.execute("ALTER TABLE daily_review_history ADD COLUMN source_checkin_versions_json TEXT NOT NULL DEFAULT '{}'")
+        timestamp = "1970-01-01T00:00:00+00:00"
+        for sort_order, module_key in enumerate(("weight", "training", "hunger", "sleep", "gut")):
+            conn.execute(
+                "INSERT OR IGNORE INTO checkin_module_settings(module_key,enabled,sort_order,frequency,updated_at) VALUES(?,1,?,'daily',?)",
+                (module_key, sort_order, timestamp),
+            )
         conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_food_source_key ON food_items(source_key) WHERE source_key IS NOT NULL"
         )
@@ -157,7 +208,10 @@ def row_dict(row: sqlite3.Row | None) -> dict | None:
     if row is None:
         return None
     result = dict(row)
-    for key in ("result_json", "structured_json", "correction_json", "source_record_ids_json"):
+    for key in (
+        "result_json", "structured_json", "correction_json", "source_record_ids_json",
+        "source_checkin_versions_json", "answers_json", "draft_json",
+    ):
         if key in result and result[key]:
             result[key] = json.loads(result[key])
     return result
