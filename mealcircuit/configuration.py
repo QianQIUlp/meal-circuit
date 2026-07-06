@@ -22,13 +22,31 @@ SETTING_FIELDS = (
     "portion_method",
     "missing_training_default",
     "compensation_boundary",
+    "home_cooking",
 )
+
+HOME_COOKING_DEFAULT = {"enabled": False}
+HOME_COOKING_FIELDS = {
+    "region",
+    "meal_scope",
+    "servings",
+    "weekday_time_limit_minutes",
+    "equipment",
+    "recipe_detail",
+    "rotation_window_days",
+    "reuse_policy",
+    "flavor_preferences",
+    "online_purchase_mode",
+    "food_exclusions",
+}
+HOME_COOKING_EQUIPMENT = {"rice_cooker", "stovetop_pan", "stovetop_pot", "refrigerator"}
 
 
 def validate_settings(value: object) -> dict:
     if not isinstance(value, dict):
         raise ValidationError("settings.json 顶层必须是对象")
     settings = {key: value.get(key) for key in SETTING_FIELDS}
+    settings["home_cooking"] = _validate_home_cooking(value.get("home_cooking"))
     target = settings["protein_target_g"]
     if (
         not isinstance(target, list)
@@ -39,12 +57,54 @@ def validate_settings(value: object) -> dict:
         raise ValidationError("protein_target_g 必须是两个递增正数")
     settings["protein_target_g"] = [float(item) if isinstance(item, float) else item for item in target]
     for key in SETTING_FIELDS:
-        if key == "protein_target_g":
+        if key in {"protein_target_g", "home_cooking"}:
             continue
         if not isinstance(settings[key], str) or not settings[key].strip():
             raise ValidationError(f"{key} 必须是非空文本")
         settings[key] = settings[key].strip()
     return settings
+
+
+def _validate_home_cooking(value: object) -> dict:
+    if value is None:
+        return dict(HOME_COOKING_DEFAULT)
+    if not isinstance(value, dict) or not isinstance(value.get("enabled"), bool):
+        raise ValidationError("home_cooking.enabled 必须是布尔值")
+    if not value["enabled"]:
+        return dict(HOME_COOKING_DEFAULT)
+    missing = sorted(HOME_COOKING_FIELDS - value.keys())
+    if missing:
+        raise ValidationError(f"home_cooking 缺少字段：{missing}")
+    if value["region"] != "china":
+        raise ValidationError("home_cooking.region 首版仅支持 china")
+    if value["meal_scope"] != "dinner" or value["servings"] != 1:
+        raise ValidationError("home_cooking 首版仅支持一人份晚餐")
+    if value["recipe_detail"] != "beginner_card":
+        raise ValidationError("home_cooking.recipe_detail 必须是 beginner_card")
+    if value["reuse_policy"] != "reuse_ingredients_rotate_dishes":
+        raise ValidationError("home_cooking.reuse_policy 无效")
+    if value["online_purchase_mode"] != "spec_and_search_keywords":
+        raise ValidationError("home_cooking.online_purchase_mode 无效")
+    time_limit = value["weekday_time_limit_minutes"]
+    if not isinstance(time_limit, int) or isinstance(time_limit, bool) or not 10 <= time_limit <= 60:
+        raise ValidationError("home_cooking.weekday_time_limit_minutes 必须是 10–60 的整数")
+    window = value["rotation_window_days"]
+    if not isinstance(window, int) or isinstance(window, bool) or not 2 <= window <= 14:
+        raise ValidationError("home_cooking.rotation_window_days 必须是 2–14 的整数")
+    equipment = value["equipment"]
+    if not isinstance(equipment, list) or not equipment or any(item not in HOME_COOKING_EQUIPMENT for item in equipment):
+        raise ValidationError("home_cooking.equipment 包含无效设备")
+    for field in ("flavor_preferences", "food_exclusions"):
+        items = value[field]
+        if not isinstance(items, list) or any(not isinstance(item, str) or not item.strip() for item in items):
+            raise ValidationError(f"home_cooking.{field} 必须是文本数组")
+    return {
+        "enabled": True,
+        **{key: value[key] for key in HOME_COOKING_FIELDS},
+        "equipment": list(dict.fromkeys(value["equipment"])),
+        "flavor_preferences": list(dict.fromkeys(item.strip() for item in value["flavor_preferences"])),
+        "food_exclusions": list(dict.fromkeys(item.strip() for item in value["food_exclusions"])),
+    }
 
 
 def load_settings() -> dict:

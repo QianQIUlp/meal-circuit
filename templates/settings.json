@@ -3,5 +3,19 @@
   "protein_target_g": null,
   "portion_method": "请填写常用份量表达方式",
   "missing_training_default": "请填写训练信息缺失时的默认处理",
-  "compensation_boundary": "不跳餐、不清零主食、不极端压低热量；只撤掉重复加餐并恢复标准份量。"
+  "compensation_boundary": "不跳餐、不清零主食、不极端压低热量；只撤掉重复加餐并恢复标准份量。",
+  "home_cooking": {
+    "enabled": false,
+    "region": "china",
+    "meal_scope": "dinner",
+    "servings": 1,
+    "weekday_time_limit_minutes": 25,
+    "equipment": ["rice_cooker", "stovetop_pan", "stovetop_pot", "refrigerator"],
+    "recipe_detail": "beginner_card",
+    "rotation_window_days": 3,
+    "reuse_policy": "reuse_ingredients_rotate_dishes",
+    "flavor_preferences": ["bold", "sour_spicy", "tomato", "xiaomi_chili"],
+    "online_purchase_mode": "spec_and_search_keywords",
+    "food_exclusions": []
+  }
 }

@@ -34,6 +34,21 @@ TEST_SETTINGS = {
     "compensation_boundary": "不跳餐、不清零主食、不极端压低热量",
 }
 
+HOME_COOKING = {
+    "enabled": True,
+    "region": "china",
+    "meal_scope": "dinner",
+    "servings": 1,
+    "weekday_time_limit_minutes": 25,
+    "equipment": ["rice_cooker", "stovetop_pan", "stovetop_pot", "refrigerator"],
+    "recipe_detail": "beginner_card",
+    "rotation_window_days": 3,
+    "reuse_policy": "reuse_ingredients_rotate_dishes",
+    "flavor_preferences": ["bold", "sour_spicy", "tomato", "xiaomi_chili"],
+    "online_purchase_mode": "spec_and_search_keywords",
+    "food_exclusions": [],
+}
+
 
 def configure_private_home(path: Path) -> dict[str, str | None]:
     old = {key: os.environ.get(key) for key in ("MEALCIRCUIT_HOME", "MEALCIRCUIT_DB")}
@@ -85,6 +100,64 @@ def daily_review_result(review_date: str, unsafe: bool = False):
         },
         "one_line_review": "达到个人目标下界后停止机械加餐。",
     }
+
+
+def home_cooking_review_result(review_date: str, dish_key="tomato_chicken", flavor="tomato_sour_spicy"):
+    result = daily_review_result(review_date)
+    menu_date = date.fromisoformat(result["tomorrow_menu"]["date"])
+    meals = result["tomorrow_menu"]["meals"]
+    meals[0]["mode"] = "quick_assembly"
+    meals[1]["mode"] = "eat_out"
+    meals[2]["mode"] = "home_cook"
+    meals[2]["recipe_card"] = {
+        "title": "番茄小米椒鸡肉",
+        "servings": 1,
+        "active_minutes": 15,
+        "total_minutes": 22,
+        "cookware": ["stovetop_pan"],
+        "ingredients": [
+            {"name": "鸡胸肉", "amount": "180g", "prep": "切成约2cm小块"},
+            {"name": "番茄", "amount": "1个", "prep": "切块"},
+        ],
+        "seasonings": [
+            {"name": "小米椒", "amount": "半根", "timing": "关火前加入"},
+            {"name": "生抽", "amount": "1茶匙", "timing": "番茄出汁后加入"},
+        ],
+        "steps": [
+            {"instruction": "鸡肉下锅摊开", "minutes": 4, "heat": "中火", "done_signal": "表面全部变白"},
+            {"instruction": "加入番茄翻炒", "minutes": 6, "heat": "中小火", "done_signal": "番茄明显出汁"},
+        ],
+        "failure_rescue": ["锅太干时加2汤匙清水，不继续加油"],
+        "cleanup": "1口炒锅、1块砧板和1把刀",
+        "gut_fallback": "去掉小米椒，番茄减半并加少量清水保留鲜味。",
+    }
+    result["tomorrow_menu"].update({
+        "shopping_list": [{
+            "name": "番茄", "amount": "3个", "purpose": "明日晚餐及后两日复用", "required": True,
+            "selection_guide": "表皮完整、拿起有重量感", "storage": "室温避光，熟透后冷藏",
+        }],
+        "online_options": [{
+            "category": "低油番茄调味", "selection_criteria": ["配料表短", "无明显糖油前排"],
+            "package_size": "200g以内小包装", "search_keywords": ["无添加糖番茄碎小包装"],
+            "pairs_with": ["鸡肉", "豆腐"], "skip_if": "能稳定买到新鲜番茄时跳过",
+        }],
+        "reuse_plan": {
+            "horizon_days": 3,
+            "items": [{
+                "ingredient": "番茄", "tomorrow_use": "番茄小米椒鸡肉",
+                "later_uses": [
+                    {"date": (menu_date + timedelta(days=1)).isoformat(), "use": "番茄豆腐汤"},
+                    {"date": (menu_date + timedelta(days=2)).isoformat(), "use": "番茄炒蛋"},
+                ],
+                "storage": "未切常温，切开后密封冷藏并在次日用完",
+            }],
+        },
+        "rotation": {
+            "dish_key": dish_key, "primary_protein": "chicken", "primary_vegetable": "tomato",
+            "flavor_profile": flavor, "technique": "stir_fry",
+        },
+    })
+    return result
 
 
 class MealCircuitTest(unittest.TestCase):
@@ -377,10 +450,58 @@ class MealCircuitTest(unittest.TestCase):
         service.add_daily_record(today, "测试动态目标")
         context = service.daily_review_context(today)
         self.assertEqual(context["result_schema"]["tomorrow_menu"]["protein_target_g"], [120, 150])
+        self.assertEqual(context["home_cooking_preferences"], {"enabled": False})
         result = daily_review_result(today)
         result["tomorrow_menu"]["protein_target_g"] = [120, 150]
         result["tomorrow_menu"]["environment"] = "家庭用餐"
         self.assertEqual(service.complete_daily_review(today, result)["status"], "completed")
+
+    def test_home_cooking_schema_validation_and_time_limit(self):
+        settings_path = Path(self.temp.name) / "settings.json"
+        settings_path.write_text(
+            json.dumps({**TEST_SETTINGS, "home_cooking": HOME_COOKING}, ensure_ascii=False), encoding="utf-8"
+        )
+        today = date.today().isoformat()
+        service.add_daily_record(today, "测试独居晚餐")
+        context = service.daily_review_context(today)
+        self.assertTrue(context["home_cooking_preferences"]["enabled"])
+        self.assertEqual(context["result_schema"]["tomorrow_menu"]["meals"][2]["mode"], "home_cook")
+        self.assertTrue(context["home_cooking_generation_protocol"])
+
+        missing = daily_review_result(today)
+        with self.assertRaisesRegex(ValidationError, "早餐.mode"):
+            service.complete_daily_review(today, missing)
+        too_slow = home_cooking_review_result(today)
+        too_slow["tomorrow_menu"]["meals"][2]["recipe_card"]["total_minutes"] = 26
+        with self.assertRaisesRegex(ValidationError, "不得超过 25 分钟"):
+            service.complete_daily_review(today, too_slow)
+        wrong_date = home_cooking_review_result(today)
+        wrong_date["tomorrow_menu"]["reuse_plan"]["items"][0]["later_uses"][0]["date"] = (
+            date.fromisoformat(today) + timedelta(days=8)
+        ).isoformat()
+        with self.assertRaisesRegex(ValidationError, "复用窗口"):
+            service.complete_daily_review(today, wrong_date)
+        self.assertEqual(service.complete_daily_review(today, home_cooking_review_result(today))["status"], "completed")
+
+    def test_home_cooking_history_rotation_and_repeat_reason(self):
+        settings_path = Path(self.temp.name) / "settings.json"
+        settings_path.write_text(
+            json.dumps({**TEST_SETTINGS, "home_cooking": HOME_COOKING}, ensure_ascii=False), encoding="utf-8"
+        )
+        first_date = (date.today() - timedelta(days=1)).isoformat()
+        second_date = date.today().isoformat()
+        service.add_daily_record(first_date, "第一天独居晚餐")
+        service.complete_daily_review(first_date, home_cooking_review_result(first_date))
+        service.add_daily_record(second_date, "第二天独居晚餐")
+        context = service.daily_review_context(second_date)
+        self.assertEqual(context["recent_home_dinners"][0]["rotation"]["dish_key"], "tomato_chicken")
+        self.assertEqual(context["recent_online_categories"], ["低油番茄调味"])
+
+        repeated = home_cooking_review_result(second_date)
+        with self.assertRaisesRegex(ValidationError, "连续晚餐不得重复"):
+            service.complete_daily_review(second_date, repeated)
+        repeated["tomorrow_menu"]["rotation"]["repeat_reason"] = "ingredient_expiry"
+        self.assertEqual(service.complete_daily_review(second_date, repeated)["status"], "completed")
 
     def test_legacy_database_environment_warns(self):
         legacy = str(Path(self.temp.name) / "legacy.db")
@@ -561,7 +682,7 @@ class WebAppTest(unittest.TestCase):
         status, _, detail = self.request("GET", f"/reviews/{review_date}")
         decoded = detail.decode("utf-8")
         self.assertEqual(status, 200)
-        for label in ("核心建议", "食堂菜单", "每日蛋白目标", "早餐", "午餐", "晚餐", "条件加餐", "训练日调整", "肠胃异常调整"):
+        for label in ("核心建议", "明日餐单", "每日蛋白目标", "早餐", "午餐", "晚餐", "条件加餐", "训练日调整", "肠胃异常调整"):
             self.assertIn(label, decoded)
         self.assertIn("优先食品裁决", decoded)
         self.assertIn("优先全麦面包", decoded)
@@ -583,6 +704,27 @@ class WebAppTest(unittest.TestCase):
         self.assertIn("最近建议", decoded_overview)
         self.assertIn("review-card", decoded_overview)
         self.assertNotIn("今天蛋白很多", decoded_overview)
+
+    def test_home_cooking_menu_web_display(self):
+        settings_path = Path(self.temp.name) / "settings.json"
+        settings_path.write_text(
+            json.dumps({**TEST_SETTINGS, "home_cooking": HOME_COOKING}, ensure_ascii=False), encoding="utf-8"
+        )
+        review_date = date.today().isoformat()
+        service.add_daily_record(review_date, "独居晚餐页面测试")
+        result = home_cooking_review_result(review_date)
+        result["tomorrow_menu"]["meals"][2]["recipe_card"]["title"] = "番茄<script>鸡肉</script>"
+        service.complete_daily_review(review_date, result)
+        status, _, body = self.request("GET", f"/reviews/{review_date}")
+        decoded = body.decode("utf-8")
+        self.assertEqual(status, 200)
+        for label in (
+            "快速组装", "食堂 / 外食", "在家下厨", "BEGINNER DINNER", "明日采购清单",
+            "可选网购组件", "3 日食材复用方向", "失败补救", "清洁成本", "肠胃降级",
+        ):
+            self.assertIn(label, decoded)
+        self.assertIn("番茄&lt;script&gt;鸡肉&lt;/script&gt;", decoded)
+        self.assertNotIn("番茄<script>鸡肉</script>", decoded)
 
     def test_checkin_web_question_flow_settings_and_origin(self):
         today = date.today().isoformat()
