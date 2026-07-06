@@ -20,7 +20,7 @@ from mealcircuit import storage
 from mealcircuit.configuration import configuration_status, initialize_private_home
 from mealcircuit.db import init_db
 from mealcircuit.migration import apply_migration, migration_preview
-from mealcircuit.server import Handler, ThreadingHTTPServer
+from mealcircuit.server import Handler, ThreadingHTTPServer, origin_matches_host, parse_host_endpoint
 from mealcircuit.storage import db_path, resolve_data_path, upload_root
 from mealcircuit.validation import ValidationError
 from tools.release_check import scan as release_scan
@@ -594,7 +594,12 @@ class WebAppTest(unittest.TestCase):
         status, _, question = self.request("GET", f"/check-ins/{today}/weight")
         self.assertEqual(status, 200)
         self.assertIn("今天测体重了吗", question.decode("utf-8"))
-        headers = {"Content-Type": "application/x-www-form-urlencoded"}
+        headers = {
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Host": f"localhost:{self.port}",
+            "Origin": f"http://127.0.0.1:{self.port}",
+            "Sec-Fetch-Site": "same-site",
+        }
         first = urllib.parse.urlencode({"question_id": "measured", "expected_version": "0", "value": "yes"}).encode()
         status, response_headers, _ = self.request("POST", f"/check-ins/{today}/weight/answer", first, headers)
         self.assertEqual(status, 303)
@@ -618,6 +623,92 @@ class WebAppTest(unittest.TestCase):
         )
         self.assertEqual(status, 400)
         self.assertIn("拒绝跨来源写入请求", response.decode("utf-8"))
+
+    def test_loopback_origin_policy_and_real_post_actions(self):
+        port = self.port
+        self.assertEqual(parse_host_endpoint(f"[::1]:{port}", port), ("::1", port))
+        self.assertTrue(origin_matches_host("127.0.0.1", port, f"http://localhost:{port}", "same-site"))
+        self.assertTrue(origin_matches_host("localhost", port, f"http://[::1]:{port}", "same-site"))
+        self.assertTrue(origin_matches_host("example.test", port, f"http://example.test:{port}", "same-origin"))
+        self.assertFalse(origin_matches_host("127.0.0.1", port, f"http://localhost:{port + 1}", "same-site"))
+        self.assertFalse(origin_matches_host("example.test", port, f"http://other.test:{port}", "cross-site"))
+        self.assertTrue(origin_matches_host("127.0.0.1", port, "null", "same-origin"))
+        self.assertTrue(origin_matches_host("localhost", port, "null", "none"))
+        self.assertFalse(origin_matches_host("127.0.0.1", port, "null", "cross-site"))
+
+        today = date.today().isoformat()
+        base_headers = {
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Host": f"localhost:{port}",
+            "Origin": f"http://127.0.0.1:{port}",
+            "Sec-Fetch-Site": "same-site",
+        }
+        answer = urllib.parse.urlencode({"question_id": "trained", "expected_version": "0", "value": "yes"}).encode()
+        status, headers, _ = self.request("POST", f"/check-ins/{today}/training/answer", answer, base_headers)
+        self.assertEqual(status, 303)
+        self.assertIn("training_types", headers["Location"])
+
+        multi = urllib.parse.urlencode([
+            ("question_id", "training_types"), ("expected_version", "0"),
+            ("value", "strength"), ("value", "cardio"),
+        ]).encode()
+        status, headers, _ = self.request("POST", f"/check-ins/{today}/training/answer", multi, base_headers)
+        self.assertEqual(status, 303)
+        self.assertIn("body_parts", headers["Location"])
+
+        hunger = urllib.parse.urlencode({"question_id": "hunger_level", "expected_version": "0", "value": "3"}).encode()
+        status, _, _ = self.request("POST", f"/check-ins/{today}/hunger/answer", hunger, base_headers)
+        self.assertEqual(status, 303)
+        discard = urllib.parse.urlencode({"expected_version": "0"}).encode()
+        status, headers, _ = self.request("POST", f"/check-ins/{today}/hunger/discard-draft", discard, base_headers)
+        self.assertEqual(status, 303)
+        self.assertEqual(headers["Location"], f"/check-ins/{today}")
+
+        skip = urllib.parse.urlencode({"expected_version": "0"}).encode()
+        status, headers, _ = self.request("POST", f"/check-ins/{today}/gut/skip", skip, base_headers)
+        self.assertEqual(status, 303)
+        self.assertEqual(headers["Location"], f"/check-ins/{today}")
+
+        settings_values = []
+        for module_key in ("weight", "training", "hunger", "sleep", "gut"):
+            settings_values.extend(((f"enabled_{module_key}", "1"), (f"frequency_{module_key}", "daily")))
+        status, headers, _ = self.request(
+            "POST", "/check-ins/settings", urllib.parse.urlencode(settings_values).encode(), base_headers,
+        )
+        self.assertEqual(status, 303)
+        self.assertEqual(headers["Location"], "/check-ins/settings")
+
+    def test_origin_policy_rejects_bad_port_null_cross_site_and_invalid_host(self):
+        body = urllib.parse.urlencode({"expected_version": "999"}).encode()
+        allowed_null = {
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Host": f"127.0.0.1:{self.port}", "Origin": "null", "Sec-Fetch-Site": "same-origin",
+        }
+        status, _, _ = self.request("POST", "/__origin_probe", b"", allowed_null)
+        self.assertEqual(status, 404)
+        allowed_ipv6_alias = {
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Host": f"[::1]:{self.port}", "Origin": f"http://localhost:{self.port}",
+        }
+        status, _, _ = self.request("POST", "/__origin_probe", b"", allowed_ipv6_alias)
+        self.assertEqual(status, 404)
+        cases = (
+            {"Host": f"127.0.0.1:{self.port}", "Origin": f"http://localhost:{self.port + 1}"},
+            {"Host": f"127.0.0.1:{self.port}", "Origin": "null", "Sec-Fetch-Site": "cross-site"},
+            {"Host": f"evil.invalid:{self.port}", "Origin": f"http://evil.invalid:{self.port}"},
+        )
+        output = io.StringIO()
+        with redirect_stderr(output):
+            for extra in cases:
+                headers = {"Content-Type": "application/x-www-form-urlencoded", **extra}
+                status, _, response = self.request("POST", f"/check-ins/{date.today().isoformat()}/weight/skip", body, headers)
+                self.assertEqual(status, 400)
+                self.assertTrue(
+                    "拒绝跨来源写入请求" in response.decode("utf-8")
+                    or "Host 请求头不在允许范围" in response.decode("utf-8")
+                )
+        self.assertIn("Rejected POST origin", output.getvalue())
+        self.assertIn("Sec-Fetch-Site", output.getvalue())
 
     def test_cross_origin_post_is_rejected(self):
         body = urllib.parse.urlencode({"materials": "synthetic"}).encode()

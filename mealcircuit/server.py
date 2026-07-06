@@ -21,6 +21,52 @@ from .storage import port_value, upload_root
 from .validation import ValidationError, nutrition_number
 
 
+LOOPBACK_NAMES = {"localhost", "127.0.0.1", "::1"}
+
+
+def is_loopback_host(host_name: str | None) -> bool:
+    if not host_name:
+        return False
+    normalized = host_name.lower().rstrip(".")
+    if normalized in LOOPBACK_NAMES:
+        return True
+    try:
+        return ipaddress.ip_address(normalized).is_loopback
+    except ValueError:
+        return False
+
+
+def parse_host_endpoint(host_header: str, default_port: int) -> tuple[str, int]:
+    try:
+        parsed = urllib.parse.urlsplit(f"//{host_header}")
+        host_name = parsed.hostname
+        host_port = parsed.port or default_port
+    except ValueError as exc:
+        raise ValidationError("Host 请求头无效") from exc
+    if not host_name:
+        raise ValidationError("Host 请求头无效")
+    return host_name.lower().rstrip("."), host_port
+
+
+def origin_matches_host(host_name: str, host_port: int, origin: str | None, fetch_site: str | None) -> bool:
+    if not origin:
+        return True
+    if origin == "null":
+        return is_loopback_host(host_name) and (fetch_site or "").lower() in {"same-origin", "none"}
+    try:
+        parsed = urllib.parse.urlsplit(origin)
+        origin_name = parsed.hostname
+        origin_port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    except ValueError:
+        return False
+    if not origin_name or parsed.scheme not in {"http", "https"} or origin_port != host_port:
+        return False
+    origin_name = origin_name.lower().rstrip(".")
+    if is_loopback_host(host_name) and is_loopback_host(origin_name):
+        return True
+    return origin_name == host_name
+
+
 STYLE = """
 :root {
   color-scheme: dark;
@@ -767,23 +813,31 @@ class Handler(BaseHTTPRequestHandler):
 
     def validate_origin(self) -> None:
         host_header = self.headers.get("Host", "")
-        try:
-            host_url = urllib.parse.urlsplit(f"//{host_header}")
-            host_name = host_url.hostname
-        except ValueError as exc:
-            raise ValidationError("Host 请求头无效") from exc
-        bound_host = str(self.server.server_address[0])
-        allowed = {"127.0.0.1", "localhost", "::1", bound_host}
-        allow_remote = bool(getattr(self.server, "allow_remote", False))
-        if not host_name or (not allow_remote and host_name.lower() not in {item.lower() for item in allowed}):
-            raise ValidationError("Host 请求头不在允许范围")
+        bound_port = int(self.server.server_address[1])
         origin = self.headers.get("Origin")
-        if origin:
-            origin_url = urllib.parse.urlsplit(origin)
-            origin_port = origin_url.port or (443 if origin_url.scheme == "https" else 80)
-            host_port = host_url.port or int(self.server.server_address[1])
-            if not origin_url.hostname or origin_url.hostname.lower() != host_name.lower() or origin_port != host_port:
-                raise ValidationError("拒绝跨来源写入请求")
+        fetch_site = self.headers.get("Sec-Fetch-Site")
+        try:
+            host_name, host_port = parse_host_endpoint(host_header, bound_port)
+        except ValidationError:
+            self.log_message(
+                "Rejected POST origin Host=%r Origin=%r Sec-Fetch-Site=%r",
+                host_header, origin, fetch_site,
+            )
+            raise
+        bound_host = str(self.server.server_address[0])
+        allow_remote = bool(getattr(self.server, "allow_remote", False))
+        if not allow_remote and not (is_loopback_host(host_name) or host_name == bound_host.lower().rstrip(".")):
+            self.log_message(
+                "Rejected POST origin Host=%r Origin=%r Sec-Fetch-Site=%r",
+                host_header, origin, fetch_site,
+            )
+            raise ValidationError("Host 请求头不在允许范围")
+        if not origin_matches_host(host_name, host_port, origin, fetch_site):
+            self.log_message(
+                "Rejected POST origin Host=%r Origin=%r Sec-Fetch-Site=%r",
+                host_header, origin, fetch_site,
+            )
+            raise ValidationError("拒绝跨来源写入请求")
 
     def read_urlencoded(self) -> dict[str, str]:
         values = self.read_urlencoded_values()
