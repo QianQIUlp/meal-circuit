@@ -97,7 +97,7 @@ STYLE = """
 html { scroll-padding-top: 96px; }
 body {
   margin: 0;
-  min-width: 320px;
+  min-width: 0;
   min-height: 100vh;
   background:
     linear-gradient(rgba(184, 242, 91, .025) 1px, transparent 1px),
@@ -246,6 +246,22 @@ pre {
 .metric { color: var(--accent); font-size: clamp(2.75rem, 8vw, 4.5rem); font-weight: 720; line-height: .95; }
 .structured-list { margin: 8px 0 20px; padding-left: 22px; }
 .structured-list li { margin: 7px 0; padding-left: 4px; }
+.meal-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1px; background: var(--border); border: 1px solid var(--border); border-radius: var(--radius-sm); overflow: hidden; }
+.meal-panel { min-width: 0; padding: 20px; background: var(--surface-strong); }
+.meal-panel h3 { margin-top: 0; }
+.meal-mode { color: var(--amber); font: 700 .75rem/1.3 Consolas, monospace; }
+.menu-section { margin-top: 28px; padding-top: 24px; border-top: 1px solid var(--border); }
+.menu-section > h2, .menu-section > h3 { margin-top: 0; }
+.recipe-meta { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 18px; }
+.recipe-meta span { padding: 4px 8px; border: 1px solid var(--border-strong); border-radius: var(--radius-sm); color: var(--muted); font-size: .8rem; }
+.recipe-columns { display: grid; grid-template-columns: minmax(0, .9fr) minmax(0, 1.1fr); gap: 28px; }
+.recipe-steps { margin: 8px 0 20px; padding-left: 28px; }
+.recipe-steps li { margin-bottom: 14px; padding-left: 6px; }
+.step-meta { display: block; margin-top: 3px; color: var(--muted); font-size: .8rem; }
+.menu-facts { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.menu-fact { padding: 14px 16px; background: var(--surface-strong); border-left: 3px solid var(--blue); }
+.menu-fact p:last-child { margin-bottom: 0; }
+.menu-fact strong { color: var(--text); }
 .eyebrow {
   margin: 0 0 6px; color: var(--accent); font: 700 .72rem/1.2 Consolas, monospace;
   letter-spacing: .12em; text-transform: uppercase;
@@ -382,6 +398,7 @@ summary { width: fit-content; color: var(--accent); font-weight: 650; cursor: po
   .history-heading { align-items: flex-start; }
   .settings-row { grid-template-columns: 1fr auto; }
   .settings-row select, .move-actions { grid-column: 1 / -1; }
+  .meal-grid, .recipe-columns, .menu-facts { grid-template-columns: 1fr; }
 }
 @media (max-width: 420px) {
   .actions .button, .actions button { flex: 1 1 auto; }
@@ -738,14 +755,83 @@ def render_result(task_type: str, result: dict) -> str:
     return friendly + f'<details><summary>查看原始 JSON</summary><pre>{raw}</pre></details>'
 
 
+EQUIPMENT_LABELS = {
+    "rice_cooker": "电饭煲", "stovetop_pan": "炒锅", "stovetop_pot": "汤锅", "refrigerator": "冰箱",
+}
+MEAL_MODE_LABELS = {"quick_assembly": "快速组装", "eat_out": "食堂 / 外食", "home_cook": "在家下厨"}
+
+
+def render_home_cooking_menu(menu: dict) -> str:
+    dinner = next((meal for meal in menu.get("meals", []) if meal.get("name") == "晚餐"), {})
+    recipe = dinner.get("recipe_card")
+    if not recipe:
+        return ""
+    cookware = "、".join(EQUIPMENT_LABELS.get(item, item) for item in recipe["cookware"])
+    ingredients = render_list([
+        f'{item["name"]}：{item["amount"]}；{item["prep"]}' for item in recipe["ingredients"]
+    ])
+    seasonings = render_list([
+        f'{item["name"]}：{item["amount"]}；{item["timing"]}' for item in recipe["seasonings"]
+    ])
+    steps = "".join(
+        f'<li><strong>{esc(item["instruction"])}</strong>'
+        f'<span class="step-meta">{esc(item["heat"])} · {esc(item["minutes"])} 分钟 · '
+        f'完成标志：{esc(item["done_signal"])}</span></li>'
+        for item in recipe["steps"]
+    )
+    shopping = "".join(
+        f'<div class="menu-fact"><p><strong>{esc(item["name"])}</strong> · {esc(item["amount"])}'
+        f'{" · 必买" if item["required"] else " · 缺少时再买"}</p>'
+        f'<p>{esc(item["purpose"])}</p><p class="muted small">挑选：{esc(item["selection_guide"])}；'
+        f'保存：{esc(item["storage"])}</p></div>'
+        for item in menu["shopping_list"]
+    )
+    online = "".join(
+        f'<div class="menu-fact"><p><strong>{esc(item["category"])}</strong> · {esc(item["package_size"])}</p>'
+        f'<p>搜索：{esc(" / ".join(item["search_keywords"]))}</p>'
+        f'<p class="muted small">筛选：{esc("；".join(item["selection_criteria"]))}<br>'
+        f'适用：{esc("、".join(item["pairs_with"]))}<br>跳过：{esc(item["skip_if"])}</p></div>'
+        for item in menu["online_options"]
+    )
+    reuse = "".join(
+        f'<div class="menu-fact"><p><strong>{esc(item["ingredient"])}</strong></p>'
+        f'<p>明日：{esc(item["tomorrow_use"])}</p>'
+        f'<p class="muted small">后续：{esc("；".join("{} {}".format(use["date"], use["use"]) for use in item["later_uses"]))}<br>'
+        f'保存：{esc(item["storage"])}</p></div>'
+        for item in menu["reuse_plan"]["items"]
+    )
+    online_section = (
+        '<section class="menu-section"><h3>可选网购组件</h3><div class="menu-facts">' + online + "</div></section>"
+        if online else ""
+    )
+    return (
+        '<section class="menu-section"><p class="eyebrow">BEGINNER DINNER</p>'
+        f'<h2>{esc(recipe["title"])}</h2><div class="recipe-meta">'
+        f'<span>1 人份</span><span>主动 {esc(recipe["active_minutes"])} 分钟</span>'
+        f'<span>总计 {esc(recipe["total_minutes"])} 分钟</span><span>{esc(cookware)}</span></div>'
+        '<div class="recipe-columns"><div><h3>食材</h3>' + ingredients
+        + '<h3>调味</h3>' + seasonings + '</div><div><h3>按顺序操作</h3><ol class="recipe-steps">'
+        + steps + '</ol></div></div><h3>失败补救</h3>' + render_list(recipe["failure_rescue"])
+        + f'<p><strong>清洁成本：</strong>{esc(recipe["cleanup"])}</p>'
+        + f'<p><strong>肠胃降级：</strong>{esc(recipe["gut_fallback"])}</p></section>'
+        + '<section class="menu-section"><h3>明日采购清单</h3><div class="menu-facts">' + shopping + "</div></section>"
+        + online_section
+        + f'<section class="menu-section"><h3>{esc(menu["reuse_plan"]["horizon_days"])} 日食材复用方向</h3>'
+        + '<p class="muted">后续用途会继续根据每日状态校准，不是锁死的周计划。</p>'
+        + '<div class="menu-facts">' + reuse + "</div></section>"
+    )
+
+
 def render_daily_review_result(result: dict) -> str:
     status_labels = {"stable": "稳定", "observe": "观察", "adjust": "需要调整", "risk": "风险上升"}
     menu = result["tomorrow_menu"]
     meals = []
     for meal in menu["meals"]:
         protein = meal["protein_g"]
+        mode = MEAL_MODE_LABELS.get(meal.get("mode"), "")
+        mode_html = f'<p class="meal-mode">{esc(mode)}</p>' if mode else ""
         meals.append(
-            f'<article class="card"><h3>{esc(meal["name"])}</h3>'
+            f'<article class="meal-panel"><h3>{esc(meal["name"])}</h3>{mode_html}'
             f'{render_list(meal["foods"])}'
             f'<p><strong>大致份量：</strong>{esc(meal["portion_guidance"])}</p>'
             f'<p><strong>蛋白估算：</strong>{esc(protein[0])}–{esc(protein[1])}g</p>'
@@ -772,10 +858,12 @@ def render_daily_review_result(result: dict) -> str:
         + '<h3>不需要调整</h3>' + render_list(result["do_not_adjust"])
         + '<h3>风险信号</h3>' + render_list(result["risk_signals"])
         + '<h3>优先食品裁决</h3>' + priority_html
-        + f'<section class="card"><h2>{esc(menu["date"])} 食堂菜单</h2>'
-        + f'<p><strong>每日蛋白目标：</strong>{esc(menu["protein_target_g"][0])}–{esc(menu["protein_target_g"][1])}g</p></section>'
-        + '<div class="grid">' + ''.join(meals) + '</div>'
-        + '<section class="card"><h3>条件加餐</h3>'
+        + f'<section class="menu-section"><h2>{esc(menu["date"])} 明日餐单</h2>'
+        + f'<p><strong>用餐环境：</strong>{esc(menu["environment"])} · <strong>每日蛋白目标：</strong>'
+        + f'{esc(menu["protein_target_g"][0])}–{esc(menu["protein_target_g"][1])}g</p></section>'
+        + '<div class="meal-grid">' + ''.join(meals) + '</div>'
+        + render_home_cooking_menu(menu)
+        + '<section class="menu-section"><h3>条件加餐</h3>'
         + f'<p>{esc(snack["condition"])}</p>{render_list(snack["options"])}'
         + f'<h3>训练日调整</h3><p>{esc(menu["training_adjustment"])}</p>'
         + f'<h3>肠胃异常调整</h3><p>{esc(menu["gut_adjustment"])}</p></section>'

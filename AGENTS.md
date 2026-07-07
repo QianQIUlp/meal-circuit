@@ -29,6 +29,8 @@
 8. 使用 `day-complete YYYY-MM-DD --file result.json` 提交，禁止直接改数据库绕过校验。
 9. `day-context` 中的 `priority_foods` 必须逐项评估；结果的 `priority_food_decisions` 必须覆盖全部高优先级食品，标明 `use` 或 `skip` 及具体原因。
 10. 高优先级只表示满足对应功能条件时优先；具体食品用途、份量和跳过条件必须读取食品库及私人设置，不得在公开规则中假定。
+11. `day-context.home_cooking_preferences.enabled` 为真时，必须读取 `recent_home_dinners`、`recent_online_categories` 和 `home_cooking_generation_protocol`；早餐使用低摩擦组装、午餐适配外食、晚餐生成一人份新手执行卡，并完整提供采购、网购筛选和三日食材复用信息。
+12. 独居晚餐不得超过配置时间和炊具限制；连续晚餐不得重复菜品或主风味。确因健康恢复、临期食材或采购限制重复时，必须使用允许的 `repeat_reason` 明确说明，不得用“方便”笼统绕过轮换。
 
 ## 开发约束
 
