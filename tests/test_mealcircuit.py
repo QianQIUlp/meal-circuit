@@ -325,6 +325,32 @@ class MealCircuitTest(unittest.TestCase):
         self.assertEqual(context["recent_checkins"][0]["version"], 1)
         self.assertNotIn("draft_json", context["recent_checkins"][0])
 
+    def test_dashboard_snapshot_is_read_only_and_preserves_unknowns(self):
+        today = date.today().isoformat()
+        yesterday = (date.today() - timedelta(days=1)).isoformat()
+        snapshot = service.dashboard_snapshot(today)
+        self.assertEqual(snapshot["daily"]["status"], "unrecorded")
+        self.assertEqual(len(snapshot["trend"]), 14)
+        conn = sqlite3.connect(db_path())
+        try:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM daily_reviews").fetchone()[0], 0)
+        finally:
+            conn.close()
+
+        service.save_checkin_answer(today, "weight", "measured", "yes", 0)
+        service.save_checkin_answer(today, "weight", "weight_kg", "72.4", 0)
+        service.save_checkin_answer(today, "weight", "measurement_context", "morning_fasted", 0)
+        service.complete_checkin_module(today, "weight", 0)
+        service.save_checkin_answer(today, "hunger", "hunger_level", "4", 0)
+        service.skip_checkin_module(yesterday, "gut", 0)
+
+        snapshot = service.dashboard_snapshot(today)
+        self.assertEqual(snapshot["trend"][-1]["modules"]["weight"]["weight_kg"], 72.4)
+        self.assertNotIn("hunger", snapshot["trend"][-1]["modules"])
+        self.assertEqual(snapshot["trend"][-2]["modules"]["gut"]["status"], "skipped")
+        self.assertIsNone(snapshot["tomorrow_menu"])
+        self.assertTrue(any(item["kind"] == "review" for item in snapshot["queue"]))
+
     def test_checkin_branch_update_history_and_stale_version(self):
         today = date.today().isoformat()
         answers = (
@@ -601,12 +627,22 @@ class WebAppTest(unittest.TestCase):
             status, _, body = self.request("GET", path)
             self.assertEqual(status, 200)
             self.assertIn(b"MealCircuit", body)
-        status, _, home = self.request("GET", "/")
+        status, home_headers, home = self.request("GET", "/")
         decoded_home = home.decode("utf-8")
-        for label in ("今日建议", "食物照片", "原材料分析"):
+        for label in ("今日结论", "今日状态", "明日计划", "处理队列", "照片任务", "原材料"):
             self.assertIn(label, decoded_home)
+        self.assertIn('class="app-sidebar"', decoded_home)
+        self.assertIn('aria-current="page"', decoded_home)
+        self.assertIn('href="/assets/ui/app.css?v=', decoded_home)
         self.assertIn('href="/history"', decoded_home)
         self.assertNotIn("最近任务", decoded_home)
+        self.assertIn("script-src 'self'", home_headers["Content-Security-Policy"])
+        status, headers, css = self.request("GET", "/assets/ui/app.css")
+        self.assertEqual(status, 200)
+        self.assertTrue(headers["Content-Type"].startswith("text/css"))
+        self.assertIn(b"prefers-color-scheme: light", css)
+        status, _, _ = self.request("GET", "/assets/ui/%2e%2e/server.py")
+        self.assertEqual(status, 404)
         status, _, daily = self.request("GET", "/daily")
         self.assertIn("尚未记录", daily.decode("utf-8"))
         body = "materials=" + urllib.parse.quote("鸡胸肉 300g")
@@ -682,7 +718,7 @@ class WebAppTest(unittest.TestCase):
         status, _, detail = self.request("GET", f"/reviews/{review_date}")
         decoded = detail.decode("utf-8")
         self.assertEqual(status, 200)
-        for label in ("核心建议", "明日餐单", "每日蛋白目标", "早餐", "午餐", "晚餐", "条件加餐", "训练日调整", "肠胃异常调整"):
+        for label in ("核心建议", "明日计划", "蛋白目标", "早餐", "午餐", "晚餐", "条件加餐", "训练日调整", "肠胃异常调整"):
             self.assertIn(label, decoded)
         self.assertIn("优先食品裁决", decoded)
         self.assertIn("优先全麦面包", decoded)

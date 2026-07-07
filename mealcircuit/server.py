@@ -22,6 +22,7 @@ from .validation import ValidationError, nutrition_number
 
 
 LOOPBACK_NAMES = {"localhost", "127.0.0.1", "::1"}
+STATIC_ROOT = Path(__file__).with_name("static")
 
 
 def is_loopback_host(host_name: str | None) -> bool:
@@ -67,379 +68,64 @@ def origin_matches_host(host_name: str, host_port: int, origin: str | None, fetc
     return origin_name == host_name
 
 
-STYLE = """
-:root {
-  color-scheme: dark;
-  --bg: #0b1210;
-  --surface: #111b17;
-  --surface-strong: #16231d;
-  --surface-raised: #1a2922;
-  --border: #2c4037;
-  --border-strong: #40594e;
-  --text: #f2f6f3;
-  --muted: #a7b7ae;
-  --accent: #b8f25b;
-  --accent-hover: #caf77d;
-  --accent-ink: #16210c;
-  --amber: #f6c453;
-  --blue: #78bff2;
-  --danger: #ff9297;
-  --success: #82e2ba;
-  --focus: #e7ffb9;
-  --radius-sm: 6px;
-  --radius-md: 10px;
-  --shadow: 0 18px 48px rgba(0, 0, 0, .22);
-  font-family: "Microsoft YaHei UI", "PingFang SC", system-ui, sans-serif;
-  background: var(--bg);
-  color: var(--text);
-}
-* { box-sizing: border-box; }
-html { scroll-padding-top: 96px; }
-body {
-  margin: 0;
-  min-width: 0;
-  min-height: 100vh;
-  background:
-    linear-gradient(rgba(184, 242, 91, .025) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(184, 242, 91, .025) 1px, transparent 1px),
-    var(--bg);
-  background-size: 32px 32px;
-  font-size: 16px;
-  line-height: 1.65;
-}
-a { color: var(--accent); text-underline-offset: 3px; }
-a:hover { color: var(--accent-hover); }
-h1, h2, h3, .brand, .metric {
-  font-family: Bahnschrift, "Microsoft YaHei UI", "PingFang SC", system-ui, sans-serif;
-  letter-spacing: -.02em;
-}
-h1 { margin: 0 0 12px; font-size: clamp(1.75rem, 4vw, 2.5rem); line-height: 1.15; }
-h2 { margin: 0 0 16px; font-size: clamp(1.25rem, 2.2vw, 1.55rem); line-height: 1.3; }
-h3 { margin: 24px 0 12px; font-size: 1.05rem; line-height: 1.4; }
-p { margin: 0 0 16px; }
-code, pre, .metric, td:first-child { font-family: Consolas, "SFMono-Regular", monospace; }
-code { color: #d8f7a9; }
-.wrap { width: min(100% - 48px, 1184px); margin-inline: auto; }
-.skip-link {
-  position: fixed; top: 8px; left: 8px; z-index: 1000; padding: 10px 14px;
-  background: var(--accent); color: var(--accent-ink); border-radius: var(--radius-sm);
-  transform: translateY(-160%); transition: transform 160ms ease-out;
-}
-.skip-link:focus { transform: translateY(0); }
-.nav {
-  position: sticky; top: 0; z-index: 40;
-  background: rgba(11, 18, 16, .94);
-  border-bottom: 1px solid var(--border);
-  backdrop-filter: blur(14px);
-}
-.nav::after {
-  content: ""; display: block; height: 2px;
-  background: linear-gradient(90deg, var(--accent) 0 42%, var(--amber) 42% 68%, var(--blue) 68% 100%);
-  opacity: .72;
-}
-.nav-shell { display: flex; align-items: center; min-height: 72px; gap: 32px; }
-.brand {
-  display: inline-flex; align-items: center; gap: 12px; flex: 0 0 auto;
-  color: var(--text); font-size: 1.25rem; font-weight: 700; text-decoration: none;
-}
-.brand:hover { color: var(--text); }
-.brand-mark { display: grid; gap: 3px; width: 22px; }
-.brand-mark i { display: block; height: 3px; border-radius: 2px; background: var(--accent); }
-.brand-mark i:nth-child(2) { width: 72%; background: var(--amber); }
-.brand-mark i:nth-child(3) { width: 45%; background: var(--blue); }
-.nav-links { display: flex; align-items: center; justify-content: flex-end; gap: 4px; margin-left: auto; }
-.nav-links a {
-  min-height: 44px; display: inline-flex; align-items: center; padding: 8px 12px;
-  color: var(--muted); font-size: .925rem; font-weight: 600; text-decoration: none;
-  border-radius: var(--radius-sm); transition: color 160ms ease-out, background 160ms ease-out; white-space: nowrap;
-}
-.nav-links a:hover { color: var(--text); background: var(--surface-raised); }
-.nav-links a[aria-current="page"] { color: var(--text); background: var(--surface-raised); }
-main.wrap { padding-block: 32px 56px; }
-.hero {
-  position: relative; overflow: hidden; padding: clamp(28px, 5vw, 52px);
-  background: var(--surface-strong); border: 1px solid var(--border-strong);
-  border-radius: var(--radius-md); box-shadow: var(--shadow); margin: 0 0 24px;
-}
-.hero::before {
-  content: ""; position: absolute; inset: 0 auto 0 0; width: 6px;
-  background: linear-gradient(var(--accent) 0 42%, var(--amber) 42% 68%, var(--blue) 68% 100%);
-}
-.hero h1 { max-width: 18ch; }
-.hero p { max-width: 68ch; color: var(--muted); margin: 0; font-size: 1.03rem; }
-.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(280px, 100%), 1fr)); gap: 20px; }
-.card {
-  min-width: 0; padding: clamp(20px, 3vw, 28px); margin-bottom: 20px;
-  background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-md);
-}
-.grid > .card { margin-bottom: 0; }
-.card > :last-child { margin-bottom: 0; }
-.stat-card { display: flex; flex-direction: column; justify-content: center; }
-.workflow-card code { display: inline-block; margin: 3px 0; }
-.section-heading { margin-right: auto; margin-bottom: 0; }
-.actions { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
-.button, button {
-  appearance: none; min-height: 44px; display: inline-flex; align-items: center; justify-content: center;
-  border: 1px solid var(--accent); border-radius: var(--radius-sm); padding: 9px 16px;
-  background: var(--accent); color: var(--accent-ink); font: inherit; font-weight: 750;
-  line-height: 1.3; text-decoration: none; cursor: pointer; touch-action: manipulation;
-  transition: background 160ms ease-out, border-color 160ms ease-out, color 160ms ease-out;
-}
-.button:hover, button:hover { background: var(--accent-hover); border-color: var(--accent-hover); color: var(--accent-ink); }
-.button:active, button:active { background: var(--accent); }
-.button.secondary, button.secondary {
-  background: transparent; border-color: var(--border-strong); color: var(--text);
-}
-.button.secondary:hover, button.secondary:hover { background: var(--surface-raised); border-color: #597164; }
-.button.danger, button.danger { background: transparent; border-color: #8e4c50; color: var(--danger); }
-.button.danger:hover, button.danger:hover { background: #3d2023; border-color: var(--danger); }
-button:disabled { cursor: not-allowed; opacity: .46; }
-label { display: block; margin: 18px 0 7px; color: var(--text); font-weight: 650; }
-input, textarea, select {
-  width: 100%; min-height: 46px; padding: 10px 12px; border: 1px solid var(--border-strong);
-  border-radius: var(--radius-sm); background: #0d1612; color: var(--text); font: inherit;
-  transition: border-color 160ms ease-out, box-shadow 160ms ease-out, background 160ms ease-out;
-}
-input:hover, textarea:hover, select:hover { border-color: #5a7366; }
-input::placeholder, textarea::placeholder { color: #7f9288; }
-input[type="file"] { min-height: 52px; padding: 6px; color: var(--muted); }
-input[type="file"]::file-selector-button {
-  min-height: 38px; margin-right: 12px; padding: 7px 12px; border: 0; border-radius: 4px;
-  background: var(--surface-raised); color: var(--text); font: inherit; font-weight: 650; cursor: pointer;
-}
-textarea { min-height: 140px; resize: vertical; }
-select { cursor: pointer; }
-:focus-visible { outline: 3px solid var(--focus); outline-offset: 3px; }
-input:focus-visible, textarea:focus-visible, select:focus-visible {
-  outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px rgba(184, 242, 91, .2);
-}
-.form-actions { margin-top: 24px; }
-.search-control { flex: 1 1 280px; max-width: 420px; }
-.row { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0 20px; }
-.table-scroll { max-width: 100%; overflow-x: auto; margin: 4px -4px 16px; padding: 0 4px; }
-table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
-th, td { text-align: left; padding: 13px 12px; border-bottom: 1px solid var(--border); vertical-align: top; }
-th { color: var(--muted); font-size: .78rem; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; white-space: nowrap; }
-tbody tr { transition: background 160ms ease-out; }
-tbody tr:hover { background: rgba(184, 242, 91, .045); }
-td:first-child { font-size: .875rem; }
-.nutrition { min-width: 0; }
-.nutrition th { width: 38%; }
-.nutrition td:first-child { font-family: inherit; font-size: inherit; }
-.status {
-  display: inline-flex; align-items: center; gap: 7px; min-height: 26px; padding: 3px 9px;
-  border: 1px solid currentColor; border-radius: 999px; font: 700 .75rem/1.2 Consolas, monospace;
-}
-.status::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
-.pending { background: rgba(246, 196, 83, .1); color: var(--amber); }
-.completed { background: rgba(130, 226, 186, .1); color: var(--success); }
-.muted { color: var(--muted); }
-.small { font-size: .8125rem; }
-.error { border-color: #804247; background: #2c191b; color: #ffd4d6; }
-.notice { border-color: #42654f; background: #15261d; color: #ccefbf; }
-pre {
-  max-width: 100%; margin: 12px 0; padding: 16px; overflow: auto; white-space: pre-wrap;
-  word-break: break-word; background: #080d0b; border: 1px solid #22332b; border-radius: var(--radius-sm);
-  color: #d9e7df; font-size: .875rem; line-height: 1.65;
-}
-.photo { display: block; max-width: 100%; max-height: 560px; margin: 24px auto; border-radius: var(--radius-sm); object-fit: contain; }
-.metric { color: var(--accent); font-size: clamp(2.75rem, 8vw, 4.5rem); font-weight: 720; line-height: .95; }
-.structured-list { margin: 8px 0 20px; padding-left: 22px; }
-.structured-list li { margin: 7px 0; padding-left: 4px; }
-.meal-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1px; background: var(--border); border: 1px solid var(--border); border-radius: var(--radius-sm); overflow: hidden; }
-.meal-panel { min-width: 0; padding: 20px; background: var(--surface-strong); }
-.meal-panel h3 { margin-top: 0; }
-.meal-mode { color: var(--amber); font: 700 .75rem/1.3 Consolas, monospace; }
-.menu-section { margin-top: 28px; padding-top: 24px; border-top: 1px solid var(--border); }
-.menu-section > h2, .menu-section > h3 { margin-top: 0; }
-.recipe-meta { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 18px; }
-.recipe-meta span { padding: 4px 8px; border: 1px solid var(--border-strong); border-radius: var(--radius-sm); color: var(--muted); font-size: .8rem; }
-.recipe-columns { display: grid; grid-template-columns: minmax(0, .9fr) minmax(0, 1.1fr); gap: 28px; }
-.recipe-steps { margin: 8px 0 20px; padding-left: 28px; }
-.recipe-steps li { margin-bottom: 14px; padding-left: 6px; }
-.step-meta { display: block; margin-top: 3px; color: var(--muted); font-size: .8rem; }
-.menu-facts { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
-.menu-fact { padding: 14px 16px; background: var(--surface-strong); border-left: 3px solid var(--blue); }
-.menu-fact p:last-child { margin-bottom: 0; }
-.menu-fact strong { color: var(--text); }
-.eyebrow {
-  margin: 0 0 6px; color: var(--accent); font: 700 .72rem/1.2 Consolas, monospace;
-  letter-spacing: .12em; text-transform: uppercase;
-}
-.section-header, .history-heading, .review-card__top, .review-card__footer {
-  display: flex; align-items: center; justify-content: space-between; gap: 16px;
-}
-.section-header { margin-bottom: 18px; }
-.section-header h2 { margin: 0; }
-.history-heading {
-  align-items: flex-end; margin-bottom: 20px; padding: clamp(22px, 4vw, 34px);
-  background: var(--surface-strong); border: 1px solid var(--border-strong); border-radius: var(--radius-md);
-}
-.history-heading h1 { margin-bottom: 8px; }
-.history-heading p:last-child { margin: 0; }
-.history-count {
-  flex: 0 0 auto; padding: 7px 11px; border: 1px solid var(--border-strong); border-radius: var(--radius-sm);
-  color: var(--muted); font: 700 .78rem/1.2 Consolas, monospace; white-space: nowrap;
-}
-.review-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
-.review-card {
-  position: relative; min-width: 0; overflow: hidden; display: flex; flex-direction: column; gap: 14px;
-  padding: 20px 20px 18px; background: var(--surface-strong); border: 1px solid var(--border);
-  border-radius: var(--radius-md); transition: border-color 160ms ease-out, transform 160ms ease-out;
-}
-.review-card::before {
-  content: ""; position: absolute; inset: 0 auto 0 0; width: 4px; background: var(--blue);
-}
-.review-card[data-status="stable"]::before { background: var(--success); }
-.review-card[data-status="observe"]::before { background: var(--amber); }
-.review-card[data-status="adjust"]::before, .review-card[data-status="risk"]::before { background: var(--danger); }
-.review-card:hover { border-color: var(--border-strong); transform: translateY(-2px); }
-.review-date { color: var(--text); font: 720 1.08rem/1.2 Bahnschrift, "Microsoft YaHei UI", sans-serif; }
-.review-signal {
-  display: inline-flex; align-items: center; gap: 7px; color: var(--muted);
-  font: 700 .75rem/1.2 Consolas, monospace;
-}
-.review-signal::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
-.review-card[data-status="stable"] .review-signal { color: var(--success); }
-.review-card[data-status="observe"] .review-signal { color: var(--amber); }
-.review-card[data-status="adjust"] .review-signal, .review-card[data-status="risk"] .review-signal { color: var(--danger); }
-.review-summary {
-  margin: 0; color: var(--text); font-size: 1.03rem; font-weight: 680; line-height: 1.55;
-  display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden;
-}
-.review-advice {
-  margin: 0; color: var(--muted); font-size: .9rem; line-height: 1.6;
-  display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3; overflow: hidden;
-}
-.review-card__footer { margin-top: auto; padding-top: 13px; border-top: 1px solid var(--border); }
-.review-meta { color: var(--muted); font: 600 .75rem/1.3 Consolas, monospace; }
-.review-link { font-size: .875rem; font-weight: 720; text-decoration: none; white-space: nowrap; }
-.review-empty { grid-column: 1 / -1; margin: 0; padding: 24px; border: 1px dashed var(--border-strong); border-radius: var(--radius-md); color: var(--muted); }
-details { margin-top: 24px; border-top: 1px solid var(--border); padding-top: 16px; }
-summary { width: fit-content; color: var(--accent); font-weight: 650; cursor: pointer; }
-.checkin-hero {
-  display: flex; align-items: flex-end; justify-content: space-between; gap: 24px;
-  padding: clamp(22px, 4vw, 34px); margin-bottom: 20px;
-  background: var(--surface-strong); border: 1px solid var(--border-strong); border-radius: var(--radius-md);
-}
-.checkin-hero h1 { margin-bottom: 8px; }
-.checkin-hero > div:first-child { min-width: 0; }
-.checkin-date { white-space: nowrap; }
-.checkin-progress { min-width: 124px; text-align: right; }
-.checkin-progress strong { display: block; color: var(--accent); font: 720 2rem/1 Bahnschrift, sans-serif; }
-.progress-track { height: 4px; margin-top: 12px; overflow: hidden; background: var(--border); border-radius: 2px; }
-.progress-fill { display: block; height: 100%; background: var(--accent); }
-.signal-list { position: relative; max-width: 780px; margin: 0 auto 24px; padding: 0; list-style: none; }
-.signal-list::before { content: ""; position: absolute; top: 28px; bottom: 28px; left: 17px; width: 2px; background: var(--border-strong); }
-.signal-item { position: relative; padding-left: 52px; margin-bottom: 12px; }
-.signal-node {
-  position: absolute; z-index: 1; top: 24px; left: 9px; width: 18px; height: 18px;
-  border: 3px solid var(--bg); border-radius: 50%; background: var(--border-strong); box-shadow: 0 0 0 1px var(--border-strong);
-}
-.signal-item[data-state="completed"] .signal-node { background: var(--success); box-shadow: 0 0 0 1px var(--success); }
-.signal-item[data-state="skipped"] .signal-node { background: var(--amber); box-shadow: 0 0 0 1px var(--amber); }
-.signal-item[data-state="in_progress"] .signal-node { background: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
-.signal-card {
-  display: flex; align-items: center; justify-content: space-between; gap: 20px; min-height: 76px;
-  padding: 16px 18px; color: var(--text); text-decoration: none; background: var(--surface);
-  border: 1px solid var(--border); border-radius: var(--radius-md); transition: border-color 180ms ease-out, transform 180ms ease-out;
-}
-.signal-card:hover { color: var(--text); border-color: var(--border-strong); transform: translateX(3px); }
-.signal-card h2 { margin: 0 0 3px; font-size: 1.08rem; }
-.signal-card p { margin: 0; color: var(--muted); font-size: .875rem; }
-.signal-state { flex: 0 0 auto; color: var(--muted); font-size: .82rem; font-weight: 700; }
-.quiz-shell { max-width: 720px; margin: 0 auto; }
-.quiz-card { position: relative; overflow: hidden; padding: clamp(22px, 4vw, 36px); background: var(--surface-strong); border: 1px solid var(--border-strong); border-radius: var(--radius-md); box-shadow: var(--shadow); }
-.quiz-card::before { content: ""; position: absolute; inset: 0 0 auto; height: 3px; background: var(--accent); }
-.quiz-top { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 28px; }
-.quiz-step { margin: 0; color: var(--muted); font: 700 .76rem/1.3 Consolas, monospace; letter-spacing: .06em; text-transform: uppercase; }
-.skip-form { margin: 0; }
-.skip-link-button { min-height: 36px; padding: 6px 10px; border-color: transparent; background: transparent; color: var(--muted); font-size: .85rem; }
-.skip-link-button:hover { color: var(--text); background: var(--surface-raised); border-color: var(--border); }
-.question-title { max-width: 22ch; margin-bottom: 24px; font-size: clamp(1.45rem, 4vw, 2rem); }
-.option-list { display: grid; gap: 10px; margin: 0; padding: 0; border: 0; }
-.option-button { width: 100%; justify-content: flex-start; min-height: 52px; text-align: left; background: var(--surface); border-color: var(--border-strong); color: var(--text); }
-.option-button:hover { background: var(--surface-raised); border-color: var(--accent); color: var(--text); }
-.choice-row { position: relative; }
-.choice-row input { position: absolute; opacity: 0; pointer-events: none; }
-.choice-row label { display: block; margin: 0; padding: 13px 15px 13px 46px; background: var(--surface); border: 1px solid var(--border-strong); border-radius: var(--radius-sm); cursor: pointer; }
-.choice-row label::before { content: ""; position: absolute; top: 17px; left: 16px; width: 17px; height: 17px; border: 2px solid var(--muted); border-radius: 4px; }
-.choice-row input:checked + label { border-color: var(--accent); background: rgba(184, 242, 91, .07); }
-.choice-row input:checked + label::before { border-color: var(--accent); background: var(--accent); box-shadow: inset 0 0 0 3px var(--surface); }
-.choice-row input:focus-visible + label { outline: 3px solid var(--focus); outline-offset: 3px; }
-.quiz-actions { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 24px; }
-.quiz-actions .back-link { color: var(--muted); font-weight: 650; }
-.duration-exact { margin-top: 18px; padding-top: 18px; border-top: 1px solid var(--border); }
-.danger-note { margin-top: 20px; padding: 14px 16px; border-left: 3px solid var(--danger); background: rgba(255,146,151,.08); color: #ffd4d6; }
-.settings-list { display: grid; gap: 12px; }
-.settings-row { display: grid; grid-template-columns: minmax(150px,1fr) auto minmax(140px,auto) auto; align-items: center; gap: 12px; padding: 14px 16px; background: var(--surface-strong); border: 1px solid var(--border); border-radius: var(--radius-sm); }
-.settings-row label { margin: 0; }
-.settings-row > label { display: flex; align-items: center; gap: 8px; }
-.settings-row input[type="checkbox"] { width: 18px; min-height: 18px; margin: 0; flex: 0 0 auto; }
-.settings-row select { min-width: 140px; }
-.move-actions { display: flex; gap: 6px; }
-.move-actions button { min-width: 42px; padding-inline: 10px; }
-@media (max-width: 980px) {
-  .nav-shell { display: block; padding: 12px 0 8px; }
-  .brand { min-height: 44px; }
-  .nav-links { justify-content: flex-start; margin: 4px -8px 0; overflow-x: auto; scrollbar-width: none; }
-  .nav-links::-webkit-scrollbar { display: none; }
-  .nav-links a { flex: 0 0 auto; }
-}
-@media (max-width: 760px) {
-  .wrap { width: min(100% - 32px, 1184px); }
-  main.wrap { padding-block: 24px 40px; }
-  .hero { padding-left: 28px; }
-  .row { grid-template-columns: 1fr; }
-  .actions > .section-heading { flex-basis: 100%; }
-  .table-scroll { margin-inline: -12px; padding-inline: 12px; }
-  th, td { padding: 12px 10px; }
-  .review-grid { grid-template-columns: 1fr; }
-  .history-heading { align-items: flex-start; }
-  .settings-row { grid-template-columns: 1fr auto; }
-  .settings-row select, .move-actions { grid-column: 1 / -1; }
-  .meal-grid, .recipe-columns, .menu-facts { grid-template-columns: 1fr; }
-}
-@media (max-width: 420px) {
-  .actions .button, .actions button { flex: 1 1 auto; }
-  .search-control { flex-basis: 100%; }
-  .section-header, .history-heading { align-items: stretch; flex-direction: column; }
-  .section-header .button { width: 100%; }
-  .checkin-hero { align-items: stretch; flex-direction: column; }
-  .checkin-progress { text-align: left; }
-  .signal-item { padding-left: 42px; }
-  .signal-list::before { left: 12px; }
-  .signal-node { left: 4px; }
-  .signal-card { align-items: flex-start; flex-direction: column; gap: 8px; }
-  .quiz-actions { align-items: stretch; flex-direction: column-reverse; }
-  .quiz-actions button { width: 100%; }
-}
-@media (prefers-reduced-motion: reduce) {
-  *, *::before, *::after { scroll-behavior: auto !important; transition-duration: .01ms !important; }
-}
-"""
-
-
 def esc(value: object) -> str:
     return html.escape("" if value is None else str(value))
 
 
+def icon(name: str) -> str:
+    return f'<span class="icon icon-{esc(name)}" aria-hidden="true"></span>'
+
+
 def layout(title: str, body: str) -> bytes:
-    nav_items = (
-        ("/daily", "今日建议", title in {"今日建议与明日菜单", "每日复盘"}),
-        (f"/check-ins/{date.today().isoformat()}", "今日状态", title in {"今日状态", "状态问答", "状态设置"}),
-        ("/history", "历史建议", title == "历史建议"),
-        ("/tasks/photo", "食物照片", title == "上传食物照片"),
-        ("/tasks/material", "原材料分析", title == "原材料分析"),
-        ("/foods", "营养库", title in {"食品营养库", "新增食品", "编辑食品"}),
-        ("/overview", "记录与记忆", title == "记录与记忆"),
+    today = date.today()
+    checkin_path = f"/check-ins/{today.isoformat()}"
+    nav_groups = (
+        ("日常", (
+            ("/", "今日总览", "dashboard", title == "首页"),
+            ("/daily", "今日建议", "advice", title in {"今日建议与明日菜单", "每日复盘"}),
+            (checkin_path, "今日状态", "checkin", title in {"今日状态", "状态问答", "状态设置"}),
+        )),
+        ("处理", (
+            ("/tasks/photo", "照片任务", "photo", title in {"上传食物照片", "任务详情"}),
+            ("/tasks/material", "原材料", "material", title == "原材料分析"),
+            ("/tasks", "全部任务", "tasks", title == "任务列表"),
+        )),
+        ("资料", (
+            ("/foods", "食品营养库", "foods", title in {"食品营养库", "新增食品", "编辑食品"}),
+            ("/history", "历史建议", "history", title == "历史建议"),
+            ("/overview", "记录与记忆", "memory", title == "记录与记忆"),
+        )),
     )
-    nav_links = "".join(
-        (f'<a href="{href}" aria-current="page">{label}</a>' if current else f'<a href="{href}">{label}</a>')
-        for href, label, current in nav_items
+    nav_sections = []
+    for label, items in nav_groups:
+        links = []
+        for href, item_label, icon_name, current in items:
+            current_attr = ' aria-current="page"' if current else ""
+            links.append(
+                f'<a class="nav-link" href="{href}"{current_attr} title="{esc(item_label)}">'
+                f'{icon(icon_name)}<span class="nav-label">{esc(item_label)}</span></a>'
+            )
+        nav_sections.append(
+            f'<section class="nav-group" aria-label="{esc(label)}"><p class="nav-group-label">{esc(label)}</p>{"".join(links)}</section>'
+        )
+    page_titles = {
+        "首页": "今日总览", "今日建议与明日菜单": "今日建议", "每日复盘": "每日复盘",
+        "今日状态": "今日状态", "状态问答": "状态问答", "状态设置": "状态设置",
+        "上传食物照片": "照片任务", "原材料分析": "原材料分析", "任务列表": "全部任务",
+        "任务详情": "任务详情", "食品营养库": "食品营养库", "新增食品": "新增食品",
+        "编辑食品": "编辑食品", "历史建议": "历史建议", "记录与记忆": "记录与记忆",
+        "操作失败": "操作失败", "未找到": "未找到",
+    }
+    top_action = "" if title in {"今日状态", "状态问答", "状态设置"} else (
+        f'<a class="button" href="{checkin_path}">{icon("checkin")}记录状态</a>'
     )
-    page = f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{esc(title)} · MealCircuit</title><style>{STYLE}</style></head><body>
-    <a class="skip-link" href="#main-content">跳到主要内容</a><nav class="nav" aria-label="主导航"><div class="wrap nav-shell"><a class="brand" href="/"><span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span>MealCircuit</a><div class="nav-links">{nav_links}</div></div></nav><main class="wrap" id="main-content" tabindex="-1">{body}</main></body></html>"""
+    date_label = f"{today.month}月{today.day}日 周{'一二三四五六日'[today.weekday()]}"
+    page = f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{esc(title)} · MealCircuit</title><link rel="stylesheet" href="/assets/ui/app.css?v=20260707d"><script src="/assets/ui/app.js?v=20260707d" defer></script></head><body>
+    <a class="skip-link" href="#main-content">跳到主要内容</a>
+    <div class="app-shell"><aside class="app-sidebar" id="app-sidebar" aria-label="主导航"><a class="sidebar-brand" href="/">MealCircuit</a><nav class="sidebar-nav">{"".join(nav_sections)}</nav><div class="sidebar-footer"><button class="icon-button" type="button" data-nav-collapse aria-label="收起侧栏" title="收起侧栏">{icon("collapse")}</button></div></aside>
+    <button class="nav-scrim" type="button" data-nav-close aria-label="关闭导航"></button>
+    <header class="app-topbar"><div class="topbar-start"><button class="icon-button mobile-menu" type="button" data-nav-open aria-controls="app-sidebar" aria-expanded="false" aria-label="打开导航">{icon("menu")}</button><p class="topbar-title">{esc(page_titles.get(title, title))}</p></div><div class="topbar-end"><span class="utility muted">{date_label}</span><span class="local-status">{icon("local")}<span>仅存于本机</span></span>{top_action}</div></header>
+    <main class="app-content" id="main-content" tabindex="-1">{body}</main></div></body></html>"""
     return page.encode("utf-8")
 
 
@@ -476,7 +162,7 @@ def render_review_cards(reviews: list[dict]) -> str:
             f'<span class="review-signal">{esc(status_labels.get(signal, signal))}</span></header>'
             f'<p class="review-summary">{esc(summary)}</p><p class="review-advice">{esc(advice)}</p>'
             f'<footer class="review-card__footer"><span class="review-meta">{meta}</span>'
-            f'<a class="review-link" href="/reviews/{review_date}">打开复盘 <span aria-hidden="true">→</span></a></footer></article>'
+            f'<a class="review-link" href="/reviews/{review_date}">打开复盘 {icon("chevron")}</a></footer></article>'
         )
     return '<div class="review-grid">' + ("".join(cards) or '<p class="review-empty">还没有历史建议。保存每日记录后，复盘会按日期出现在这里。</p>') + "</div>"
 
@@ -491,6 +177,111 @@ def render_checkin_callout(checkin_date: str) -> str:
         f'<section class="card"><div class="section-header"><div><p class="eyebrow">Daily signals</p>'
         f'<h2>{esc(label)}</h2><p class="muted">用点击补充体重、训练、饥饿饱腹、睡眠和肠胃反应。</p></div>'
         f'<a class="button secondary" href="/check-ins/{esc(checkin_date)}">{action}</a></div></section>'
+    )
+
+
+def _trend_cell(module: dict | None, kind: str) -> str:
+    if module is None:
+        return '<span class="trend-cell" data-state="missing" title="缺失">·</span>'
+    if module["status"] == "skipped":
+        return '<span class="trend-cell" data-state="skipped" title="用户跳过">—</span>'
+    if kind == "weight":
+        if module.get("measured") != "yes":
+            return '<span class="trend-cell" data-state="unmeasured" title="当天未测体重">未</span>'
+        value = module.get("weight_kg")
+        return f'<span class="trend-cell" data-state="recorded" title="体重 {esc(value)} kg">{esc(value)}</span>'
+    if kind == "training":
+        shown = "训" if module.get("trained") == "yes" else "休"
+        return f'<span class="trend-cell" data-state="recorded" title="{esc(module["summary"])}">{shown}</span>'
+    level = module.get("hunger_level")
+    if level is None:
+        return '<span class="trend-cell" data-state="recorded" title="饥饿感已记录">记</span>'
+    return f'<span class="trend-cell" data-state="recorded" data-level="{level}" title="{esc(module["summary"])}">{level}</span>'
+
+
+def render_dashboard(snapshot: dict) -> str:
+    daily = snapshot["daily"]
+    if daily["status"] == "completed":
+        conclusion = snapshot["conclusion"] or snapshot["core_advice"][0]
+        decision_meta = snapshot["core_advice"][0] if snapshot["core_advice"] else "复盘已完成"
+    elif daily["status"] == "pending":
+        conclusion = "记录已保存，等待生成今日判断"
+        decision_meta = "处理待办后，这里会显示核心建议与次日菜单。"
+    else:
+        conclusion = "今天尚未形成判断"
+        decision_meta = "先记录今日状态或饮食，系统会建立可追溯的复盘待办。"
+
+    dates = "".join(
+        f'<span class="trend-date">{date.fromisoformat(item["date"]).month}.{date.fromisoformat(item["date"]).day}</span>'
+        for item in snapshot["trend"]
+    )
+    rows = []
+    for key, label in (("weight", "体重"), ("training", "训练"), ("hunger", "饥饿")):
+        cells = "".join(_trend_cell(item["modules"].get(key), key) for item in snapshot["trend"])
+        rows.append(f'<div class="trend-row"><span class="trend-label">{label}</span>{cells}</div>')
+    trend = (
+        '<div class="trend" role="img" aria-label="近14天已发布状态趋势。点表示缺失，虚线表示用户跳过。">'
+        '<div class="trend-head"><h2>14天趋势</h2><div class="trend-legend">'
+        '<span><i class="trend-key recorded"></i>已记录</span><span><i class="trend-key skipped"></i>跳过或缺失</span>'
+        f'</div></div><div class="trend-days">{dates}</div>{"".join(rows)}</div>'
+    )
+
+    state_labels = {"not_started": "待填写", "in_progress": "有草稿", "completed": "已记录", "skipped": "已跳过"}
+    module_rows = []
+    for module in snapshot["checkin"]["modules"]:
+        if not module["enabled"]:
+            continue
+        display_state = "in_progress" if module["has_draft"] else module["status"]
+        summary = module["summary"] or module["description"]
+        module_rows.append(
+            '<div class="module-row"><div class="module-main">'
+            f'<div class="module-name">{esc(module["label"])}</div><div class="module-summary">{esc(summary)}</div></div>'
+            f'<span class="module-state {esc(display_state)}"><i class="state-dot"></i>{esc(state_labels.get(display_state, display_state))}</span></div>'
+        )
+
+    menu = snapshot["tomorrow_menu"]
+    if menu:
+        meal_items = []
+        for meal in menu["meals"]:
+            foods = "、".join(meal["foods"])
+            meal_items.append(
+                f'<li class="meal-item"><span class="meal-node" aria-hidden="true"></span><div class="meal-title">'
+                f'<span>{esc(meal["name"])}</span><span class="meal-time">次日</span></div>'
+                f'<p class="meal-foods">{esc(foods)}</p></li>'
+            )
+        snack = menu["conditional_snack"]
+        meal_items.append(
+            '<li class="meal-item"><span class="meal-node" aria-hidden="true"></span>'
+            f'<div class="meal-title"><span>条件加餐</span><span class="meal-time">按条件</span></div>'
+            f'<p class="meal-foods">{esc(snack["condition"])} · {esc("、".join(snack["options"]))}</p></li>'
+        )
+        menu_html = f'<ol class="meal-timeline">{"".join(meal_items)}</ol>'
+    else:
+        menu_html = '<div class="empty-state">完成当日复盘后，这里会显示真实的次日菜单。</div>'
+
+    if snapshot["queue"]:
+        queue_rows = "".join(
+            f'<tr><td>{esc(item["label"])}</td><td>{esc(item["evidence"])}</td>'
+            f'<td><span class="status pending">待处理</span></td><td><a class="queue-link" href="{esc(item["href"])}">打开{icon("chevron")}</a></td></tr>'
+            for item in snapshot["queue"][:8]
+        )
+        queue_html = (
+            '<div class="table-scroll" tabindex="0" role="region" aria-label="处理队列"><table class="queue-table"><thead>'
+            '<tr><th scope="col">任务类型</th><th scope="col">关联证据</th><th scope="col">状态</th><th scope="col">下一步</th></tr>'
+            f'</thead><tbody>{queue_rows}</tbody></table></div>'
+        )
+    else:
+        queue_html = '<div class="empty-state">当前没有待处理任务。</div>'
+
+    coverage = snapshot["checkin"]["coverage"]
+    return (
+        '<div class="dashboard-grid">'
+        f'<section class="panel decision-panel"><p class="eyebrow">今日结论</p><h1 class="decision-copy">{esc(conclusion)}</h1>'
+        f'<p class="decision-meta">{esc(decision_meta)}</p>{trend}<p class="utility muted">状态覆盖 {coverage["handled"]} / {coverage["due"]}</p></section>'
+        f'<section class="panel"><div class="panel-title"><h2>今日状态</h2><a href="/check-ins/{esc(snapshot["date"])}">查看</a></div><div class="module-list">{"".join(module_rows)}</div></section>'
+        f'<section class="panel"><div class="panel-title"><h2>明日计划</h2><a href="/daily">完整建议</a></div>{menu_html}</section>'
+        '</div>'
+        f'<section class="panel queue-panel"><div class="panel-title"><h2>处理队列</h2><span class="queue-count">待处理 {len(snapshot["queue"])}</span></div>{queue_html}</section>'
     )
 
 
@@ -636,7 +427,7 @@ def render_checkin_question(checkin_date: str, module_key: str, requested_questi
         f'<input type="hidden" name="expected_version" value="{esc(module["version"])}">'
         f'<button class="skip-link-button" type="submit">跳过本模块</button></form></div>'
         f'<h1 class="question-title">{esc(question["label"])}</h1>{control}{severe}'
-        f'<div class="quiz-actions"><a class="back-link" href="{esc(back_href)}">← 返回</a>'
+        f'<div class="quiz-actions"><a class="back-link" href="{esc(back_href)}">返回</a>'
         + (f'<form method="post" action="/check-ins/{esc(checkin_date)}/{esc(module_key)}/discard-draft">'
            f'<input type="hidden" name="expected_version" value="{esc(module["version"])}">'
            f'<button class="secondary" type="submit">放弃草稿</button></form>' if module["has_draft"] else '<span></span>')
@@ -655,9 +446,9 @@ def render_checkin_settings() -> str:
         optional = " selected" if setting["frequency"] == "optional" else ""
         move = []
         if index:
-            move.append(f'<button class="secondary" name="move" value="{esc(key)}:up" aria-label="上移{esc(definition["label"])}">↑</button>')
+            move.append(f'<button class="secondary" name="move" value="{esc(key)}:up" aria-label="上移{esc(definition["label"])}" title="上移">{icon("up")}</button>')
         if index < len(settings) - 1:
-            move.append(f'<button class="secondary" name="move" value="{esc(key)}:down" aria-label="下移{esc(definition["label"])}">↓</button>')
+            move.append(f'<button class="secondary" name="move" value="{esc(key)}:down" aria-label="下移{esc(definition["label"])}" title="下移">{icon("down")}</button>')
         rows.append(
             f'<div class="settings-row"><label><input type="checkbox" name="enabled_{esc(key)}" value="1"{checked}> '
             f'{esc(definition["label"])}</label><span class="muted small">{esc(definition["description"])}</span>'
@@ -694,12 +485,14 @@ def food_form(item: dict | None = None) -> str:
         for key, label in priority_options.items()
     )
     return f"""
-    <form method="post" action="{action}"><input type="hidden" name="source_key" value="{val('source_key')}"><div class="row"><div><label for="food-name">名称 *</label><input id="food-name" name="name" required value="{val('name')}"></div><div><label for="food-brand">品牌</label><input id="food-brand" name="brand" value="{val('brand')}"></div></div>
-    <div class="row"><div><label for="food-basis">营养基准 *</label><select id="food-basis" name="basis"><option value="100g" {selected100}>每 100g</option><option value="serving" {selected_serving}>每份</option></select></div><div><label for="food-serving">份量单位（按份时必填）</label><input id="food-serving" name="serving_unit" placeholder="例如：1 片 / 1 包（35g）" value="{val('serving_unit')}"></div></div>
-    <div class="row"><div><label for="food-energy">能量 kcal</label><input id="food-energy" type="number" min="0" step="any" name="energy_kcal" value="{val('energy_kcal')}"></div><div><label for="food-protein">蛋白质 g</label><input id="food-protein" type="number" min="0" step="any" name="protein_g" value="{val('protein_g')}"></div><div><label for="food-carbs">碳水 g</label><input id="food-carbs" type="number" min="0" step="any" name="carbs_g" value="{val('carbs_g')}"></div><div><label for="food-fat">脂肪 g</label><input id="food-fat" type="number" min="0" step="any" name="fat_g" value="{val('fat_g')}"></div><div><label for="food-fiber">膳食纤维 g</label><input id="food-fiber" type="number" min="0" step="any" name="fiber_g" value="{val('fiber_g')}"></div><div><label for="food-sodium">钠 mg</label><input id="food-sodium" type="number" min="0" step="any" name="sodium_mg" value="{val('sodium_mg')}"></div></div>
-    <div class="row"><div><label for="food-category">食品类别</label><select id="food-category" name="category">{categories}</select></div><div><label for="food-priority">菜单优先级</label><select id="food-priority" name="menu_priority">{priorities}</select></div></div>
-    <label for="food-default-portion">默认份量</label><input id="food-default-portion" name="default_portion" placeholder="例如：50–100g / 1包40g" value="{val('default_portion')}"><label for="food-usage-rule">菜单使用条件</label><textarea id="food-usage-rule" name="usage_rule">{val('usage_rule')}</textarea>
-    <label for="food-source">来源链接</label><input id="food-source" type="url" name="source_url" value="{val('source_url')}"><label for="food-photo-path">包装照片路径</label><input id="food-photo-path" name="package_photo_path" placeholder="可记录本机路径" value="{val('package_photo_path')}"><label for="food-notes">备注</label><textarea id="food-notes" name="notes">{val('notes')}</textarea><div class="actions form-actions"><button type="submit">保存</button><a class="button secondary" href="/foods">取消</a></div></form>"""
+    <form method="post" action="{action}"><input type="hidden" name="source_key" value="{val('source_key')}">
+    <fieldset class="form-section"><legend>基本信息</legend><div class="row"><div><label for="food-name">名称 *</label><input id="food-name" name="name" required value="{val('name')}"></div><div><label for="food-brand">品牌</label><input id="food-brand" name="brand" value="{val('brand')}"></div></div>
+    <div class="row"><div><label for="food-basis">营养基准 *</label><select id="food-basis" name="basis"><option value="100g" {selected100}>每 100g</option><option value="serving" {selected_serving}>每份</option></select></div><div><label for="food-serving">份量单位（按份时必填）</label><input id="food-serving" name="serving_unit" placeholder="例如：1 片 / 1 包（35g）" value="{val('serving_unit')}"></div></div></fieldset>
+    <fieldset class="form-section"><legend>营养数据</legend><div class="row"><div><label for="food-energy">能量 kcal</label><input id="food-energy" type="number" min="0" step="any" name="energy_kcal" value="{val('energy_kcal')}"></div><div><label for="food-protein">蛋白质 g</label><input id="food-protein" type="number" min="0" step="any" name="protein_g" value="{val('protein_g')}"></div><div><label for="food-carbs">碳水 g</label><input id="food-carbs" type="number" min="0" step="any" name="carbs_g" value="{val('carbs_g')}"></div><div><label for="food-fat">脂肪 g</label><input id="food-fat" type="number" min="0" step="any" name="fat_g" value="{val('fat_g')}"></div><div><label for="food-fiber">膳食纤维 g</label><input id="food-fiber" type="number" min="0" step="any" name="fiber_g" value="{val('fiber_g')}"></div><div><label for="food-sodium">钠 mg</label><input id="food-sodium" type="number" min="0" step="any" name="sodium_mg" value="{val('sodium_mg')}"></div></div></fieldset>
+    <fieldset class="form-section"><legend>菜单规则</legend><div class="row"><div><label for="food-category">食品类别</label><select id="food-category" name="category">{categories}</select></div><div><label for="food-priority">菜单优先级</label><select id="food-priority" name="menu_priority">{priorities}</select></div></div>
+    <label for="food-default-portion">默认份量</label><input id="food-default-portion" name="default_portion" placeholder="例如：50–100g / 1包40g" value="{val('default_portion')}"><label for="food-usage-rule">菜单使用条件</label><textarea id="food-usage-rule" name="usage_rule">{val('usage_rule')}</textarea></fieldset>
+    <fieldset class="form-section"><legend>来源与备注</legend><label for="food-source">来源链接</label><input id="food-source" type="url" name="source_url" value="{val('source_url')}"><label for="food-photo-path">包装照片路径</label><input id="food-photo-path" name="package_photo_path" placeholder="可记录本机路径" value="{val('package_photo_path')}"><label for="food-notes">备注</label><textarea id="food-notes" name="notes">{val('notes')}</textarea></fieldset>
+    <div class="actions form-actions"><button type="submit">保存</button><a class="button secondary" href="/foods">取消</a></div></form>"""
 
 
 def render_list(items: list, empty_text: str = "暂无") -> str:
@@ -829,13 +622,13 @@ def render_daily_review_result(result: dict) -> str:
     for meal in menu["meals"]:
         protein = meal["protein_g"]
         mode = MEAL_MODE_LABELS.get(meal.get("mode"), "")
-        mode_html = f'<p class="meal-mode">{esc(mode)}</p>' if mode else ""
+        mode_html = f'<span class="meal-time">{esc(mode)}</span>' if mode else '<span class="meal-time">次日</span>'
         meals.append(
-            f'<article class="meal-panel"><h3>{esc(meal["name"])}</h3>{mode_html}'
-            f'{render_list(meal["foods"])}'
-            f'<p><strong>大致份量：</strong>{esc(meal["portion_guidance"])}</p>'
-            f'<p><strong>蛋白估算：</strong>{esc(protein[0])}–{esc(protein[1])}g</p>'
-            f'<h4>替换项</h4>{render_list(meal["substitutions"])}</article>'
+            '<li class="meal-item"><span class="meal-node" aria-hidden="true"></span>'
+            f'<div class="meal-title"><span>{esc(meal["name"])}</span>{mode_html}</div>'
+            f'<p class="meal-foods">{esc("、".join(meal["foods"]))}</p>'
+            f'<p class="meal-foods">{esc(meal["portion_guidance"])} · 蛋白 {esc(protein[0])}–{esc(protein[1])}g</p>'
+            f'<p class="meal-foods">替换：{esc("、".join(meal["substitutions"]) or "无")}</p></li>'
         )
     snack = menu["conditional_snack"]
     priority_decisions = []
@@ -851,23 +644,23 @@ def render_daily_review_result(result: dict) -> str:
     priority_html = '<ul class="structured-list">' + ''.join(f'<li>{item}</li>' for item in priority_decisions) + '</ul>'
     raw = esc(json.dumps(result, ensure_ascii=False, indent=2))
     return (
-        f'<p class="notice card"><strong>今日状态：</strong>{esc(status_labels[result["system_status"]])}</p>'
-        '<h3>事实</h3>' + render_list(result["facts"])
-        + '<h3>系统推断</h3>' + render_list(result["inferences"])
-        + '<h3>核心建议</h3>' + render_list(result["core_advice"])
-        + '<h3>不需要调整</h3>' + render_list(result["do_not_adjust"])
-        + '<h3>风险信号</h3>' + render_list(result["risk_signals"])
-        + '<h3>优先食品裁决</h3>' + priority_html
-        + f'<section class="menu-section"><h2>{esc(menu["date"])} 明日餐单</h2>'
-        + f'<p><strong>用餐环境：</strong>{esc(menu["environment"])} · <strong>每日蛋白目标：</strong>'
-        + f'{esc(menu["protein_target_g"][0])}–{esc(menu["protein_target_g"][1])}g</p></section>'
-        + '<div class="meal-grid">' + ''.join(meals) + '</div>'
+        '<div class="report-grid"><section class="panel">'
+        + f'<p class="notice card"><strong>今日状态：</strong>{esc(status_labels[result["system_status"]])}</p>'
+        + '<div class="report-section"><h2>事实</h2>' + render_list(result["facts"]) + '</div>'
+        + '<div class="report-section"><h2>系统推断</h2>' + render_list(result["inferences"]) + '</div>'
+        + '<div class="report-section"><h2>核心建议</h2>' + render_list(result["core_advice"]) + '</div>'
+        + '<div class="report-section"><h2>不需要调整</h2>' + render_list(result["do_not_adjust"]) + '</div>'
+        + '<div class="report-section"><h2>风险信号</h2>' + render_list(result["risk_signals"]) + '</div>'
+        + '<div class="report-section"><h2>优先食品裁决</h2>' + priority_html + '</div></section>'
+        + f'<aside class="panel report-aside"><p class="eyebrow">{esc(menu["date"])}</p><h2>明日计划</h2>'
+        + f'<p class="muted small">{esc(menu["environment"])} · 蛋白目标 {esc(menu["protein_target_g"][0])}–{esc(menu["protein_target_g"][1])}g</p>'
+        + '<ol class="meal-timeline">' + ''.join(meals) + '</ol>'
+        + '<div class="report-section"><h3>条件加餐</h3>'
+        + f'<p>{esc(snack["condition"])}</p>{render_list(snack["options"])}</div>'
+        + f'<div class="report-section"><h3>训练日调整</h3><p>{esc(menu["training_adjustment"])}</p></div>'
+        + f'<div class="report-section"><h3>肠胃异常调整</h3><p>{esc(menu["gut_adjustment"])}</p></div></aside></div>'
         + render_home_cooking_menu(menu)
-        + '<section class="menu-section"><h3>条件加餐</h3>'
-        + f'<p>{esc(snack["condition"])}</p>{render_list(snack["options"])}'
-        + f'<h3>训练日调整</h3><p>{esc(menu["training_adjustment"])}</p>'
-        + f'<h3>肠胃异常调整</h3><p>{esc(menu["gut_adjustment"])}</p></section>'
-        + f'<p class="card"><strong>一句话复盘：</strong>{esc(result["one_line_review"])}</p>'
+        + f'<p class="panel"><strong>一句话复盘：</strong>{esc(result["one_line_review"])}</p>'
         + f'<details><summary>查看原始 JSON</summary><pre>{raw}</pre></details>'
     )
 
@@ -887,6 +680,25 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
 
+    def send_static(self, relative_path: str) -> None:
+        root = STATIC_ROOT.resolve()
+        try:
+            target = (root / urllib.parse.unquote(relative_path)).resolve()
+            target.relative_to(root)
+        except (ValueError, OSError):
+            raise FileNotFoundError(relative_path)
+        if not target.is_file():
+            raise FileNotFoundError(relative_path)
+        payload = target.read_bytes()
+        content_type = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(payload)))
+        self.send_header("Cache-Control", "public, max-age=3600")
+        self.send_security_headers()
+        self.end_headers()
+        self.wfile.write(payload)
+
     def redirect(self, location: str) -> None:
         self.send_response(303)
         self.send_header("Location", location)
@@ -897,7 +709,11 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("X-Frame-Options", "DENY")
-        self.send_header("Content-Security-Policy", "default-src 'self'; img-src 'self' data:; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'")
+        self.send_header(
+            "Content-Security-Policy",
+            "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; "
+            "script-src 'self'; form-action 'self'; frame-ancestors 'none'",
+        )
 
     def validate_origin(self) -> None:
         host_header = self.headers.get("Host", "")
@@ -962,27 +778,16 @@ class Handler(BaseHTTPRequestHandler):
         return fields, files
 
     def render_error(self, error: Exception, status: int = 400) -> None:
-        self.send_html("操作失败", f'<section class="card error"><h2>操作失败</h2><p>{esc(error)}</p><a class="button secondary" href="javascript:history.back()">返回</a></section>', status)
+        self.send_html("操作失败", f'<section class="card error"><h1>操作失败</h1><p>{esc(error)}</p><a class="button secondary" href="/">返回总览</a></section>', status)
 
     def do_GET(self) -> None:
         parsed = urllib.parse.urlparse(self.path)
         path, query = parsed.path.rstrip("/") or "/", urllib.parse.parse_qs(parsed.query)
         try:
-            if path == "/":
-                tasks = service.list_tasks()
-                pending_reviews = service.list_daily_reviews("pending")
-                pending = sum(1 for t in tasks if t["status"] == "pending") + len(pending_reviews)
-                review_links = render_list([f'{r["review_date"]}：待生成核心建议与次日菜单' for r in pending_reviews], "暂无待复盘日期")
-                daily = service.daily_state()
-                if daily["status"] == "completed":
-                    first_advice = daily["review"]["result_json"]["core_advice"][0]
-                    daily_status = f'<p>{esc(first_advice)}</p><p class="muted">明日菜单：{esc(daily["review"]["result_json"]["tomorrow_menu"]["date"])}</p>'
-                elif daily["status"] == "pending":
-                    daily_status = '<p>今日记录已保存，等待 Agent 生成核心建议和明日菜单。</p>'
-                else:
-                    daily_status = '<p>今天尚未记录，进入后可直接提交自然语言饮食记录。</p>'
-                body = f'''<section class="hero"><h1>本地饮食反馈工作台</h1><p>记录一餐，校准长期趋势。</p></section><div class="grid"><section class="card"><h2>今日建议</h2>{daily_status}<div class="actions"><a class="button" href="/daily">查看建议与菜单</a><a class="button secondary" href="/history">历史建议</a></div></section><section class="card"><h2>食物照片</h2><p>上传餐食照片，记录份量区间与营养估算。</p><a class="button" href="/tasks/photo">上传食物照片</a></section><section class="card"><h2>原材料分析</h2><p>输入现有食材，获取低失败率组合与调整。</p><a class="button" href="/tasks/material">分析现有食材</a></section></div>{render_checkin_callout(date.today().isoformat())}<section class="card workflow-card"><h2>待办状态</h2><div class="metric">{pending}</div><p class="muted">待 Agent 处理</p><code>python -m mealcircuit.agent_cli pending</code></section><section class="card"><h2>待生成每日复盘</h2>{review_links}</section>'''
-                self.send_html("首页", body)
+            if path.startswith("/assets/ui/"):
+                self.send_static(path.removeprefix("/assets/ui/"))
+            elif path == "/":
+                self.send_html("首页", render_dashboard(service.dashboard_snapshot()))
             elif path == "/daily":
                 daily = service.daily_state()
                 if daily["status"] == "completed":
@@ -999,7 +804,8 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     state = '<p><span class="status pending">尚未记录</span></p>'
                     content = f'''<p>直接记录今天吃了什么和身体状态，保存后系统会创建每日复盘待办。</p><form method="post" action="/records"><input type="hidden" name="record_date" value="{esc(daily["date"])}"><label for="daily-input">今日自然语言记录</label><textarea id="daily-input" name="raw_input" required></textarea><div class="form-actions"><button>保存并创建复盘</button></div></form>'''
-                self.send_html("今日建议与明日菜单", f'<section class="card"><div class="section-header"><div><h1>今日建议与明日菜单</h1>{state}</div><a class="button secondary" href="/history">查看历史建议</a></div></section>{render_checkin_callout(daily["date"])}<section class="card">{content}</section>')
+                content_shell = content if daily["status"] == "completed" else f'<section class="panel">{content}</section>'
+                self.send_html("今日建议与明日菜单", f'<section class="panel"><div class="section-header"><div><h1>今日建议与明日菜单</h1>{state}</div><a class="button secondary" href="/history">查看历史建议</a></div></section>{render_checkin_callout(daily["date"])}{content_shell}')
             elif path == "/history":
                 reviews = service.list_daily_reviews()
                 body = (
@@ -1049,10 +855,10 @@ class Handler(BaseHTTPRequestHandler):
                 body = f'<section class="card"><div class="actions"><h1 class="section-heading">食品营养库</h1><a class="button" href="/foods/new">新增食品</a></div><form method="get"><label for="food-search">检索名称或品牌</label><div class="actions"><input class="search-control" id="food-search" name="q" value="{esc(q)}"><button>检索</button></div></form><div class="table-scroll" tabindex="0" role="region" aria-label="食品营养库"><table><thead><tr><th scope="col">名称</th><th scope="col">品牌</th><th scope="col">菜单优先级</th><th scope="col">基准</th><th scope="col">kcal</th><th scope="col">蛋白质</th><th scope="col"></th></tr></thead><tbody>{rows}</tbody></table></div><p class="muted">高优先级表示同功能下优先选择，不表示每天强制追加。</p></section>'
                 self.send_html("食品营养库", body)
             elif path == "/foods/new":
-                self.send_html("新增食品", f'<section class="card"><h1>新增食品 / 原料</h1>{food_form()}</section>')
+                self.send_html("新增食品", f'<div class="section-header"><div><h1>新增食品 / 原料</h1><p class="muted">按包装标签或可靠来源保存，未知数据保持为空。</p></div></div>{food_form()}')
             elif path.startswith("/foods/"):
                 food = service.get_food(path.split("/")[2])
-                self.send_html("编辑食品", f'<section class="card"><h1>编辑食品 / 原料</h1>{food_form(food)}<form method="post" action="/foods/{esc(food["id"])}/delete" onsubmit="return confirm(\'确认删除？历史仍会保留。\')"><button class="danger">删除</button></form></section>')
+                self.send_html("编辑食品", f'<div class="section-header"><div><h1>编辑食品 / 原料</h1><p class="muted">修改会保留历史版本。</p></div></div>{food_form(food)}<section class="panel error"><h2>危险操作</h2><p>删除后不会再用于菜单，但历史仍会保留。</p><form method="post" action="/foods/{esc(food["id"])}/delete" onsubmit="return confirm(\'确认删除？历史仍会保留。\')"><button class="danger">删除食品</button></form></section>')
             elif path == "/overview":
                 info = service.overview()
                 memories = "".join(f'<li><strong>{esc(m["kind"])}</strong> {esc(m["content"])} <span class="muted">{esc(m["evidence"])}</span></li>' for m in info["memories"]) or '<li class="muted">暂无长期记忆</li>'
@@ -1071,12 +877,13 @@ class Handler(BaseHTTPRequestHandler):
                         f'<pre>python -m mealcircuit.agent_cli day-context {esc(review_date)} --output context.json\n'
                         f'python -m mealcircuit.agent_cli day-complete {esc(review_date)} --file result.json</pre>'
                     )
+                result_shell = result if review["status"] == "completed" else f'<section class="panel"><h2>核心建议与次日菜单</h2>{result}</section>'
                 body = (
-                    f'<section class="card"><h1>{esc(review_date)} 每日复盘</h1>'
+                    f'<section class="panel"><h1>{esc(review_date)} 每日复盘</h1>'
                     f'<p><span class="status {esc(review["status"])}">{esc(review["status"])}</span> · '
                     f'版本 {esc(review["result_version"])}</p></section>'
                     + render_checkin_callout(review_date)
-                    + f'<section class="card"><h2>核心建议与次日菜单</h2>{result}</section>'
+                    + result_shell
                 )
                 self.send_html("每日复盘", body)
             elif path.startswith("/media/"):
