@@ -895,6 +895,98 @@ def daily_state(review_date: str | None = None) -> dict:
     return {"date": target, "status": review["status"], "record_count": record_count, "review": review}
 
 
+def dashboard_snapshot(review_date: str | None = None, days: int = 14) -> dict:
+    """Build a read-only dashboard projection without queueing or reopening work."""
+    target = review_date or date.today().isoformat()
+    try:
+        end = date.fromisoformat(target)
+    except ValueError as exc:
+        raise ValidationError("日期必须是 YYYY-MM-DD") from exc
+    if days < 1 or days > 31:
+        raise ValidationError("趋势天数必须在 1–31 之间")
+
+    start = end - timedelta(days=days - 1)
+    timeline = {
+        (start + timedelta(days=offset)).isoformat(): {
+            "date": (start + timedelta(days=offset)).isoformat(),
+            "modules": {},
+        }
+        for offset in range(days)
+    }
+    init_db()
+    with connect() as conn:
+        rows = conn.execute(
+            """SELECT c.checkin_date,m.module_key,m.status,m.answers_json,m.version
+               FROM daily_checkins c JOIN daily_checkin_modules m ON m.checkin_id=c.id
+               WHERE c.checkin_date BETWEEN ? AND ? AND m.version>0
+               ORDER BY c.checkin_date,m.module_key""",
+            (start.isoformat(), target),
+        ).fetchall()
+
+    for row in rows:
+        item = row_dict(row)
+        answers = item.get("answers_json") or {}
+        module_key = item["module_key"]
+        module = {
+            "status": item["status"],
+            "summary": checkins.summarize(module_key, answers, item["status"]),
+        }
+        if item["status"] == "completed":
+            if module_key == "weight":
+                module["measured"] = answers.get("measured")
+                module["weight_kg"] = answers.get("weight_kg") if answers.get("measured") == "yes" else None
+            elif module_key == "training":
+                module["trained"] = answers.get("trained")
+                module["effort"] = answers.get("effort")
+            elif module_key == "hunger":
+                level = answers.get("hunger_level")
+                module["hunger_level"] = int(level) if isinstance(level, str) and level.isdigit() else None
+                module["hunger_time"] = answers.get("hunger_time")
+            elif module_key == "sleep":
+                module["sleep_duration"] = answers.get("sleep_duration")
+            elif module_key == "gut":
+                module["gut_state"] = answers.get("gut_state")
+        timeline[item["checkin_date"]]["modules"][module_key] = module
+
+    work = pending_work()
+    queue = [
+        {
+            "kind": "photo" if item["type"] == "photo" else "material",
+            "label": "照片任务" if item["type"] == "photo" else "原材料分析",
+            "evidence": item.get("original_input") or (Path(item["image_path"]).name if item.get("image_path") else "待补充"),
+            "status": item["status"],
+            "href": f'/tasks/{item["id"]}',
+            "created_at": item["created_at"],
+        }
+        for item in work["tasks"]
+    ]
+    queue.extend(
+        {
+            "kind": "review",
+            "label": "每日复盘",
+            "evidence": item["review_date"],
+            "status": item["status"],
+            "href": f'/reviews/{item["review_date"]}',
+            "created_at": item["updated_at"],
+        }
+        for item in work["daily_reviews"]
+    )
+    queue.sort(key=lambda item: item["created_at"], reverse=True)
+
+    daily = daily_state(target)
+    result = daily["review"].get("result_json") if daily["review"] else None
+    return {
+        "date": target,
+        "daily": daily,
+        "conclusion": (result or {}).get("one_line_review"),
+        "core_advice": (result or {}).get("core_advice") or [],
+        "tomorrow_menu": (result or {}).get("tomorrow_menu"),
+        "checkin": get_checkin_state(target),
+        "trend": list(timeline.values()),
+        "queue": queue,
+    }
+
+
 def add_memory(kind: str, content: str, evidence: str = "") -> dict:
     if kind not in {"preference", "gut_trigger", "constraint", "other"}:
         raise ValidationError("长期记忆类型无效")
