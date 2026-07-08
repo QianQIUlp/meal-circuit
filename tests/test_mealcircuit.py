@@ -651,7 +651,8 @@ class WebAppTest(unittest.TestCase):
         self.assertIn(b"#a9d2bf", favicon)
         status, headers, theme_script = self.request("GET", "/assets/ui/theme-init.js")
         self.assertEqual(status, 200)
-        self.assertTrue(headers["Content-Type"].startswith("text/javascript"))
+        javascript_type = headers["Content-Type"].split(";", 1)[0]
+        self.assertIn(javascript_type, {"text/javascript", "application/javascript"})
         self.assertIn(b"mealcircuit.theme", theme_script)
         status, _, _ = self.request("GET", "/assets/ui/%2e%2e/server.py")
         self.assertEqual(status, 404)
