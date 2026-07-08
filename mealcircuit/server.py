@@ -117,14 +117,14 @@ def layout(title: str, body: str) -> bytes:
         "操作失败": "操作失败", "未找到": "未找到",
     }
     top_action = "" if title in {"今日状态", "状态问答", "状态设置"} else (
-        f'<a class="button" href="{checkin_path}">{icon("checkin")}记录状态</a>'
+        f'<a class="button" href="{checkin_path}" aria-label="记录状态" title="记录状态">{icon("checkin")}记录状态</a>'
     )
     date_label = f"{today.month}月{today.day}日 周{'一二三四五六日'[today.weekday()]}"
-    page = f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{esc(title)} · MealCircuit</title><link rel="stylesheet" href="/assets/ui/app.css?v=20260707d"><script src="/assets/ui/app.js?v=20260707d" defer></script></head><body>
+    page = f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{esc(title)} · MealCircuit</title><link rel="icon" href="/assets/ui/favicon.svg" type="image/svg+xml"><script src="/assets/ui/theme-init.js?v=20260708b"></script><link rel="stylesheet" href="/assets/ui/app.css?v=20260708b"><script src="/assets/ui/app.js?v=20260708b" defer></script></head><body>
     <a class="skip-link" href="#main-content">跳到主要内容</a>
     <div class="app-shell"><aside class="app-sidebar" id="app-sidebar" aria-label="主导航"><a class="sidebar-brand" href="/">MealCircuit</a><nav class="sidebar-nav">{"".join(nav_sections)}</nav><div class="sidebar-footer"><button class="icon-button" type="button" data-nav-collapse aria-label="收起侧栏" title="收起侧栏">{icon("collapse")}</button></div></aside>
     <button class="nav-scrim" type="button" data-nav-close aria-label="关闭导航"></button>
-    <header class="app-topbar"><div class="topbar-start"><button class="icon-button mobile-menu" type="button" data-nav-open aria-controls="app-sidebar" aria-expanded="false" aria-label="打开导航">{icon("menu")}</button><p class="topbar-title">{esc(page_titles.get(title, title))}</p></div><div class="topbar-end"><span class="utility muted">{date_label}</span><span class="local-status">{icon("local")}<span>仅存于本机</span></span>{top_action}</div></header>
+    <header class="app-topbar"><div class="topbar-start"><button class="icon-button mobile-menu" type="button" data-nav-open aria-controls="app-sidebar" aria-expanded="false" aria-label="打开导航">{icon("menu")}</button><p class="topbar-title">{esc(page_titles.get(title, title))}</p></div><div class="topbar-end"><button class="icon-button theme-toggle" type="button" data-theme-toggle aria-label="切换到浅色主题" title="切换到浅色主题" hidden><span class="icon icon-sun theme-target-light" aria-hidden="true"></span><span class="icon icon-moon theme-target-dark" aria-hidden="true"></span></button><span class="utility muted">{date_label}</span><span class="local-status">{icon("local")}<span>仅存于本机</span></span>{top_action}</div></header>
     <main class="app-content" id="main-content" tabindex="-1">{body}</main></div></body></html>"""
     return page.encode("utf-8")
 

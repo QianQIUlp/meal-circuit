@@ -4,8 +4,32 @@
   const menuButton = document.querySelector("[data-nav-open]");
   const scrim = document.querySelector("[data-nav-close]");
   const collapseButton = document.querySelector("[data-nav-collapse]");
+  const themeButton = document.querySelector("[data-theme-toggle]");
   const desktopQuery = window.matchMedia("(min-width: 768px)");
   let returnFocus = null;
+
+  const updateThemeButton = () => {
+    if (!themeButton) return;
+    const currentTheme = document.documentElement.dataset.theme;
+    const label = currentTheme === "light" ? "切换到深色主题" : "切换到浅色主题";
+    themeButton.setAttribute("aria-label", label);
+    themeButton.setAttribute("title", label);
+  };
+
+  if (themeButton) {
+    themeButton.hidden = false;
+    updateThemeButton();
+    themeButton.addEventListener("click", () => {
+      const nextTheme = document.documentElement.dataset.theme === "light" ? "dark" : "light";
+      document.documentElement.dataset.theme = nextTheme;
+      updateThemeButton();
+      try {
+        localStorage.setItem("mealcircuit.theme", nextTheme);
+      } catch (_error) {
+        // Theme switching still works for this page when storage is unavailable.
+      }
+    });
+  }
 
   try {
     if (localStorage.getItem("mealcircuit.sidebarCollapsed") === "true") {
