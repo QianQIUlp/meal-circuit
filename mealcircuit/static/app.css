@@ -24,8 +24,29 @@
   --font-mono: "Cascadia Mono", "SFMono-Regular", Consolas, monospace;
 }
 
+:root[data-theme="light"] {
+  color-scheme: light;
+  --canvas: #ecefec;
+  --sidebar: #f3f5f2;
+  --surface: #f8f9f6;
+  --surface-raised: #e1e5e1;
+  --surface-subtle: #f1f3f0;
+  --border: #c8cfca;
+  --border-strong: #aeb8b1;
+  --text: #202321;
+  --muted: #5e6661;
+  --accent: #356b55;
+  --accent-strong: #285642;
+  --accent-ink: #ffffff;
+  --warning: #6f570f;
+  --adjust: #a9472b;
+  --danger: #a73d45;
+  --focus: #255b47;
+  --scrim: rgba(20, 24, 21, .42);
+}
+
 @media (prefers-color-scheme: light) {
-  :root {
+  :root:not([data-theme]) {
     color-scheme: light;
     --canvas: #ecefec;
     --sidebar: #f3f5f2;
@@ -51,7 +72,7 @@
 html { scroll-padding-top: calc(var(--topbar-height) + 16px); }
 body {
   margin: 0;
-  min-width: 320px;
+  min-width: 0;
   min-height: 100dvh;
   background: var(--canvas);
   color: var(--text);
@@ -131,13 +152,18 @@ code { color: var(--accent-strong); }
 .icon-down { --icon: url("/assets/ui/icons/chevron-down.svg"); }
 .icon-settings { --icon: url("/assets/ui/icons/settings.svg"); }
 .icon-alert { --icon: url("/assets/ui/icons/triangle-alert.svg"); }
+.icon-sun { --icon: url("/assets/ui/icons/sun.svg"); }
+.icon-moon { --icon: url("/assets/ui/icons/moon.svg"); }
+.theme-target-dark { display: none; }
+:root[data-theme="light"] .theme-target-light { display: none; }
+:root[data-theme="light"] .theme-target-dark { display: inline-block; }
 
 .app-topbar {
   position: sticky; z-index: 40; top: 0; min-height: var(--topbar-height); display: flex; align-items: center;
   justify-content: space-between; gap: 20px; padding: 0 24px; background: var(--sidebar); border-bottom: 1px solid var(--border);
 }
 .topbar-start, .topbar-end { display: flex; align-items: center; gap: 12px; min-width: 0; }
-.topbar-title { margin: 0; font-size: 18px; font-weight: 680; white-space: nowrap; }
+.topbar-title { min-width: 0; margin: 0; overflow: hidden; font-size: 18px; font-weight: 680; text-overflow: ellipsis; white-space: nowrap; }
 .local-status { display: inline-flex; align-items: center; gap: 8px; color: var(--muted); font-size: 13px; white-space: nowrap; }
 .local-status .icon { width: 16px; height: 16px; flex-basis: 16px; color: var(--accent); }
 .mobile-menu { display: none; }
@@ -442,6 +468,10 @@ summary { width: fit-content; color: var(--accent-strong); font-weight: 650; cur
   .panel, .card, .history-heading, .checkin-hero, .quiz-card { padding: 16px; }
   .module-list { margin: -16px; }
   .question-title { font-size: 22px; }
+}
+
+@media (max-width: 360px) {
+  .topbar-end .button { width: 44px; min-width: 44px; padding: 0; font-size: 0; }
 }
 
 @media (prefers-reduced-motion: reduce) {
