@@ -55,7 +55,7 @@ flowchart LR
 
 ```
 
-All analysis results must pass JSON Schema-level structural validation before they are written. Raw inputs and existing results are never silently overwritten; user corrections are appended as new history.
+All analysis results must pass JSON Schema-level structural validation before they are written. Pending task text can be edited from its detail page, with every prior version retained; completed inputs and results stay locked, and user corrections are appended as new history.
 
 ## Product Surface
 
@@ -195,7 +195,7 @@ flowchart LR
 
 ```
 
-所有分析结果都经过 JSON Schema 级别的结构校验后才会写入。原始输入与既有结果不会被静默覆盖，用户更正会作为新历史追加。
+所有分析结果都经过 JSON Schema 级别的结构校验后才会写入。待处理任务的文字输入可在详情页修改并保留旧版本；任务完成后输入和结果保持锁定，用户更正会作为新历史追加。
 
 ## 产品界面
 

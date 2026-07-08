@@ -252,6 +252,40 @@ class MealCircuitTest(unittest.TestCase):
         self.assertEqual(len(corrected["corrections"]), 1)
         self.assertEqual(corrected["result_json"], valid)
 
+    def test_pending_task_input_edit_history_validation_and_context(self):
+        chicken = service.create_food({"name": "鸡胸肉", "brand": "", "basis": "100g", "energy_kcal": 120, "protein_g": 23, "carbs_g": 0, "fat_g": 2, "serving_unit": "", "source_url": "", "package_photo_path": None, "notes": ""})
+        egg = service.create_food({"name": "鸡蛋", "brand": "", "basis": "100g", "energy_kcal": 140, "protein_g": 13, "carbs_g": 1, "fat_g": 9, "serving_unit": "", "source_url": "", "package_photo_path": None, "notes": ""})
+        task = service.create_material_task("鸡胸肉 300g")
+        updated = service.update_task_input(task["id"], "  鸡蛋 6 个  ", 1)
+        self.assertEqual(updated["original_input"], "鸡蛋 6 个")
+        self.assertEqual(updated["input_version"], 2)
+        self.assertEqual(updated["input_history"][0]["version"], 1)
+        self.assertEqual(updated["input_history"][0]["input_text"], "鸡胸肉 300g")
+        unchanged = service.update_task_input(task["id"], "鸡蛋 6 个", 2)
+        self.assertEqual(len(unchanged["input_history"]), 1)
+        context = service.task_context(task["id"])
+        self.assertEqual(context["task"]["original_input"], "鸡蛋 6 个")
+        self.assertEqual([item["id"] for item in context["food_library_matches"]], [egg["id"]])
+        self.assertNotIn(chicken["id"], [item["id"] for item in context["food_library_matches"]])
+        with self.assertRaises(ValidationError):
+            service.update_task_input(task["id"], "鸡蛋 8 个", 1)
+        with self.assertRaises(ValidationError):
+            service.update_task_input(task["id"], "   ", 2)
+
+        photo = service.create_photo_task(io.BytesIO(b"GIF89a" + b"photo"), "训练后")
+        cleared = service.update_task_input(photo["id"], "", 1)
+        self.assertEqual(cleared["original_input"], "")
+        self.assertEqual(cleared["input_history"][0]["input_text"], "训练后")
+
+        result = {
+            "summary": "可分两份", "combinations": ["鸡蛋配主食与蔬菜"],
+            "batch_nutrition": nutrition(), "per_serving_nutrition": nutrition(),
+            "gaps": ["蔬菜未知"], "risks": ["数量粗略"], "minimal_adjustments": ["补充蔬菜"],
+        }
+        service.complete_task(task["id"], result)
+        with self.assertRaises(ValidationError):
+            service.update_task_input(task["id"], "鸡蛋 8 个", 2)
+
     def test_complete_material_result(self):
         task = service.create_material_task("鸡蛋 6 个")
         result = {
@@ -458,6 +492,38 @@ class MealCircuitTest(unittest.TestCase):
         self.assertIn("source_checkin_versions_json", review_columns)
         self.assertIn("source_checkin_versions_json", history_columns)
         self.assertEqual(checkin_tables, {"daily_checkins", "daily_checkin_modules", "daily_checkin_module_history"})
+
+    def test_task_input_history_schema_migrates_existing_tasks(self):
+        legacy_path = Path(self.temp.name) / "legacy-task-input.db"
+        conn = sqlite3.connect(legacy_path)
+        try:
+            conn.executescript(
+                """
+                CREATE TABLE tasks (
+                    id TEXT PRIMARY KEY, type TEXT NOT NULL, status TEXT NOT NULL,
+                    original_input TEXT NOT NULL DEFAULT '', image_path TEXT,
+                    created_at TEXT NOT NULL, completed_at TEXT, result_json TEXT,
+                    result_version INTEGER NOT NULL DEFAULT 0
+                );
+                INSERT INTO tasks(id,type,status,original_input,created_at)
+                VALUES('legacy','material','pending','鸡蛋 2 个','2026-01-01T00:00:00+00:00');
+                """
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        init_db(legacy_path)
+        init_db(legacy_path)
+        conn = sqlite3.connect(legacy_path)
+        try:
+            task_columns = {row[1] for row in conn.execute("PRAGMA table_info(tasks)")}
+            history_tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='task_input_history'")}
+            input_version = conn.execute("SELECT input_version FROM tasks WHERE id='legacy'").fetchone()[0]
+        finally:
+            conn.close()
+        self.assertIn("input_version", task_columns)
+        self.assertEqual(history_tables, {"task_input_history"})
+        self.assertEqual(input_version, 1)
 
     def test_init_doctor_and_dynamic_settings(self):
         settings_path = Path(self.temp.name) / "settings.json"
@@ -705,6 +771,52 @@ class WebAppTest(unittest.TestCase):
         self.assertIn("&lt;b&gt;米饭&lt;/b&gt;", decoded)
         self.assertNotIn("<script>alert('x')</script>", decoded)
         self.assertNotIn("<b>米饭</b>", decoded)
+
+    def test_pending_task_input_edit_form_history_and_completed_lock(self):
+        task = service.create_material_task("鸡蛋 2 个")
+        status, _, pending = self.request("GET", f'/tasks/{task["id"]}')
+        decoded_pending = pending.decode("utf-8")
+        self.assertEqual(status, 200)
+        self.assertIn(f'action="/tasks/{task["id"]}/input"', decoded_pending)
+        self.assertIn('name="expected_version" value="1"', decoded_pending)
+        self.assertIn('maxlength="10000"', decoded_pending)
+        self.assertIn("鸡蛋 2 个</textarea>", decoded_pending)
+
+        form = urllib.parse.urlencode({"text": "<b>鸡蛋 4 个</b>", "expected_version": "1"}).encode()
+        status, headers, _ = self.request(
+            "POST", f'/tasks/{task["id"]}/input', form,
+            {"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        self.assertEqual(status, 303)
+        self.assertEqual(headers["Location"], f'/tasks/{task["id"]}')
+        status, _, edited = self.request("GET", headers["Location"])
+        decoded_edited = edited.decode("utf-8")
+        self.assertEqual(status, 200)
+        self.assertIn("输入修改历史（1）", decoded_edited)
+        self.assertIn("&lt;b&gt;鸡蛋 4 个&lt;/b&gt;</textarea>", decoded_edited)
+        self.assertNotIn("<b>鸡蛋 4 个</b>", decoded_edited)
+        self.assertIn("鸡蛋 2 个", decoded_edited)
+
+        result = {
+            "summary": "可分两份", "combinations": ["鸡蛋配主食与蔬菜"],
+            "batch_nutrition": nutrition(), "per_serving_nutrition": nutrition(),
+            "gaps": ["蔬菜未知"], "risks": ["数量粗略"], "minimal_adjustments": ["补充蔬菜"],
+        }
+        service.complete_task(task["id"], result)
+        status, _, completed = self.request("GET", f'/tasks/{task["id"]}')
+        decoded_completed = completed.decode("utf-8")
+        self.assertEqual(status, 200)
+        self.assertNotIn(f'action="/tasks/{task["id"]}/input"', decoded_completed)
+        self.assertIn("任务完成后输入已锁定", decoded_completed)
+        self.assertIn(f'action="/tasks/{task["id"]}/corrections"', decoded_completed)
+
+        stale = urllib.parse.urlencode({"text": "鸡蛋 6 个", "expected_version": "2"}).encode()
+        status, _, response = self.request(
+            "POST", f'/tasks/{task["id"]}/input', stale,
+            {"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("只能修改待处理任务", response.decode("utf-8"))
 
     def test_daily_review_web_display_and_record_redirect(self):
         review_date = date.today().isoformat()
