@@ -2,6 +2,16 @@
 
 > 项目于 2026-07-02 从 DietOS 更名为 MealCircuit（食回路）。以下旧名称保留为真实历史记录。
 
+## 2026-07-08：README 双语化与清晰截图
+
+- 目标：把 README 从单语中文整理成 GitHub 友好的中英双语入口，并替换掉 GitHub 上发糊的首页演示图，同时统一对外版本展示到 `v0.2.0`。
+- 改动文件：更新 `README.md`、新增无损截图 `docs/assets/mealcircuit-dashboard.png`、同步 `mealcircuit/__init__.py` 版本号，并记录本轮开发过程；删除旧的 `docs/assets/mealcircuit-dashboard.jpg`。
+- 核心功能：README 顶部新增语言切换锚点，正文重排为完整 English / 简体中文 两段镜像结构；徽章版本与 release 链接统一到 `v0.2.0`；首页截图改为从真实本地服务抓取的 PNG，保留 1440x1024 视口但去掉有损 JPEG 压缩带来的模糊。
+- 验证：`.\test.ps1` 31 项测试通过；`python tools\release_check.py` 零命中；真实浏览器检查 `http://127.0.0.1:8768/` 的首页，确认标题为“首页 · MealCircuit”、控制台无错误、桌面三列布局正常、处理队列只显示两条演示待办，并重新抓取 README 使用的 PNG 截图。
+- 仍未实现：链接文档如 `PRIVACY.md`、`SECURITY.md`、`CONTRIBUTING.md` 仍保持当前语言，不随本轮 README 一起双语化。
+- 下一最小任务：若后续还要继续国际化，优先补齐隐私、安全、贡献和免责声明页面的英文版本，并在 README 中改成按语言跳转。
+- 用户用法：直接查看仓库根目录 `README.md` 即可；如需重新生成演示截图，可在隔离的 `MEALCIRCUIT_HOME` 下启动本地服务并抓取首页 PNG。
+
 ## 2026-07-07：Calibrated Console UI / UX 升级
 
 - 目标：在不改变现有 URL、表单协议、数据库和 Agent CLI 的前提下，把廉价的荧光科技感界面改为克制、信息密集、可长期使用的本地营养工作台。
