@@ -1,17 +1,163 @@
 # MealCircuit
 
-**本地优先的长期饮食反馈工作台。记录事实，保留上下文，校准下一次选择。**
+<p align="right"><strong><a href="#english">English</a> | <a href="#zh-cn">简体中文</a></strong></p>
+
+**Local-first long-horizon meal feedback workbench. Capture facts. Keep the context. Calibrate the next choice.**
 
 <p>
-  <a href="https://github.com/QianQIUlp/meal-circuit/releases/tag/v0.1.0"><img src="https://img.shields.io/badge/release-v0.1.0-8DB8A4?style=flat-square&labelColor=202321" alt="Release v0.1.0"></a>
+  <a href="https://github.com/QianQIUlp/meal-circuit/releases/tag/v0.2.0"><img src="https://img.shields.io/badge/release-v0.2.0-8DB8A4?style=flat-square&labelColor=202321" alt="Release v0.2.0"></a>
   <img src="https://img.shields.io/badge/Python-3.11%2B-8DB8A4?style=flat-square&labelColor=202321" alt="Python 3.11 or newer">
   <a href="https://github.com/QianQIUlp/meal-circuit/actions/workflows/test.yml"><img src="https://github.com/QianQIUlp/meal-circuit/actions/workflows/test.yml/badge.svg" alt="CI status"></a>
   <a href="LICENSE"><img src="https://img.shields.io/github/license/QianQIUlp/meal-circuit?style=flat-square&labelColor=202321&color=8DB8A4" alt="MIT license"></a>
 </p>
 
-MealCircuit 是一个**本地优先、Agent-in-the-loop** 的长期饮食反馈工作台。它把餐食照片、原材料、每日状态问答、食品营养库和用户更正串成一条可追溯的反馈回路，再结合近 14 天趋势、长期记忆与个人总纲，生成结构化判断和下一日菜单。
+![MealCircuit dashboard overview: 14-day status trend, daily modules, next-day plan, and processing queue](docs/assets/mealcircuit-dashboard.png)
 
-![MealCircuit 今日总览：14 天状态趋势、每日模块、次日菜单与处理队列](docs/assets/mealcircuit-dashboard.jpg)
+<a id="english"></a>
+
+## English
+
+MealCircuit is a **local-first, agent-in-the-loop** workbench for long-horizon meal feedback. It connects meal photos, raw ingredients, daily status check-ins, the food nutrition library, and user corrections into a traceable feedback loop, then combines the last 14 days of trends, long-term memory, and personal doctrine to produce structured judgments and a next-day meal plan.
+
+> [!IMPORTANT]
+> MealCircuit itself does not call external model APIs and does not require an API key. It stores facts, assembles context, and validates results; Codex, Claude Code, or another agent performs the analysis only when the user triggers a task.
+
+## More Than Calorie Logging
+
+| Evidence First | Context First | Sovereignty First |
+| :--- | :--- | :--- |
+| Oils, sauces, weights, and brands that are not visible in a photo are explicitly marked as unknown instead of being faked into precision. | Every judgment reads the personal doctrine, the last 14 days of records, long-term memory, and current adjustments instead of evaluating one meal in isolation. | Data lives by default in a local SQLite directory outside the repo, with no account, no telemetry, and no default cloud sync. |
+
+## Get Running in Three Minutes
+
+Requirements: **Python 3.11+**. On Windows you can use the PowerShell scripts already in the repo, and runtime use does not require third-party Python packages.
+
+```powershell
+git clone https://github.com/QianQIUlp/meal-circuit.git
+cd meal-circuit
+
+python -m mealcircuit.agent_cli init
+python -m mealcircuit.agent_cli doctor
+.\start.ps1
+```
+
+Open [http://127.0.0.1:8765](http://127.0.0.1:8765). After the first initialization, fill in your private `profile.md` and `settings.json` at the paths shown by `doctor`; stop the server with `Ctrl+C`.
+
+## How It Works
+
+```mermaid
+flowchart LR
+    A["Capture<br/>Photos · Ingredients · Daily eating"] --> B["Assemble context<br/>Doctrine · 14-day trends · Long-term memory"]
+    B --> C["Agent judgment<br/>Range estimates · Unknowns · Minimal adjustments"]
+    C --> D["Persist results<br/>Daily review · Next-day menu · Risk signals"]
+    D --> E["Keep calibrating<br/>User corrections · Food library · New records"]
+    E -. Next cycle .-> B
+
+```
+
+All analysis results must pass JSON Schema-level structural validation before they are written. Raw inputs and existing results are never silently overwritten; user corrections are appended as new history.
+
+## Product Surface
+
+| Entry | Problem it solves |
+| :--- | :--- |
+| **Today Overview** | Summarize today's state and review the core advice, risk signals, and next-day three-meal plan |
+| **Today Status** | Record weight, training, hunger/satiety, sleep, and gut response one question at a time, with drafts, skips, and version history |
+| **Meal Photos** | Upload real meals so an agent can estimate nutrition ranges from visible evidence and list unknowns |
+| **Ingredient Analysis** | Combine raw ingredients with user food-library data to judge usage, portions, and risks |
+| **Food Nutrition Library** | Manage brand labels, default portions, priorities, usage conditions, and version history |
+| **Records & Memory** | Store daily eating, long-term trends, current adjustments, and daily-review history |
+
+The daily menu always covers breakfast, lunch, dinner, a conditional snack, training-day adjustments, and gut-symptom adjustments. When `home_cooking` is enabled in private settings, breakfast becomes low-friction assembly, lunch adapts to cafeteria or eating out, and dinner becomes a beginner-friendly single-serving execution card, together with a shopping list, online filtering keywords, and a three-day ingredient reuse direction. The system reads the last 14 completed dinners and rotates dishes and flavor profiles by default; if repetition is necessary because of recovery, expiring ingredients, or shopping constraints, the reason must be stated explicitly. High-priority foods still require an item-by-item `use` or `skip` decision instead of being mechanically forced into the menu.
+
+“Today Status” shows five daily modules by default. You answer one question at a time, and single-question drafts are preserved automatically; only after a full module is completed do its answers enter the agent context and re-queue the daily review. Modules can be hidden, reordered, or switched to on-demand recording in “Adjust Modules”. An explicit skip only means the user did not provide the information; the system does not infer “no training” or “no symptoms” from that.
+
+## Agent Workflow
+
+Pending work is read from the CLI. Photos and raw ingredients use task context; daily reviews use date context.
+
+```powershell
+# 1. List pending photo, ingredient, and daily review work
+python -m mealcircuit.agent_cli pending
+
+# 2a. Process a photo / ingredient task
+python -m mealcircuit.agent_cli context <TASK_ID> --output context.json
+python -m mealcircuit.agent_cli schema photo
+python -m mealcircuit.agent_cli complete <TASK_ID> --file result.json
+
+# 2b. Process a daily review
+python -m mealcircuit.agent_cli day-context 2026-01-01 --output context.json
+python -m mealcircuit.agent_cli schema daily
+python -m mealcircuit.agent_cli day-complete 2026-01-01 --file result.json
+
+# 3. Append a user-confirmed correction without overwriting the original result
+python -m mealcircuit.agent_cli correct <TASK_ID> --text "User-confirmed correction"
+```
+
+Agents should strictly follow `doctrine.content` and `result_schema` in the exported context. Daily reviews must also read `target_checkin`, `checkin_coverage`, and `recent_checkins`; drafts are not exported, and skips or missing answers remain unknown. Photo analysis uses nutrition ranges; any range that cannot be judged is `null`, and invisible details go into `unknowns`.
+
+In solo-cooking mode, `day-context` also includes `home_cooking_preferences`, `recent_home_dinners`, `recent_online_categories`, and the generation protocol. Online shopping advice only describes specs, ingredient filters, and search keywords; it does not perform external lookups or claim real product prices or inventory.
+
+## Data & Boundaries
+
+Runtime data is never written into the source repository:
+
+| System | Default private data directory |
+| :--- | :--- |
+| Windows | `%LOCALAPPDATA%\MealCircuit` |
+| macOS | `~/Library/Application Support/MealCircuit` |
+| Linux | `$XDG_DATA_HOME/mealcircuit` or `~/.local/share/mealcircuit` |
+
+Use `MEALCIRCUIT_HOME` to move the entire private directory, or `MEALCIRCUIT_DB` and `MEALCIRCUIT_PORT` to override the database path and port separately.
+
+<details>
+<summary><strong>Migrate safely from legacy DietOS</strong></summary>
+
+Preview first, then apply the copy:
+
+```powershell
+python -m mealcircuit.agent_cli migrate-data --from-repo <OLD_REPO_PATH>
+python -m mealcircuit.agent_cli migrate-data --from-repo <OLD_REPO_PATH> --apply
+```
+
+Migration only copies data and never deletes source files; the database uses the SQLite Backup API and verifies integrity, table row counts, and logical summaries.
+
+</details>
+
+### Current Real Boundaries
+
+- The Web UI listens on loopback only by default; `--allow-remote` does not add authentication or TLS and should not be exposed to the public internet.
+- Uploads only create pending work; there is no automatic background photo recognition or meal-plan generation.
+- There are currently no user accounts, cloud sync, mobile clients, package OCR, or external nutrition databases.
+- If you use a cloud agent, exported context and images may be sent to that model provider; decide based on its data policy.
+- MealCircuit provides general-purpose logging and decision support, not medical diagnosis or treatment advice.
+
+## Development & Verification
+
+```powershell
+.\test.ps1
+python tools\release_check.py
+```
+
+Tests cover data persistence, daily-status drafts and versions, context assembly, result validation, overwrite protection, daily reviews, priority-food decisions, HTTP critical paths, and open-source release boundaries. The project stays on the Python standard library path; dependency or architecture changes need separate review.
+
+```text
+mealcircuit/   app, data, validation, service, and CLI
+rules/         public core rules
+templates/     private configuration bootstrap templates
+tests/         unit and HTTP integration tests
+tools/         pre-release privacy and boundary checks
+```
+
+## License
+
+[MIT](LICENSE) · [Privacy Notice](PRIVACY.md) · [Security Policy](SECURITY.md) · [Contributing](CONTRIBUTING.md) · [Disclaimer](DISCLAIMER.md)
+
+<a id="zh-cn"></a>
+
+## 简体中文
+
+MealCircuit 是一个**本地优先、Agent-in-the-loop** 的长期饮食反馈工作台。它把餐食照片、原材料、每日状态问答、食品营养库和用户更正串成一条可追溯的反馈回路，再结合近 14 天趋势、长期记忆与个人总纲，生成结构化判断和下一日菜单。
 
 > [!IMPORTANT]
 > MealCircuit 自身不调用外部模型 API，也不要求 API Key。它负责保存事实、组装上下文和校验结果；Codex、Claude Code 或其他 Agent 负责在用户发起任务后完成分析。
@@ -55,7 +201,7 @@ flowchart LR
 
 | 入口 | 解决的问题 |
 | :--- | :--- |
-| **今日建议** | 汇总当天状态，查看核心建议、风险信号与次日三餐菜单 |
+| **今日总览** | 汇总当天状态，查看核心建议、风险信号与次日三餐菜单 |
 | **今日状态** | 通过逐题卡片记录体重、训练、饥饿饱腹、睡眠和肠胃反应；支持草稿、跳过和版本历史 |
 | **食物照片** | 上传真实餐食，由 Agent 按可见证据估算营养区间并列出未知项 |
 | **原材料分析** | 结合食品库中的用户数据，判断食材用途、份量与风险 |
