@@ -40,7 +40,16 @@ def init_db(path: Path | None = None) -> None:
                 created_at TEXT NOT NULL,
                 completed_at TEXT,
                 result_json TEXT,
-                result_version INTEGER NOT NULL DEFAULT 0
+                result_version INTEGER NOT NULL DEFAULT 0,
+                input_version INTEGER NOT NULL DEFAULT 1
+            );
+            CREATE TABLE IF NOT EXISTS task_input_history (
+                id TEXT PRIMARY KEY,
+                task_id TEXT NOT NULL REFERENCES tasks(id),
+                version INTEGER NOT NULL,
+                input_text TEXT NOT NULL,
+                archived_at TEXT NOT NULL,
+                UNIQUE(task_id, version)
             );
             CREATE TABLE IF NOT EXISTS task_corrections (
                 id TEXT PRIMARY KEY,
@@ -162,6 +171,7 @@ def init_db(path: Path | None = None) -> None:
                 updated_at TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status, created_at);
+            CREATE INDEX IF NOT EXISTS idx_task_input_history ON task_input_history(task_id, version);
             CREATE INDEX IF NOT EXISTS idx_records_date ON daily_records(record_date);
             CREATE INDEX IF NOT EXISTS idx_checkins_date ON daily_checkins(checkin_date);
             CREATE INDEX IF NOT EXISTS idx_checkin_modules ON daily_checkin_modules(checkin_id,module_key);
@@ -172,6 +182,9 @@ def init_db(path: Path | None = None) -> None:
             """
         )
         existing_food_columns = {row["name"] for row in conn.execute("PRAGMA table_info(food_items)")}
+        task_columns = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
+        if "input_version" not in task_columns:
+            conn.execute("ALTER TABLE tasks ADD COLUMN input_version INTEGER NOT NULL DEFAULT 1")
         food_migrations = {
             "fiber_g": "REAL",
             "sodium_mg": "REAL",

@@ -106,13 +106,53 @@ def get_task(task_id: str) -> dict:
         task = row_dict(conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone())
         if not task:
             raise KeyError(task_id)
+        task["input_history"] = [
+            dict(row)
+            for row in conn.execute(
+                "SELECT * FROM task_input_history WHERE task_id=? ORDER BY version DESC", (task_id,)
+            ).fetchall()
+        ]
         task["corrections"] = [
             row_dict(row)
             for row in conn.execute(
                 "SELECT * FROM task_corrections WHERE task_id=? ORDER BY created_at", (task_id,)
             ).fetchall()
         ]
-        return task
+    return task
+
+
+def update_task_input(task_id: str, text: str, expected_version: int) -> dict:
+    if not isinstance(text, str):
+        raise ValidationError("用户输入必须是文本")
+    clean = text.strip()
+    timestamp = now()
+    with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        task = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+        if not task:
+            raise KeyError(task_id)
+        if task["status"] != "pending":
+            raise ValidationError("只能修改待处理任务；已完成任务请追加用户校正")
+        if not isinstance(expected_version, int) or isinstance(expected_version, bool) or task["input_version"] != expected_version:
+            raise ValidationError("任务输入已变化，请刷新页面后重试")
+        if task["type"] == "material":
+            if not clean:
+                raise ValidationError("请输入现有食材和粗略数量")
+            if len(clean) > 10000:
+                raise ValidationError("原材料输入不能超过 10000 字")
+        if clean != task["original_input"]:
+            conn.execute(
+                "INSERT INTO task_input_history(id,task_id,version,input_text,archived_at) VALUES(?,?,?,?,?)",
+                (new_id("task_input"), task_id, task["input_version"], task["original_input"], timestamp),
+            )
+            updated = conn.execute(
+                """UPDATE tasks SET original_input=?,input_version=input_version+1
+                   WHERE id=? AND status='pending' AND input_version=?""",
+                (clean, task_id, expected_version),
+            )
+            if updated.rowcount != 1:
+                raise ValidationError("任务状态或输入已变化，请刷新页面后重试")
+    return get_task(task_id)
 
 
 def complete_task(task_id: str, result: dict) -> dict:

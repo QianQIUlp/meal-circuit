@@ -139,6 +139,36 @@ def task_table(tasks: list[dict]) -> str:
     return f'<div class="table-scroll" tabindex="0" role="region" aria-label="任务列表"><table><thead><tr><th scope="col">任务</th><th scope="col">类型</th><th scope="col">状态</th><th scope="col">创建时间</th></tr></thead><tbody>{rows}</tbody></table></div>'
 
 
+def render_task_input(task: dict) -> str:
+    history = task.get("input_history") or []
+    history_items = "".join(
+        f'<li><p class="muted small">版本 {esc(item["version"])} · {esc(item["archived_at"])}</p>'
+        f'<pre>{esc(item["input_text"])}</pre></li>'
+        for item in history
+    )
+    history_block = (
+        f'<details><summary>输入修改历史（{len(history)}）</summary><ol class="structured-list">{history_items}</ol></details>'
+        if history else '<p class="muted small">尚无输入修改历史。</p>'
+    )
+    if task["status"] == "pending":
+        label = "现有食材及粗略数量" if task["type"] == "material" else "照片补充说明"
+        required = " required maxlength=\"10000\"" if task["type"] == "material" else ""
+        return (
+            '<h2>用户输入</h2><p class="muted small">任务处理前可修改；保存时会保留当前版本。</p>'
+            f'<form method="post" action="/tasks/{esc(task["id"])}/input">'
+            f'<input type="hidden" name="expected_version" value="{esc(task["input_version"])}">'
+            f'<label for="task-input">{label}</label>'
+            f'<textarea id="task-input" name="text"{required}>{esc(task["original_input"])}</textarea>'
+            '<div class="form-actions"><button type="submit">保存输入</button></div></form>'
+            f'{history_block}'
+        )
+    current = f'<pre>{esc(task["original_input"])}</pre>' if task["original_input"] else '<p class="muted">无补充说明</p>'
+    return (
+        '<h2>用户输入</h2><p class="muted small">任务完成后输入已锁定；事实变化请追加用户校正。</p>'
+        f'{current}{history_block}'
+    )
+
+
 def render_review_cards(reviews: list[dict]) -> str:
     status_labels = {
         "stable": "稳定", "observe": "观察", "adjust": "需调整", "risk": "风险",
@@ -838,14 +868,13 @@ class Handler(BaseHTTPRequestHandler):
                 task_id = path.split("/")[2]
                 task = service.get_task(task_id)
                 media = f'<img class="photo" src="/media/{Path(task["image_path"]).name}" alt="上传的食物照片">' if task.get("image_path") else ""
-                original = f'<pre>{esc(task["original_input"])}</pre>' if task["original_input"] else '<p class="muted">无补充说明</p>'
                 if task["result_json"]:
                     result = render_result(task["type"], task["result_json"])
                 else:
                     result = f'<p>等待 Agent 处理。</p><pre>python -m mealcircuit.agent_cli context {esc(task_id)} --output context.json\npython -m mealcircuit.agent_cli complete {esc(task_id)} --file result.json</pre>'
                 corrections = "".join(f'<li>{esc(c["correction_json"]["text"])} <span class="muted small">{esc(c["created_at"])}</span></li>' for c in task["corrections"]) or '<li class="muted">暂无用户校正</li>'
                 correction_form = f'<form method="post" action="/tasks/{esc(task_id)}/corrections"><label for="task-correction">新增用户校正（保留原结果，不覆盖）</label><textarea id="task-correction" name="text" required></textarea><div class="form-actions"><button type="submit">保存校正</button></div></form>' if task["status"] == "completed" else ""
-                body = f'<section class="card"><h1>{"食物识别" if task["type"]=="photo" else "原材料分析"}</h1><p><span class="status {esc(task["status"])}">{esc(task["status"])}</span> · {esc(task_id)}</p>{media}<h3>用户原始输入</h3>{original}</section><section class="card"><h2>Agent 分析结果</h2>{result}</section><section class="card"><h2>用户校正历史</h2><ul>{corrections}</ul>{correction_form}</section>'
+                body = f'<section class="card"><h1>{"食物识别" if task["type"]=="photo" else "原材料分析"}</h1><p><span class="status {esc(task["status"])}">{esc(task["status"])}</span> · {esc(task_id)}</p>{media}{render_task_input(task)}</section><section class="card"><h2>Agent 分析结果</h2>{result}</section><section class="card"><h2>用户校正历史</h2><ul>{corrections}</ul>{correction_form}</section>'
                 self.send_html("任务详情", body)
             elif path == "/foods":
                 q = query.get("q", [""])[0]
@@ -1013,6 +1042,11 @@ class Handler(BaseHTTPRequestHandler):
                 food_id = path.split("/")[2]
                 service.update_food(food_id, self.food_payload(self.read_urlencoded()))
                 self.redirect(f"/foods/{food_id}")
+            elif path.startswith("/tasks/") and path.endswith("/input"):
+                task_id = path.split("/")[2]
+                form = self.read_urlencoded()
+                service.update_task_input(task_id, form.get("text", ""), int(form.get("expected_version", "")))
+                self.redirect(f"/tasks/{task_id}")
             elif path.startswith("/tasks/") and path.endswith("/corrections"):
                 task_id = path.split("/")[2]
                 service.add_correction(task_id, {"text": self.read_urlencoded().get("text", "")})
