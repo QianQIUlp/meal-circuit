@@ -4,6 +4,7 @@ import json
 import re
 import shutil
 import uuid
+import hashlib
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import BinaryIO
@@ -749,6 +750,10 @@ def daily_review_schema(settings: dict | None = None) -> dict:
                 "repeat_reason": "omit unless health_recovery|ingredient_expiry|shopping_constraint",
             },
         })
+        schema["ingredient_carryover_decisions"] = [{
+            "carryover_id": "string", "ingredient": "string", "decision": "use|skip|discard",
+            "reason": "string", "planned_use": "string",
+        }]
     return schema
 
 
@@ -773,6 +778,119 @@ def _home_menu_history(rows: list) -> tuple[list[dict], list[str]]:
             if category and category not in online_categories:
                 online_categories.append(category)
     return dinners, online_categories
+
+
+def _carryover_id(source_key: str, menu_date: str, index: int, ingredient: str) -> str:
+    raw = "|".join((source_key, menu_date, str(index), ingredient))
+    return f"carryover_{hashlib.sha256(raw.encode('utf-8')).hexdigest()[:12]}"
+
+
+def _shopping_matches(ingredient: str, reuse_item: dict, shopping_list: list) -> list[dict]:
+    text = " ".join(
+        str(part or "")
+        for part in (
+            ingredient,
+            reuse_item.get("tomorrow_use"),
+            reuse_item.get("storage"),
+            " ".join(str(use.get("use") or "") for use in reuse_item.get("later_uses", []) if isinstance(use, dict)),
+        )
+    ).lower()
+    matches = []
+    for item in shopping_list:
+        if not isinstance(item, dict) or not item.get("required"):
+            continue
+        name = str(item.get("name") or "").strip()
+        if not name:
+            continue
+        normalized = name.lower()
+        if normalized in text or ingredient.lower() in normalized:
+            matches.append({
+                "name": name,
+                "amount": item.get("amount") or "",
+                "purpose": item.get("purpose") or "",
+                "storage": item.get("storage") or "",
+            })
+    return matches
+
+
+def _ingredient_carryover_obligations(review_date: str, rows: list) -> list[dict]:
+    current_date = date.fromisoformat(review_date)
+    target_menu_date = current_date + timedelta(days=1)
+    obligations = []
+    for row in rows:
+        item = row_dict(row)
+        result = item.get("result_json") or {}
+        menu = result.get("tomorrow_menu") or {}
+        reuse = menu.get("reuse_plan") or {}
+        try:
+            source_menu_date = date.fromisoformat(menu.get("date", ""))
+        except (TypeError, ValueError):
+            continue
+        horizon_days = reuse.get("horizon_days")
+        if not isinstance(horizon_days, int) or isinstance(horizon_days, bool) or horizon_days <= 0:
+            continue
+        window_end = source_menu_date + timedelta(days=horizon_days - 1)
+        if current_date > window_end:
+            continue
+        shopping_list = menu.get("shopping_list") or []
+        source_key = item.get("id") or item["review_date"]
+        for index, reuse_item in enumerate(reuse.get("items") or []):
+            if not isinstance(reuse_item, dict):
+                continue
+            ingredient = str(reuse_item.get("ingredient") or "").strip()
+            if not ingredient:
+                continue
+            shopping_items = _shopping_matches(ingredient, reuse_item, shopping_list)
+            if not shopping_items:
+                continue
+            planned_uses = []
+            for use in reuse_item.get("later_uses") or []:
+                if not isinstance(use, dict):
+                    continue
+                try:
+                    use_date = date.fromisoformat(str(use.get("date") or ""))
+                except ValueError:
+                    continue
+                if current_date <= use_date <= target_menu_date and use_date <= window_end:
+                    planned_uses.append({"date": use_date.isoformat(), "use": str(use.get("use") or "")})
+            if not planned_uses:
+                continue
+            planned_uses.sort(key=lambda value: value["date"])
+            planned_date = date.fromisoformat(planned_uses[0]["date"])
+            if planned_date <= current_date:
+                urgency = "due_today_or_confirm_used"
+            elif planned_date == target_menu_date:
+                urgency = "use_tomorrow"
+            else:
+                urgency = "within_reuse_window"
+            obligations.append({
+                "id": _carryover_id(source_key, menu.get("date") or "", index, ingredient),
+                "source_review_date": item["review_date"],
+                "source_menu_date": menu.get("date"),
+                "ingredient": ingredient,
+                "purchase_assumption": "上一轮 required 采购项可能已买；若今日记录明确否定，可在裁决中跳过或丢弃。",
+                "shopping_items": shopping_items,
+                "original_tomorrow_use": reuse_item.get("tomorrow_use") or "",
+                "planned_use_date": planned_uses[0]["date"],
+                "planned_use": planned_uses[0]["use"],
+                "remaining_later_uses": planned_uses,
+                "storage": reuse_item.get("storage") or "",
+                "urgency": urgency,
+                "reuse_window_end": window_end.isoformat(),
+            })
+    return obligations
+
+
+def _recent_review_rows_for_carryover(review_date: str, days: int = 14) -> list:
+    end = date.fromisoformat(review_date)
+    cutoff = (end - timedelta(days=days - 1)).isoformat()
+    with connect() as conn:
+        return conn.execute(
+            """SELECT id,review_date,result_json FROM daily_reviews
+               WHERE status='completed' AND review_date BETWEEN ? AND ? AND review_date<?
+               ORDER BY review_date DESC""",
+            (cutoff, review_date, review_date),
+        ).fetchall()
 
 
 def daily_review_context(review_date: str, days: int = 14) -> dict:
@@ -800,7 +918,7 @@ def daily_review_context(review_date: str, days: int = 14) -> dict:
             (cutoff, review_date),
         ).fetchall()
         recent_review_rows = conn.execute(
-            """SELECT review_date,result_json FROM daily_reviews
+            """SELECT id,review_date,result_json FROM daily_reviews
                WHERE status='completed' AND review_date BETWEEN ? AND ? AND review_date<?
                ORDER BY review_date DESC""",
             (cutoff, review_date, review_date),
@@ -813,6 +931,11 @@ def daily_review_context(review_date: str, days: int = 14) -> dict:
         recent_checkins.append(item)
     target_state = get_checkin_state(review_date)
     recent_home_dinners, recent_online_categories = _home_menu_history(recent_review_rows)
+    home_cooking = settings.get("home_cooking") or {"enabled": False}
+    carryover_obligations = (
+        _ingredient_carryover_obligations(review_date, recent_review_rows)
+        if home_cooking.get("enabled") else []
+    )
     target_modules = [
         {
             "module_key": item["module_key"], "label": item["label"], "status": item["status"],
@@ -837,16 +960,20 @@ def daily_review_context(review_date: str, days: int = 14) -> dict:
         "current_adjustments": adjustments,
         "priority_foods": list_priority_foods(),
         "settings": settings,
-        "home_cooking_preferences": settings.get("home_cooking") or {"enabled": False},
+        "home_cooking_preferences": home_cooking,
         "recent_home_dinners": recent_home_dinners,
         "recent_online_categories": recent_online_categories,
+        "ingredient_carryover_obligations": carryover_obligations,
         "home_cooking_generation_protocol": [
             "早餐使用低摩擦组装，午餐给外食规则，只有晚餐生成新手菜谱。",
             "优先复用食材但轮换菜式；连续晚餐不重复 dish_key 或 flavor_profile。",
+            "生成明日菜单前必须逐项评估 ingredient_carryover_obligations；未过期且适合当前状态的食材优先组装进明日午餐或晚餐。",
+            "临近过期的食材优先明日用完；已超过保存窗口、今日记录否定库存或与肠胃状态冲突时可跳过或丢弃，但必须说明原因。",
+            "新采购清单不得在可用剩余食材能完成同等功能时重复购买。",
             "总时间不得超过配置上限，最多两件主要炊具，每晚最多引入一个新技巧。",
             "正常肠胃可用番茄、小米椒、醋和蒜香建立酸辣风味；异常时保留香鲜并降低辣、酸、油。",
             "网购仅给规格、筛选标准和搜索关键词，不提供商品链接、价格或库存断言；近14天已推荐品类默认不重复。",
-        ] if (settings.get("home_cooking") or {}).get("enabled") else [],
+        ] if home_cooking.get("enabled") else [],
         "result_schema": daily_review_schema(settings),
     }
 
@@ -867,6 +994,12 @@ def complete_daily_review(review_date: str, result: dict) -> dict:
     expected_menu_date = (date.fromisoformat(review_date) + timedelta(days=1)).isoformat()
     if result["tomorrow_menu"]["date"] != expected_menu_date:
         raise ValidationError(f"次日菜单日期必须是 {expected_menu_date}")
+    home_cooking = settings.get("home_cooking") or {"enabled": False}
+    if home_cooking.get("enabled"):
+        obligations = _ingredient_carryover_obligations(
+            review_date, _recent_review_rows_for_carryover(review_date)
+        )
+        _validate_ingredient_carryover_decisions(result, obligations)
     timestamp = now()
     with connect() as conn:
         updated = conn.execute(
@@ -877,6 +1010,49 @@ def complete_daily_review(review_date: str, result: dict) -> dict:
         if updated.rowcount != 1:
             raise ValidationError("复盘状态已变化，请重新读取")
     return get_daily_review(review_date)
+
+
+def _non_empty_text(value: object, name: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValidationError(f"{name} 必须是非空文本")
+    return value.strip()
+
+
+def _validate_ingredient_carryover_decisions(result: dict, obligations: list[dict]) -> None:
+    decisions = result.get("ingredient_carryover_decisions")
+    if not obligations and decisions is None:
+        return
+    if obligations and decisions is None:
+        decisions = []
+    if not isinstance(decisions, list):
+        raise ValidationError("ingredient_carryover_decisions 必须是数组")
+    expected = {item["id"]: item for item in obligations}
+    seen = set()
+    for index, decision in enumerate(decisions):
+        if not isinstance(decision, dict):
+            raise ValidationError(f"ingredient_carryover_decisions[{index}] 必须是对象")
+        carryover_id = _non_empty_text(
+            decision.get("carryover_id"), f"ingredient_carryover_decisions[{index}].carryover_id"
+        )
+        if carryover_id in seen:
+            raise ValidationError(f"ingredient_carryover_decisions 中重复承接ID：{carryover_id}")
+        seen.add(carryover_id)
+        ingredient = _non_empty_text(
+            decision.get("ingredient"), f"ingredient_carryover_decisions[{index}].ingredient"
+        )
+        action = _non_empty_text(
+            decision.get("decision"), f"ingredient_carryover_decisions[{index}].decision"
+        )
+        if action not in {"use", "skip", "discard"}:
+            raise ValidationError("ingredient_carryover_decisions.decision 必须是 use、skip 或 discard")
+        _non_empty_text(decision.get("reason"), f"ingredient_carryover_decisions[{index}].reason")
+        _non_empty_text(decision.get("planned_use"), f"ingredient_carryover_decisions[{index}].planned_use")
+        if carryover_id in expected and ingredient != expected[carryover_id]["ingredient"]:
+            raise ValidationError(f"ingredient_carryover_decisions[{index}].ingredient 与承接食材不一致")
+    if seen != set(expected):
+        missing = sorted(set(expected) - seen)
+        unknown = sorted(seen - set(expected))
+        raise ValidationError(f"食材承接裁决不完整；缺少={missing}，未知={unknown}")
 
 
 def _validate_dinner_rotation(review_date: str, result: dict, settings: dict) -> None:

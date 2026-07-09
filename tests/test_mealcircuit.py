@@ -160,6 +160,20 @@ def home_cooking_review_result(review_date: str, dish_key="tomato_chicken", flav
     return result
 
 
+def add_carryover_decisions(result: dict, context: dict, decision: str = "use") -> dict:
+    result["ingredient_carryover_decisions"] = [
+        {
+            "carryover_id": item["id"],
+            "ingredient": item["ingredient"],
+            "decision": decision,
+            "reason": "测试中承接上一轮可能剩余食材，避免重复采购或浪费。",
+            "planned_use": item["planned_use"],
+        }
+        for item in context["ingredient_carryover_obligations"]
+    ]
+    return result
+
+
 class MealCircuitTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -588,11 +602,44 @@ class MealCircuitTest(unittest.TestCase):
         context = service.daily_review_context(second_date)
         self.assertEqual(context["recent_home_dinners"][0]["rotation"]["dish_key"], "tomato_chicken")
         self.assertEqual(context["recent_online_categories"], ["低油番茄调味"])
+        obligations = context["ingredient_carryover_obligations"]
+        self.assertEqual(len(obligations), 1)
+        self.assertEqual(obligations[0]["ingredient"], "番茄")
+        self.assertEqual(obligations[0]["planned_use_date"], (date.today() + timedelta(days=1)).isoformat())
+        self.assertEqual(obligations[0]["urgency"], "use_tomorrow")
+        self.assertEqual(obligations[0]["shopping_items"][0]["amount"], "3个")
 
         repeated = home_cooking_review_result(second_date)
         with self.assertRaisesRegex(ValidationError, "连续晚餐不得重复"):
             service.complete_daily_review(second_date, repeated)
+
+        missing_carryover = home_cooking_review_result(
+            second_date, dish_key="tomato_tofu", flavor="tomato_savory"
+        )
+        with self.assertRaisesRegex(ValidationError, "食材承接裁决不完整"):
+            service.complete_daily_review(second_date, missing_carryover)
+
+        reuse_same_ingredient = add_carryover_decisions(
+            home_cooking_review_result(second_date, dish_key="tomato_tofu", flavor="tomato_savory"),
+            context,
+        )
+        self.assertEqual(service.complete_daily_review(second_date, reuse_same_ingredient)["status"], "completed")
+
+    def test_home_cooking_carryover_allows_explicit_repeat_exception(self):
+        settings_path = Path(self.temp.name) / "settings.json"
+        settings_path.write_text(
+            json.dumps({**TEST_SETTINGS, "home_cooking": HOME_COOKING}, ensure_ascii=False), encoding="utf-8"
+        )
+        first_date = (date.today() - timedelta(days=1)).isoformat()
+        second_date = date.today().isoformat()
+        service.add_daily_record(first_date, "第一天独居晚餐")
+        service.complete_daily_review(first_date, home_cooking_review_result(first_date))
+        service.add_daily_record(second_date, "第二天独居晚餐")
+        context = service.daily_review_context(second_date)
+
+        repeated = home_cooking_review_result(second_date)
         repeated["tomorrow_menu"]["rotation"]["repeat_reason"] = "ingredient_expiry"
+        add_carryover_decisions(repeated, context)
         self.assertEqual(service.complete_daily_review(second_date, repeated)["status"], "completed")
 
     def test_legacy_database_environment_warns(self):
