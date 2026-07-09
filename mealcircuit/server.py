@@ -6,6 +6,7 @@ import io
 import ipaddress
 import json
 import mimetypes
+import os
 import sys
 import urllib.parse
 from datetime import date
@@ -15,7 +16,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from . import checkins, service
+from . import ai, checkins, service
 from .db import init_db
 from .storage import port_value, upload_root
 from .validation import ValidationError, nutrition_number
@@ -89,6 +90,7 @@ def layout(title: str, body: str) -> bytes:
             ("/tasks/photo", "照片任务", "photo", title in {"上传食物照片", "任务详情"}),
             ("/tasks/material", "原材料", "material", title == "原材料分析"),
             ("/tasks", "全部任务", "tasks", title == "任务列表"),
+            ("/ai", "API 接入", "settings", title == "API 接入"),
         )),
         ("资料", (
             ("/foods", "食品营养库", "foods", title in {"食品营养库", "新增食品", "编辑食品"}),
@@ -112,7 +114,7 @@ def layout(title: str, body: str) -> bytes:
         "首页": "今日总览", "今日建议与明日菜单": "今日建议", "每日复盘": "每日复盘",
         "今日状态": "今日状态", "状态问答": "状态问答", "状态设置": "状态设置",
         "上传食物照片": "照片任务", "原材料分析": "原材料分析", "任务列表": "全部任务",
-        "任务详情": "任务详情", "食品营养库": "食品营养库", "新增食品": "新增食品",
+        "任务详情": "任务详情", "API 接入": "API 接入", "食品营养库": "食品营养库", "新增食品": "新增食品",
         "编辑食品": "编辑食品", "历史建议": "历史建议", "记录与记忆": "记录与记忆",
         "操作失败": "操作失败", "未找到": "未找到",
     }
@@ -509,6 +511,40 @@ def render_checkin_settings() -> str:
     )
 
 
+def render_ai_settings() -> str:
+    status = ai.ai_status()
+    provider = status.get("provider") or ""
+    model_value = esc(os.environ.get("MEALCIRCUIT_AI_MODEL", ""))
+    provider_options = "".join(
+        f'<option value="{name}"{" selected" if provider == name else ""}>{label}</option>'
+        for name, label in (
+            ("deepseek", "DeepSeek"),
+            ("openai", "OpenAI"),
+            ("anthropic", "Anthropic"),
+        )
+    )
+    state = "已启用" if status["provider_valid"] and status["model_configured"] and status["key_configured"] else "未启用"
+    configured = (
+        f'<p><span class="status completed">{state}</span> · provider={esc(provider or "未设置")} · '
+        f'model={"已设置" if status["model_configured"] else "未设置"} · '
+        f'key={esc(status.get("key_name") or "未设置")} {"已设置" if status["key_configured"] else "未设置"}</p>'
+    )
+    disable = (
+        '<form method="post" action="/ai/disable">'
+        '<div class="form-actions"><button class="secondary" type="submit">关闭本次运行的 API Key 模式</button></div></form>'
+        if provider or status["model_configured"] or status["key_configured"] else ""
+    )
+    return f'''<section class="card"><div class="section-header"><div><p class="eyebrow">Runtime AI mode</p>
+<h1>API Key 接入</h1><p class="muted">只在当前服务进程内启用；不写入数据库、配置文件或页面。</p></div></div>{configured}
+<form method="post" action="/ai/configure">
+<label for="ai-provider">供应商</label><select id="ai-provider" name="provider">{provider_options}</select>
+<label for="ai-model">模型名</label><input id="ai-model" name="model" value="{model_value}" placeholder="例如 deepseek-v4-flash" required>
+<label for="ai-key">API Key</label><input id="ai-key" name="api_key" type="password" autocomplete="off" required>
+<div class="grid two"><div><label for="ai-timeout">超时秒数</label><input id="ai-timeout" name="timeout_seconds" type="number" min="1" value="{esc(status["timeout_seconds"])}"></div>
+<div><label for="ai-max-output">最大输出 token</label><input id="ai-max-output" name="max_output_tokens" type="number" min="1" value="{esc(status["max_output_tokens"])}"></div></div>
+<div class="form-actions"><button type="submit">启用本次运行的 API Key 模式</button></div></form>{disable}</section>'''
+
+
 def food_form(item: dict | None = None) -> str:
     item = item or {}
     action = f'/foods/{esc(item["id"])}' if item.get("id") else "/foods"
@@ -880,6 +916,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_html("原材料分析", '<section class="card"><h1>原材料分析任务</h1><p class="muted">输入已有食材与粗略数量，Agent 会结合总纲、营养库、近 14 天记录和长期记忆分析。</p><form method="post" action="/tasks/material"><label for="task-materials">现有食材及粗略数量 *</label><textarea id="task-materials" name="materials" required placeholder="例如：鸡胸肉约 500g、冷冻西兰花一袋、米、鸡蛋 6 个"></textarea><div class="form-actions"><button type="submit">创建待处理任务</button></div></form></section>')
             elif path == "/tasks":
                 self.send_html("任务列表", f'<section class="card"><h1>全部任务</h1>{task_table(service.list_tasks())}</section>')
+            elif path == "/ai":
+                self.send_html("API 接入", render_ai_settings())
             elif path.startswith("/tasks/"):
                 task_id = path.split("/")[2]
                 task = service.get_task(task_id)
@@ -1002,6 +1040,19 @@ class Handler(BaseHTTPRequestHandler):
                     })
                 service.update_checkin_module_settings(settings)
                 self.redirect("/check-ins/settings")
+            elif path == "/ai/configure":
+                form = self.read_urlencoded()
+                ai.configure_runtime(
+                    form.get("provider", ""),
+                    form.get("model", ""),
+                    form.get("api_key", ""),
+                    form.get("timeout_seconds", ""),
+                    form.get("max_output_tokens", ""),
+                )
+                self.redirect("/ai")
+            elif path == "/ai/disable":
+                ai.clear_runtime()
+                self.redirect("/ai")
             elif path.startswith("/check-ins/"):
                 parts = path.strip("/").split("/")
                 if len(parts) != 4:

@@ -87,6 +87,43 @@ def provider_from_environment() -> "AIProvider":
     raise ValidationError("未知模型供应商")
 
 
+def configure_runtime(
+    provider: str,
+    model: str,
+    api_key: str,
+    timeout_seconds: str | int | None = None,
+    max_output_tokens: str | int | None = None,
+) -> dict:
+    clean_provider = str(provider or "").strip().lower()
+    clean_model = str(model or "").strip()
+    clean_key = str(api_key or "").strip()
+    if clean_provider not in SUPPORTED_PROVIDERS:
+        raise ValidationError("供应商只能是 openai、anthropic 或 deepseek")
+    if not clean_model:
+        raise ValidationError("模型名不能为空")
+    if not clean_key:
+        raise ValidationError("API Key 不能为空；MealCircuit 只在本次运行内保存到进程环境")
+    timeout = _positive_int_value(timeout_seconds, DEFAULT_TIMEOUT_SECONDS, "超时时间")
+    max_tokens = _positive_int_value(max_output_tokens, DEFAULT_MAX_OUTPUT_TOKENS, "最大输出 token")
+    clear_runtime()
+    os.environ["MEALCIRCUIT_AI_PROVIDER"] = clean_provider
+    os.environ["MEALCIRCUIT_AI_MODEL"] = clean_model
+    os.environ[_key_name(clean_provider)] = clean_key
+    os.environ["MEALCIRCUIT_AI_TIMEOUT_SECONDS"] = str(timeout)
+    os.environ["MEALCIRCUIT_AI_MAX_OUTPUT_TOKENS"] = str(max_tokens)
+    return ai_status()
+
+
+def clear_runtime() -> dict:
+    for key in (
+        "MEALCIRCUIT_AI_PROVIDER", "MEALCIRCUIT_AI_MODEL", "MEALCIRCUIT_OPENAI_API_KEY",
+        "MEALCIRCUIT_ANTHROPIC_API_KEY", "MEALCIRCUIT_DEEPSEEK_API_KEY",
+        "MEALCIRCUIT_AI_TIMEOUT_SECONDS", "MEALCIRCUIT_AI_MAX_OUTPUT_TOKENS",
+    ):
+        os.environ.pop(key, None)
+    return ai_status()
+
+
 def generate_json(context: dict, kind: str, client: "AIProvider | None" = None) -> dict:
     request = build_generation_request(context, kind)
     provider = client or provider_from_environment()
@@ -570,3 +607,15 @@ def _int_environment(name: str, default: int) -> int:
     if value <= 0:
         raise ValidationError(f"{name} 必须是正整数")
     return value
+
+
+def _positive_int_value(value: str | int | None, default: int, name: str) -> int:
+    if value is None or value == "":
+        return default
+    try:
+        number = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValidationError(f"{name} 必须是正整数") from exc
+    if number <= 0:
+        raise ValidationError(f"{name} 必须是正整数")
+    return number

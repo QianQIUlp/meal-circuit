@@ -4,7 +4,7 @@
 
 - `context` / `day-context` 返回的 `doctrine.content` 是本次饮食判断的最高规则，不得静默改写；其来源由 `doctrine.mode` 和 `doctrine.sources` 标明。
 - 照片/原材料分析使用 `context <任务ID>`；每日复盘使用 `day-context <日期>`。两者都必须读取近14天记录与已发布状态、长期记忆和当前调整，不得依赖聊天模型自身记忆。
-- 默认不调用外部模型 API，不要求用户配置 API Key；仅在用户显式配置 `MEALCIRCUIT_AI_PROVIDER`、`MEALCIRCUIT_AI_MODEL` 和对应供应商 API Key 后，才允许通过内置手动生成命令调用用户选择的模型服务。DeepSeek provider 只用于文本型原材料和每日复盘；照片任务不得伪造未支持的视觉输入。
+- 默认不调用外部模型 API，不要求用户配置 API Key；仅在用户显式通过环境变量或 Web UI 的“API 接入”页面配置 provider、模型和对应 API Key 后，才允许通过内置手动生成命令调用用户选择的模型服务。Web UI 接入只允许把 key 放入当前服务进程环境，不得落库或写文件；DeepSeek provider 只用于文本型原材料和每日复盘，照片任务不得伪造未支持的视觉输入。
 
 ## 处理待办任务
 
