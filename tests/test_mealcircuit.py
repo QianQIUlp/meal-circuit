@@ -853,6 +853,16 @@ class WebAppTest(unittest.TestCase):
         finally:
             conn.close()
 
+    def rejected_post(self, path, body=None, headers=None):
+        transient = (ConnectionAbortedError, ConnectionResetError, http.client.RemoteDisconnected)
+        for attempt in range(3):
+            try:
+                return self.request("POST", path, body, headers)
+            except transient:
+                if attempt == 2:
+                    raise
+        raise AssertionError("unreachable")
+
     def test_pages_and_material_form(self):
         for path in ("/", "/daily", "/history", "/tasks/photo", "/tasks/material", "/tasks", "/ai", "/foods", "/overview"):
             status, _, body = self.request("GET", path)
@@ -1279,7 +1289,9 @@ class WebAppTest(unittest.TestCase):
         with redirect_stderr(output):
             for extra in cases:
                 headers = {"Content-Type": "application/x-www-form-urlencoded", **extra}
-                status, _, response = self.request("POST", f"/check-ins/{date.today().isoformat()}/weight/skip", body, headers)
+                status, _, response = self.rejected_post(
+                    f"/check-ins/{date.today().isoformat()}/weight/skip", body, headers
+                )
                 self.assertEqual(status, 400)
                 self.assertTrue(
                     "拒绝跨来源写入请求" in response.decode("utf-8")

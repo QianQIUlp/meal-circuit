@@ -2,6 +2,16 @@
 
 > 项目于 2026-07-02 从 DietOS 更名为 MealCircuit（食回路）。以下旧名称保留为真实历史记录。
 
+## 2026-07-09：CI 拒绝请求测试稳定性
+
+- 目标：修复 GitHub Actions Windows / Python 3.13 上 origin-policy 拒绝请求测试偶发 `ConnectionAbortedError` 的 CI 红灯。
+- 改动文件：仅更新 HTTP 测试辅助和本开发记录；未改变生产 Host/Origin 校验逻辑。
+- 核心功能：新增 `rejected_post` 测试辅助，对预期被拒绝且不会产生写入的 POST 请求在连接被系统中止时安全重试，避免 Windows socket 抖动掩盖真实断言。
+- 验证：相关单测 `test_origin_policy_rejects_bad_port_null_cross_site_and_invalid_host`、43 项 `.\test.ps1`、`python tools\release_check.py` 和 `git diff --check` 通过。
+- 仍未实现：未修改服务器拒绝逻辑；若未来生产请求也出现连接中止，需要另行排查 HTTP server 生命周期。
+- 下一最小任务：等待 PR CI 重新跑完，确认 push 与 pull_request 事件都为绿色。
+- 用户用法：无需改变。
+
 ## 2026-07-09：用户 API Key 手动生成
 
 - 目标：在保留 Codex/Claude Code 外部 Agent 工作流的同时，让用户可用自己的 OpenAI、Anthropic 或 DeepSeek API Key 手动处理待办。
