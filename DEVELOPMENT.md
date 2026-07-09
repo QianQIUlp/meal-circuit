@@ -2,6 +2,17 @@
 
 > 项目于 2026-07-02 从 DietOS 更名为 MealCircuit（食回路）。以下旧名称保留为真实历史记录。
 
+## 2026-07-09：用户 API Key 手动生成
+
+- 目标：在保留 Codex/Claude Code 外部 Agent 工作流的同时，让用户可用自己的 OpenAI、Anthropic 或 DeepSeek API Key 手动处理待办。
+- 改动文件：新增标准库 HTTP 模型 provider 层，扩展 CLI、服务层、Web 待办按钮、配置诊断、README、Agent 规则、环境变量示例和自动化测试；未新增依赖、后台队列、密钥存储或自动触发。
+- 核心功能：`generate <TASK_ID>` 与 `day-generate <日期>` 会读取现有上下文、调用所选模型、解析 JSON，并继续走现有本地校验与完成逻辑；Web 的 pending 任务和复盘页新增“用 API Key 生成”表单。
+- 供应商边界：支持 `MEALCIRCUIT_AI_PROVIDER=openai|anthropic|deepseek`、显式 `MEALCIRCUIT_AI_MODEL`、对应 API Key、超时和最大输出 token；OpenAI 使用 Responses API 图片 data URL 与 JSON schema，Anthropic 使用 Messages API 图片 base64 与强制 tool result，DeepSeek 使用 OpenAI-compatible Chat JSON mode 且只处理文本任务。
+- 验证：`python -m py_compile mealcircuit\ai.py mealcircuit\service.py mealcircuit\server.py mealcircuit\agent_cli.py mealcircuit\configuration.py tests\test_mealcircuit.py`、42 项 `.\test.ps1` 测试、`python tools\release_check.py` 和 `git diff --check` 通过；新增覆盖缺少环境变量不写库、OpenAI 照片 payload、Anthropic tool payload、DeepSeek Chat JSON mode、非法模型结果保持 pending、Web 成功/失败路径。使用隔离 `MEALCIRCUIT_HOME` 与 DeepSeek `deepseek-v4-flash` 真实烟测通过：配置诊断、原材料生成和每日复盘生成完成；照片任务按预期拒绝 DeepSeek 未支持的图片输入并保持 pending。
+- 仍未实现：不保存 API Key、不提供后台自动清队列、不做供应商价格/可用性判断、不支持 OpenAI-compatible base_url、本地模型或营养数据库外查。
+- 下一最小任务：用真实临时 API Key 对一条照片任务和一条每日复盘做端到端人工验收，重点看提示词是否足够稳定地产生可通过校验的 JSON。
+- 用户用法：设置环境变量后重启服务，点击待办页按钮，或运行 `python -m mealcircuit.agent_cli generate <TASK_ID>` / `day-generate YYYY-MM-DD`。
+
 ## 2026-07-09：明日菜单承接剩余食材
 
 - 目标：让独居下厨菜单在生成明日计划时承接上一轮三日复用方向，避免按采购清单多买的食材被下一次菜单静默忽略。

@@ -169,6 +169,20 @@ def render_task_input(task: dict) -> str:
     )
 
 
+def render_task_generate_controls(task_id: str) -> str:
+    return (
+        f'<form method="post" action="/tasks/{esc(task_id)}/generate">'
+        '<div class="form-actions"><button type="submit">用 API Key 生成</button></div></form>'
+    )
+
+
+def render_daily_generate_controls(review_date: str) -> str:
+    return (
+        f'<form method="post" action="/reviews/{esc(review_date)}/generate">'
+        '<div class="form-actions"><button type="submit">用 API Key 生成今日建议</button></div></form>'
+    )
+
+
 def render_review_cards(reviews: list[dict]) -> str:
     status_labels = {
         "stable": "稳定", "observe": "观察", "adjust": "需调整", "risk": "风险",
@@ -829,7 +843,9 @@ class Handler(BaseHTTPRequestHandler):
                     content = (
                         '<p>今日记录已经保存，等待 Agent 生成核心建议和明日菜单。</p>'
                         f'<pre>python -m mealcircuit.agent_cli day-context {esc(daily["date"])} --output context.json\n'
-                        f'python -m mealcircuit.agent_cli day-complete {esc(daily["date"])} --file result.json</pre>'
+                        f'python -m mealcircuit.agent_cli day-complete {esc(daily["date"])} --file result.json\n'
+                        f'python -m mealcircuit.agent_cli day-generate {esc(daily["date"])}</pre>'
+                        f'{render_daily_generate_controls(daily["date"])}'
                     )
                 else:
                     state = '<p><span class="status pending">尚未记录</span></p>'
@@ -871,7 +887,12 @@ class Handler(BaseHTTPRequestHandler):
                 if task["result_json"]:
                     result = render_result(task["type"], task["result_json"])
                 else:
-                    result = f'<p>等待 Agent 处理。</p><pre>python -m mealcircuit.agent_cli context {esc(task_id)} --output context.json\npython -m mealcircuit.agent_cli complete {esc(task_id)} --file result.json</pre>'
+                    result = (
+                        f'<p>等待 Agent 处理。</p><pre>python -m mealcircuit.agent_cli context {esc(task_id)} --output context.json\n'
+                        f'python -m mealcircuit.agent_cli complete {esc(task_id)} --file result.json\n'
+                        f'python -m mealcircuit.agent_cli generate {esc(task_id)}</pre>'
+                        f'{render_task_generate_controls(task_id)}'
+                    )
                 corrections = "".join(f'<li>{esc(c["correction_json"]["text"])} <span class="muted small">{esc(c["created_at"])}</span></li>' for c in task["corrections"]) or '<li class="muted">暂无用户校正</li>'
                 correction_form = f'<form method="post" action="/tasks/{esc(task_id)}/corrections"><label for="task-correction">新增用户校正（保留原结果，不覆盖）</label><textarea id="task-correction" name="text" required></textarea><div class="form-actions"><button type="submit">保存校正</button></div></form>' if task["status"] == "completed" else ""
                 body = f'<section class="card"><h1>{"食物识别" if task["type"]=="photo" else "原材料分析"}</h1><p><span class="status {esc(task["status"])}">{esc(task["status"])}</span> · {esc(task_id)}</p>{media}{render_task_input(task)}</section><section class="card"><h2>Agent 分析结果</h2>{result}</section><section class="card"><h2>用户校正历史</h2><ul>{corrections}</ul>{correction_form}</section>'
@@ -904,7 +925,9 @@ class Handler(BaseHTTPRequestHandler):
                     result = (
                         '<p>等待 Agent 生成核心建议和次日菜单。</p>'
                         f'<pre>python -m mealcircuit.agent_cli day-context {esc(review_date)} --output context.json\n'
-                        f'python -m mealcircuit.agent_cli day-complete {esc(review_date)} --file result.json</pre>'
+                        f'python -m mealcircuit.agent_cli day-complete {esc(review_date)} --file result.json\n'
+                        f'python -m mealcircuit.agent_cli day-generate {esc(review_date)}</pre>'
+                        f'{render_daily_generate_controls(review_date)}'
                     )
                 result_shell = result if review["status"] == "completed" else f'<section class="panel"><h2>核心建议与次日菜单</h2>{result}</section>'
                 body = (
@@ -1032,6 +1055,10 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/tasks/material":
                 task = service.create_material_task(self.read_urlencoded().get("materials", ""))
                 self.redirect(f'/tasks/{task["id"]}')
+            elif path.startswith("/tasks/") and path.endswith("/generate"):
+                task_id = path.split("/")[2]
+                service.generate_task_result(task_id)
+                self.redirect(f"/tasks/{task_id}")
             elif path == "/foods":
                 food = service.create_food(self.food_payload(self.read_urlencoded()))
                 self.redirect(f'/foods/{food["id"]}')
@@ -1056,6 +1083,10 @@ class Handler(BaseHTTPRequestHandler):
                 record_date = form.get("record_date", "")
                 service.add_daily_record(record_date, form.get("raw_input", ""))
                 self.redirect(f"/reviews/{record_date}")
+            elif path.startswith("/reviews/") and path.endswith("/generate"):
+                review_date = path.split("/")[2]
+                service.generate_daily_review(review_date)
+                self.redirect(f"/reviews/{review_date}")
             elif path == "/memories":
                 form = self.read_urlencoded()
                 service.add_memory(form.get("kind", ""), form.get("content", ""), form.get("evidence", ""))

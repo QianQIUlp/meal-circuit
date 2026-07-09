@@ -172,6 +172,16 @@ def complete_task(task_id: str, result: dict) -> dict:
     return get_task(task_id)
 
 
+def generate_task_result(task_id: str, client=None) -> dict:
+    from .ai import generate_json
+
+    task = get_task(task_id)
+    if task["status"] == "completed":
+        raise ValidationError("任务已完成；不得覆盖原结果，请新增用户校正")
+    result = generate_json(task_context(task_id), task["type"], client)
+    return complete_task(task_id, result)
+
+
 def add_correction(task_id: str, correction: dict) -> dict:
     task = get_task(task_id)
     if task["status"] != "completed":
@@ -1010,6 +1020,16 @@ def complete_daily_review(review_date: str, result: dict) -> dict:
         if updated.rowcount != 1:
             raise ValidationError("复盘状态已变化，请重新读取")
     return get_daily_review(review_date)
+
+
+def generate_daily_review(review_date: str, client=None) -> dict:
+    from .ai import generate_json
+
+    review = ensure_daily_review(review_date)
+    if review["status"] == "completed":
+        raise ValidationError("该日期复盘已完成；新增每日记录后才可重新复盘")
+    result = generate_json(daily_review_context(review_date), "daily", client)
+    return complete_daily_review(review_date, result)
 
 
 def _non_empty_text(value: object, name: str) -> str:

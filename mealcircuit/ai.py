@@ -1,0 +1,572 @@
+from __future__ import annotations
+
+import base64
+import json
+import mimetypes
+import os
+import urllib.error
+import urllib.request
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Callable
+
+from .validation import ValidationError
+
+
+SUPPORTED_PROVIDERS = {"openai", "anthropic", "deepseek"}
+DEFAULT_TIMEOUT_SECONDS = 120
+DEFAULT_MAX_OUTPUT_TOKENS = 8192
+
+
+@dataclass(frozen=True)
+class AIConfig:
+    provider: str
+    model: str
+    api_key: str
+    timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS
+    max_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS
+
+
+@dataclass(frozen=True)
+class GenerationRequest:
+    kind: str
+    context: dict
+    schema: dict
+    json_schema: dict
+    image_path: str | None = None
+
+
+Transport = Callable[[str, dict[str, str], dict, int], dict]
+
+
+def ai_status() -> dict:
+    provider = (os.environ.get("MEALCIRCUIT_AI_PROVIDER") or "").strip().lower()
+    model = (os.environ.get("MEALCIRCUIT_AI_MODEL") or "").strip()
+    key_name = _key_name(provider) if provider in SUPPORTED_PROVIDERS else None
+    return {
+        "provider": provider or None,
+        "provider_valid": provider in SUPPORTED_PROVIDERS,
+        "model_configured": bool(model),
+        "key_name": key_name,
+        "key_configured": bool(key_name and os.environ.get(key_name)),
+        "timeout_seconds": _int_environment("MEALCIRCUIT_AI_TIMEOUT_SECONDS", DEFAULT_TIMEOUT_SECONDS),
+        "max_output_tokens": _int_environment("MEALCIRCUIT_AI_MAX_OUTPUT_TOKENS", DEFAULT_MAX_OUTPUT_TOKENS),
+    }
+
+
+def load_config() -> AIConfig:
+    provider = (os.environ.get("MEALCIRCUIT_AI_PROVIDER") or "").strip().lower()
+    if not provider:
+        raise ValidationError("缺少 MEALCIRCUIT_AI_PROVIDER；可选 openai、anthropic 或 deepseek")
+    if provider not in SUPPORTED_PROVIDERS:
+        raise ValidationError("MEALCIRCUIT_AI_PROVIDER 只能是 openai、anthropic 或 deepseek")
+    model = (os.environ.get("MEALCIRCUIT_AI_MODEL") or "").strip()
+    if not model:
+        raise ValidationError("缺少 MEALCIRCUIT_AI_MODEL；请明确填写要使用的模型名")
+    key_name = _key_name(provider)
+    api_key = (os.environ.get(key_name) or "").strip()
+    if not api_key:
+        raise ValidationError(f"缺少 {key_name}；MealCircuit 不保存 API Key，只从环境变量读取")
+    return AIConfig(
+        provider=provider,
+        model=model,
+        api_key=api_key,
+        timeout_seconds=_int_environment("MEALCIRCUIT_AI_TIMEOUT_SECONDS", DEFAULT_TIMEOUT_SECONDS),
+        max_output_tokens=_int_environment("MEALCIRCUIT_AI_MAX_OUTPUT_TOKENS", DEFAULT_MAX_OUTPUT_TOKENS),
+    )
+
+
+def provider_from_environment() -> "AIProvider":
+    config = load_config()
+    if config.provider == "openai":
+        return OpenAIProvider(config)
+    if config.provider == "anthropic":
+        return AnthropicProvider(config)
+    if config.provider == "deepseek":
+        return DeepSeekProvider(config)
+    raise ValidationError("未知模型供应商")
+
+
+def generate_json(context: dict, kind: str, client: "AIProvider | None" = None) -> dict:
+    request = build_generation_request(context, kind)
+    provider = client or provider_from_environment()
+    result = provider.generate(request)
+    if not isinstance(result, dict):
+        raise ValidationError("模型返回的结果必须是 JSON 对象")
+    return result
+
+
+def build_generation_request(context: dict, kind: str) -> GenerationRequest:
+    schema = context.get("result_schema")
+    if not isinstance(schema, dict):
+        raise ValidationError("上下文缺少 result_schema")
+    image_path = None
+    if kind == "photo":
+        task = context.get("task") or {}
+        image_path = task.get("image_path")
+        if not image_path:
+            raise ValidationError("照片任务缺少 image_path")
+    return GenerationRequest(
+        kind=kind,
+        context=context,
+        schema=schema,
+        json_schema=result_json_schema(kind, context),
+        image_path=image_path,
+    )
+
+
+class AIProvider:
+    def generate(self, request: GenerationRequest) -> dict:
+        raise NotImplementedError
+
+
+class OpenAIProvider(AIProvider):
+    url = "https://api.openai.com/v1/responses"
+
+    def __init__(self, config: AIConfig, transport: Transport | None = None):
+        self.config = config
+        self.transport = transport or _post_json
+
+    def generate(self, request: GenerationRequest) -> dict:
+        response = self.transport(
+            self.url,
+            {
+                "Authorization": f"Bearer {self.config.api_key}",
+                "Content-Type": "application/json",
+            },
+            self.build_payload(request),
+            self.config.timeout_seconds,
+        )
+        text = _openai_text(response)
+        return _parse_json_text(text)
+
+    def build_payload(self, request: GenerationRequest) -> dict:
+        content = []
+        if request.image_path:
+            content.append({"type": "input_image", "image_url": _image_data_url(request.image_path)})
+        content.append({"type": "input_text", "text": _user_prompt(request)})
+        return {
+            "model": self.config.model,
+            "instructions": _system_prompt(request.kind),
+            "input": [{"role": "user", "content": content}],
+            "max_output_tokens": self.config.max_output_tokens,
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": f"mealcircuit_{request.kind}_result",
+                    "schema": request.json_schema,
+                    "strict": False,
+                }
+            },
+        }
+
+
+class AnthropicProvider(AIProvider):
+    url = "https://api.anthropic.com/v1/messages"
+
+    def __init__(self, config: AIConfig, transport: Transport | None = None):
+        self.config = config
+        self.transport = transport or _post_json
+
+    def generate(self, request: GenerationRequest) -> dict:
+        response = self.transport(
+            self.url,
+            {
+                "x-api-key": self.config.api_key,
+                "anthropic-version": "2023-06-01",
+                "Content-Type": "application/json",
+            },
+            self.build_payload(request),
+            self.config.timeout_seconds,
+        )
+        return _anthropic_tool_input(response)
+
+    def build_payload(self, request: GenerationRequest) -> dict:
+        content = []
+        if request.image_path:
+            content.append(_anthropic_image_block(request.image_path))
+        content.append({"type": "text", "text": _user_prompt(request)})
+        return {
+            "model": self.config.model,
+            "max_tokens": self.config.max_output_tokens,
+            "system": _system_prompt(request.kind),
+            "messages": [{"role": "user", "content": content}],
+            "tools": [{
+                "name": "submit_mealcircuit_result",
+                "description": (
+                    "Submit the final MealCircuit analysis result. The input must be the complete "
+                    "JSON object that MealCircuit should validate and persist; do not omit required fields."
+                ),
+                "input_schema": request.json_schema,
+            }],
+            "tool_choice": {"type": "tool", "name": "submit_mealcircuit_result"},
+        }
+
+
+class DeepSeekProvider(AIProvider):
+    url = "https://api.deepseek.com/chat/completions"
+
+    def __init__(self, config: AIConfig, transport: Transport | None = None):
+        self.config = config
+        self.transport = transport or _post_json
+
+    def generate(self, request: GenerationRequest) -> dict:
+        if request.image_path:
+            raise ValidationError("DeepSeek 官方 API 当前未提供 MealCircuit 照片任务所需的图片输入；请改用支持视觉输入的 provider")
+        response = self.transport(
+            self.url,
+            {
+                "Authorization": f"Bearer {self.config.api_key}",
+                "Content-Type": "application/json",
+            },
+            self.build_payload(request),
+            self.config.timeout_seconds,
+        )
+        return _parse_json_text(_chat_completion_text(response))
+
+    def build_payload(self, request: GenerationRequest) -> dict:
+        return {
+            "model": self.config.model,
+            "messages": [
+                {"role": "system", "content": _system_prompt(request.kind)},
+                {"role": "user", "content": _user_prompt(request)},
+            ],
+            "response_format": {"type": "json_object"},
+            "max_tokens": self.config.max_output_tokens,
+            "stream": False,
+            "thinking": {"type": "disabled"},
+        }
+
+
+def result_json_schema(kind: str, context: dict | None = None) -> dict:
+    nutrition = {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["energy_kcal", "protein_g", "carbs_g", "fat_g"],
+        "properties": {
+            "energy_kcal": _range_schema(),
+            "protein_g": _range_schema(),
+            "carbs_g": _range_schema(),
+            "fat_g": _range_schema(),
+        },
+    }
+    if kind == "photo":
+        return {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["summary", "candidates", "unknowns", "advice"],
+            "properties": {
+                "summary": {"type": "string"},
+                "candidates": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": ["name", "portion_range", "nutrition", "confidence"],
+                        "properties": {
+                            "name": {"type": "string"},
+                            "portion_range": {"type": "string"},
+                            "nutrition": nutrition,
+                            "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                        },
+                    },
+                },
+                "unknowns": _string_array(),
+                "advice": _string_array(),
+            },
+        }
+    if kind == "material":
+        return {
+            "type": "object",
+            "additionalProperties": False,
+            "required": [
+                "summary", "combinations", "batch_nutrition", "per_serving_nutrition",
+                "gaps", "risks", "minimal_adjustments",
+            ],
+            "properties": {
+                "summary": {"type": "string"},
+                "combinations": _string_array(),
+                "batch_nutrition": nutrition,
+                "per_serving_nutrition": nutrition,
+                "gaps": _string_array(),
+                "risks": _string_array(),
+                "minimal_adjustments": _string_array(),
+            },
+        }
+    if kind == "daily":
+        home = ((context or {}).get("settings") or {}).get("home_cooking") or {"enabled": False}
+        schema = _daily_json_schema(nutrition, bool(home.get("enabled")))
+        return schema
+    raise ValidationError(f"未知生成类型：{kind}")
+
+
+def _daily_json_schema(nutrition: dict, home_cooking: bool) -> dict:
+    meal = {
+        "type": "object",
+        "additionalProperties": True,
+        "required": ["name", "foods", "portion_guidance", "protein_g", "substitutions"],
+        "properties": {
+            "name": {"type": "string", "enum": ["早餐", "午餐", "晚餐"]},
+            "foods": _string_array(min_items=1),
+            "portion_guidance": {"type": "string"},
+            "protein_g": _range_schema(),
+            "substitutions": _string_array(),
+            "mode": {"type": "string"},
+        },
+    }
+    menu_properties = {
+        "date": {"type": "string"},
+        "environment": {"type": "string"},
+        "protein_target_g": _range_schema(),
+        "meals": {"type": "array", "minItems": 3, "maxItems": 3, "items": meal},
+        "conditional_snack": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["condition", "options"],
+            "properties": {"condition": {"type": "string"}, "options": _string_array(min_items=1)},
+        },
+        "training_adjustment": {"type": "string"},
+        "gut_adjustment": {"type": "string"},
+    }
+    menu_required = [
+        "date", "environment", "protein_target_g", "meals", "conditional_snack",
+        "training_adjustment", "gut_adjustment",
+    ]
+    root_properties = {
+        "system_status": {"type": "string", "enum": ["stable", "observe", "adjust", "risk"]},
+        "facts": _string_array(min_items=1),
+        "inferences": _string_array(),
+        "core_advice": _string_array(min_items=1, max_items=3),
+        "do_not_adjust": _string_array(),
+        "risk_signals": _string_array(),
+        "priority_food_decisions": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["food_id", "decision", "reason"],
+                "properties": {
+                    "food_id": {"type": "string"},
+                    "decision": {"type": "string", "enum": ["use", "skip"]},
+                    "reason": {"type": "string"},
+                },
+            },
+        },
+        "tomorrow_menu": {
+            "type": "object",
+            "additionalProperties": True,
+            "required": menu_required,
+            "properties": menu_properties,
+        },
+        "one_line_review": {"type": "string"},
+    }
+    root_required = [
+        "system_status", "facts", "inferences", "core_advice", "do_not_adjust",
+        "risk_signals", "priority_food_decisions", "tomorrow_menu", "one_line_review",
+    ]
+    if home_cooking:
+        menu_properties.update({
+            "shopping_list": {"type": "array", "items": {"type": "object", "additionalProperties": True}},
+            "online_options": {"type": "array", "items": {"type": "object", "additionalProperties": True}},
+            "reuse_plan": {"type": "object", "additionalProperties": True},
+            "rotation": {"type": "object", "additionalProperties": True},
+        })
+        menu_required.extend(["shopping_list", "online_options", "reuse_plan", "rotation"])
+        root_properties["ingredient_carryover_decisions"] = {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["carryover_id", "ingredient", "decision", "reason", "planned_use"],
+                "properties": {
+                    "carryover_id": {"type": "string"},
+                    "ingredient": {"type": "string"},
+                    "decision": {"type": "string", "enum": ["use", "skip", "discard"]},
+                    "reason": {"type": "string"},
+                    "planned_use": {"type": "string"},
+                },
+            },
+        }
+        root_required.append("ingredient_carryover_decisions")
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": root_required,
+        "properties": root_properties,
+    }
+
+
+def _post_json(url: str, headers: dict[str, str], payload: dict, timeout: int) -> dict:
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    request = urllib.request.Request(url, data=data, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            raw = response.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        details = exc.read().decode("utf-8", errors="replace")
+        raise ValidationError(f"模型 API 请求失败：HTTP {exc.code} {details[:500]}") from exc
+    except (urllib.error.URLError, TimeoutError) as exc:
+        raise ValidationError(f"模型 API 请求失败：{exc}") from exc
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValidationError("模型 API 返回的不是合法 JSON") from exc
+    if not isinstance(value, dict):
+        raise ValidationError("模型 API 返回 JSON 顶层不是对象")
+    return value
+
+
+def _system_prompt(kind: str) -> str:
+    return (
+        "你是 MealCircuit 内置生成器。必须严格遵循上下文中的 doctrine.content、analysis_boundary、"
+        "result_schema 和所有协议说明。只提交一个可被 MealCircuit 校验的 JSON 对象；不要输出 Markdown、"
+        "解释、额外文本或无法从证据支持的精确营养值。照片中不可见的油、酱汁、重量或品牌必须列入 unknowns。"
+        f"当前生成类型：{kind}。"
+    )
+
+
+def _user_prompt(request: GenerationRequest) -> str:
+    return (
+        "请根据以下 MealCircuit 上下文生成最终结果。上下文 JSON：\n"
+        f"{json.dumps(request.context, ensure_ascii=False, indent=2, default=str)}"
+    )
+
+
+def _image_data_url(path: str) -> str:
+    image_path = Path(path)
+    media_type = _media_type(image_path)
+    data = base64.b64encode(image_path.read_bytes()).decode("ascii")
+    return f"data:{media_type};base64,{data}"
+
+
+def _anthropic_image_block(path: str) -> dict:
+    image_path = Path(path)
+    return {
+        "type": "image",
+        "source": {
+            "type": "base64",
+            "media_type": _media_type(image_path),
+            "data": base64.b64encode(image_path.read_bytes()).decode("ascii"),
+        },
+    }
+
+
+def _media_type(path: Path) -> str:
+    guessed = mimetypes.guess_type(path.name)[0]
+    if guessed in {"image/jpeg", "image/png", "image/gif", "image/webp"}:
+        return guessed
+    suffix = path.suffix.lower()
+    return {
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".png": "image/png",
+        ".gif": "image/gif",
+        ".webp": "image/webp",
+    }.get(suffix, "application/octet-stream")
+
+
+def _openai_text(response: dict) -> str:
+    if isinstance(response.get("output_text"), str):
+        return response["output_text"]
+    texts: list[str] = []
+    for item in response.get("output") or []:
+        if not isinstance(item, dict):
+            continue
+        for content in item.get("content") or []:
+            if isinstance(content, dict) and isinstance(content.get("text"), str):
+                texts.append(content["text"])
+    if texts:
+        return "\n".join(texts)
+    raise ValidationError("模型 API 返回中没有可解析的文本结果")
+
+
+def _chat_completion_text(response: dict) -> str:
+    choices = response.get("choices")
+    if not isinstance(choices, list) or not choices:
+        raise ValidationError("模型 API 返回中没有 choices")
+    first = choices[0]
+    if not isinstance(first, dict):
+        raise ValidationError("模型 API 返回 choices 格式无效")
+    message = first.get("message")
+    if not isinstance(message, dict) or not isinstance(message.get("content"), str):
+        raise ValidationError("模型 API 返回中没有 message.content")
+    return message["content"]
+
+
+def _anthropic_tool_input(response: dict) -> dict:
+    for item in response.get("content") or []:
+        if (
+            isinstance(item, dict)
+            and item.get("type") == "tool_use"
+            and item.get("name") == "submit_mealcircuit_result"
+            and isinstance(item.get("input"), dict)
+        ):
+            return item["input"]
+    raise ValidationError("模型 API 返回中没有 submit_mealcircuit_result 工具结果")
+
+
+def _parse_json_text(text: str) -> dict:
+    clean = text.strip()
+    if clean.startswith("```"):
+        lines = clean.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].startswith("```"):
+            lines = lines[:-1]
+        clean = "\n".join(lines).strip()
+    try:
+        value = json.loads(clean)
+    except json.JSONDecodeError:
+        start, end = clean.find("{"), clean.rfind("}")
+        if start < 0 or end <= start:
+            raise ValidationError("模型返回的文本中没有合法 JSON 对象")
+        try:
+            value = json.loads(clean[start:end + 1])
+        except json.JSONDecodeError as exc:
+            raise ValidationError("模型返回的文本中没有合法 JSON 对象") from exc
+    if not isinstance(value, dict):
+        raise ValidationError("模型返回的 JSON 顶层必须是对象")
+    return value
+
+
+def _range_schema() -> dict:
+    return {
+        "anyOf": [
+            {
+                "type": "array",
+                "minItems": 2,
+                "maxItems": 2,
+                "items": {"type": "number", "minimum": 0},
+            },
+            {"type": "null"},
+        ]
+    }
+
+
+def _string_array(min_items: int = 0, max_items: int | None = None) -> dict:
+    schema: dict[str, Any] = {"type": "array", "items": {"type": "string"}, "minItems": min_items}
+    if max_items is not None:
+        schema["maxItems"] = max_items
+    return schema
+
+
+def _key_name(provider: str) -> str:
+    if provider == "openai":
+        return "MEALCIRCUIT_OPENAI_API_KEY"
+    if provider == "anthropic":
+        return "MEALCIRCUIT_ANTHROPIC_API_KEY"
+    return "MEALCIRCUIT_DEEPSEEK_API_KEY"
+
+
+def _int_environment(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValidationError(f"{name} 必须是整数") from exc
+    if value <= 0:
+        raise ValidationError(f"{name} 必须是正整数")
+    return value

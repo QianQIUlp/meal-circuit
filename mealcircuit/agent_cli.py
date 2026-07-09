@@ -34,7 +34,7 @@ def load_json(path: str) -> dict:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m mealcircuit.agent_cli",
-        description="MealCircuit（食回路）Agent-in-the-loop CLI（不调用外部模型 API）",
+        description="MealCircuit（食回路）Agent-in-the-loop CLI；可选用用户自己的 API Key 手动生成结果",
     )
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("init", help="创建仓库外私人数据目录和配置模板（不覆盖现有文件）")
@@ -53,6 +53,9 @@ def build_parser() -> argparse.ArgumentParser:
     complete.add_argument("task_id")
     complete.add_argument("--file", "-f", required=True)
     complete.add_argument("--output", "-o")
+    generate = sub.add_parser("generate", help="使用用户环境变量中的模型 API Key 生成并完成任务")
+    generate.add_argument("task_id")
+    generate.add_argument("--output", "-o")
     correct = sub.add_parser("correct", help="追加用户校正历史")
     correct.add_argument("task_id")
     correct.add_argument("--text", required=True)
@@ -68,6 +71,9 @@ def build_parser() -> argparse.ArgumentParser:
     day_complete.add_argument("date")
     day_complete.add_argument("--file", "-f", required=True)
     day_complete.add_argument("--output", "-o")
+    day_generate = sub.add_parser("day-generate", help="使用用户环境变量中的模型 API Key 生成并提交每日复盘")
+    day_generate.add_argument("date")
+    day_generate.add_argument("--output", "-o")
     return parser
 
 
@@ -92,6 +98,8 @@ def main() -> None:
             emit(service.task_context(args.task_id, args.days), args.output)
         elif args.command == "complete":
             emit(service.complete_task(args.task_id, load_json(args.file)), args.output)
+        elif args.command == "generate":
+            emit(service.generate_task_result(args.task_id), args.output)
         elif args.command == "correct":
             emit(service.add_correction(args.task_id, {"text": args.text}))
         elif args.command == "schema":
@@ -102,6 +110,8 @@ def main() -> None:
             emit(service.daily_review_context(args.date, args.days), args.output)
         elif args.command == "day-complete":
             emit(service.complete_daily_review(args.date, load_json(args.file)), args.output)
+        elif args.command == "day-generate":
+            emit(service.generate_daily_review(args.date), args.output)
     except KeyError as exc:
         print(f"错误：记录不存在：{exc.args[0]}", file=sys.stderr)
         raise SystemExit(2) from exc

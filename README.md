@@ -20,7 +20,7 @@
 MealCircuit is a **local-first, agent-in-the-loop** workbench for long-horizon meal feedback. It connects meal photos, raw ingredients, daily status check-ins, the food nutrition library, and user corrections into a traceable feedback loop, then combines the last 14 days of trends, long-term memory, and personal doctrine to produce structured judgments and a next-day meal plan.
 
 > [!IMPORTANT]
-> MealCircuit itself does not call external model APIs and does not require an API key. It stores facts, assembles context, and validates results; Codex, Claude Code, or another agent performs the analysis only when the user triggers a task.
+> MealCircuit does not require an API key by default. It stores facts, assembles context, and validates results; Codex, Claude Code, or another agent can still perform the analysis. Optionally, you can configure your own OpenAI, Anthropic, or DeepSeek API key in environment variables and manually trigger built-in generation for pending work.
 
 ## More Than Calorie Logging
 
@@ -85,16 +85,30 @@ python -m mealcircuit.agent_cli context <TASK_ID> --output context.json
 python -m mealcircuit.agent_cli schema photo
 python -m mealcircuit.agent_cli complete <TASK_ID> --file result.json
 
+# Optional: use your configured API key to generate and complete the task
+python -m mealcircuit.agent_cli generate <TASK_ID>
+
 # 2b. Process a daily review
 python -m mealcircuit.agent_cli day-context 2026-01-01 --output context.json
 python -m mealcircuit.agent_cli schema daily
 python -m mealcircuit.agent_cli day-complete 2026-01-01 --file result.json
+
+# Optional: use your configured API key to generate and complete the review
+python -m mealcircuit.agent_cli day-generate 2026-01-01
 
 # 3. Append a user-confirmed correction without overwriting the original result
 python -m mealcircuit.agent_cli correct <TASK_ID> --text "User-confirmed correction"
 ```
 
 Agents should strictly follow `doctrine.content` and `result_schema` in the exported context. Daily reviews must also read `target_checkin`, `checkin_coverage`, and `recent_checkins`; drafts are not exported, and skips or missing answers remain unknown. Photo analysis uses nutrition ranges; any range that cannot be judged is `null`, and invisible details go into `unknowns`.
+
+### Optional API Key Generation
+
+Built-in generation is manual and opt-in. Set `MEALCIRCUIT_AI_PROVIDER` to `openai`, `anthropic`, or `deepseek`, set `MEALCIRCUIT_AI_MODEL` to the exact model you want to pay for, and provide `MEALCIRCUIT_OPENAI_API_KEY`, `MEALCIRCUIT_ANTHROPIC_API_KEY`, or `MEALCIRCUIT_DEEPSEEK_API_KEY`. MealCircuit reads these values from the process environment only; it does not store keys in SQLite or the browser UI. You can also set `MEALCIRCUIT_AI_TIMEOUT_SECONDS` and `MEALCIRCUIT_AI_MAX_OUTPUT_TOKENS`.
+
+DeepSeek uses its OpenAI-compatible Chat API path. As of the current official DeepSeek API docs, MealCircuit supports DeepSeek for text-only ingredient and daily-review generation; photo tasks still need a provider with documented image input.
+
+When you click “用 API Key 生成” in the Web UI or run `generate` / `day-generate`, MealCircuit sends the assembled context, and for photo tasks the uploaded image, to the selected model provider. The returned JSON is still validated by the same local schema and business rules before anything is persisted.
 
 In solo-cooking mode, `day-context` also includes `home_cooking_preferences`, `recent_home_dinners`, `recent_online_categories`, `ingredient_carryover_obligations`, and the generation protocol. `ingredient_carryover_obligations` is derived from previous three-day reuse plans where required ingredients may have been bought and are still inside the reuse window; agent results must cover each item in `ingredient_carryover_decisions` as `use`, `skip`, or `discard`. Online shopping advice only describes specs, ingredient filters, and search keywords; it does not perform external lookups or claim real product prices or inventory.
 
@@ -127,9 +141,9 @@ Migration only copies data and never deletes source files; the database uses the
 ### Current Real Boundaries
 
 - The Web UI listens on loopback only by default; `--allow-remote` does not add authentication or TLS and should not be exposed to the public internet.
-- Uploads only create pending work; there is no automatic background photo recognition or meal-plan generation.
+- Uploads only create pending work; there is no automatic background photo recognition or meal-plan generation. Optional API key generation runs only when manually triggered.
 - There are currently no user accounts, cloud sync, mobile clients, package OCR, or external nutrition databases.
-- If you use a cloud agent, exported context and images may be sent to that model provider; decide based on its data policy.
+- If you use a cloud agent or optional API key generation, exported context and images may be sent to that model provider; decide based on its data policy.
 - MealCircuit provides general-purpose logging and decision support, not medical diagnosis or treatment advice.
 
 ## Development & Verification
@@ -160,7 +174,7 @@ tools/         pre-release privacy and boundary checks
 MealCircuit 是一个**本地优先、Agent-in-the-loop** 的长期饮食反馈工作台。它把餐食照片、原材料、每日状态问答、食品营养库和用户更正串成一条可追溯的反馈回路，再结合近 14 天趋势、长期记忆与个人总纲，生成结构化判断和下一日菜单。
 
 > [!IMPORTANT]
-> MealCircuit 自身不调用外部模型 API，也不要求 API Key。它负责保存事实、组装上下文和校验结果；Codex、Claude Code 或其他 Agent 负责在用户发起任务后完成分析。
+> MealCircuit 默认不要求 API Key。它负责保存事实、组装上下文和校验结果；Codex、Claude Code 或其他 Agent 仍可负责分析。你也可以选择在环境变量中配置自己的 OpenAI、Anthropic 或 DeepSeek API Key，并手动触发内置生成来处理待办。
 
 ## 不只是卡路里记录
 
@@ -225,16 +239,30 @@ python -m mealcircuit.agent_cli context <任务ID> --output context.json
 python -m mealcircuit.agent_cli schema photo
 python -m mealcircuit.agent_cli complete <任务ID> --file result.json
 
+# 可选：使用已配置的 API Key 生成并完成任务
+python -m mealcircuit.agent_cli generate <任务ID>
+
 # 2b. 处理每日复盘
 python -m mealcircuit.agent_cli day-context 2026-01-01 --output context.json
 python -m mealcircuit.agent_cli schema daily
 python -m mealcircuit.agent_cli day-complete 2026-01-01 --file result.json
+
+# 可选：使用已配置的 API Key 生成并提交复盘
+python -m mealcircuit.agent_cli day-generate 2026-01-01
 
 # 3. 追加用户确认的更正，不覆盖原始结果
 python -m mealcircuit.agent_cli correct <任务ID> --text "用户确认的更正"
 ```
 
 Agent 应严格遵循上下文中的 `doctrine.content` 与 `result_schema`。每日复盘还必须读取 `target_checkin`、`checkin_coverage` 和 `recent_checkins`；草稿不会被导出，跳过与缺失保持未知。照片分析使用营养区间；无法判断的区间为 `null`，不可见信息进入 `unknowns`。
+
+### 可选 API Key 生成
+
+内置生成是手动、可选能力。设置 `MEALCIRCUIT_AI_PROVIDER=openai|anthropic|deepseek`，用 `MEALCIRCUIT_AI_MODEL` 明确填写你愿意付费使用的模型名，并提供 `MEALCIRCUIT_OPENAI_API_KEY`、`MEALCIRCUIT_ANTHROPIC_API_KEY` 或 `MEALCIRCUIT_DEEPSEEK_API_KEY`。MealCircuit 只从当前进程环境变量读取这些值，不写入 SQLite，也不进入浏览器页面。可选参数包括 `MEALCIRCUIT_AI_TIMEOUT_SECONDS` 和 `MEALCIRCUIT_AI_MAX_OUTPUT_TOKENS`。
+
+DeepSeek 走其 OpenAI-compatible Chat API。按当前官方 DeepSeek API 文档，MealCircuit 只用 DeepSeek 处理文本型原材料和每日复盘生成；照片任务仍需要选择有明确图片输入能力的 provider。
+
+当你在 Web UI 点击“用 API Key 生成”或运行 `generate` / `day-generate` 时，MealCircuit 会把组装好的上下文发送给所选模型供应商；照片任务还会发送上传图片。模型返回的 JSON 仍必须通过本地结构校验和业务规则后才会保存。
 
 独居模式还会在 `day-context` 中提供 `home_cooking_preferences`、`recent_home_dinners`、`recent_online_categories`、`ingredient_carryover_obligations` 和生成协议。`ingredient_carryover_obligations` 来自上一轮三日复用计划中可能已买且仍在复用窗口内的食材；Agent 必须在结果中用 `ingredient_carryover_decisions` 逐项说明使用、跳过或丢弃。网购建议只描述规格、配料筛选标准与搜索关键词，不执行外部查询，也不声称具体商品的价格或库存。
 
@@ -267,9 +295,9 @@ python -m mealcircuit.agent_cli migrate-data --from-repo <旧工程路径> --app
 ### 当前真实边界
 
 - Web UI 默认只监听回环地址；`--allow-remote` 不会增加认证或 TLS，不建议暴露到公网。
-- 上传只创建待办，不会在后台自动识别照片或生成菜单。
+- 上传只创建待办，不会在后台自动识别照片或生成菜单。可选 API Key 生成只会在你手动触发时运行。
 - 当前没有用户账户、云同步、移动端、包装 OCR 或外部营养数据库。
-- 使用云端 Agent 时，上下文与图片可能发送给对应模型服务商，请按其数据政策判断。
+- 使用云端 Agent 或可选 API Key 生成时，上下文与图片可能发送给对应模型服务商，请按其数据政策判断。
 - MealCircuit 提供一般性记录与决策支持，不构成医疗诊断或治疗建议。
 
 ## 开发与验证
