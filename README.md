@@ -68,7 +68,7 @@ All analysis results must pass JSON Schema-level structural validation before th
 | **Food Nutrition Library** | Manage brand labels, default portions, priorities, usage conditions, and version history |
 | **Records & Memory** | Store daily eating, long-term trends, current adjustments, and daily-review history |
 
-The daily menu always covers breakfast, lunch, dinner, a conditional snack, training-day adjustments, and gut-symptom adjustments. When `home_cooking` is enabled in private settings, breakfast becomes low-friction assembly, lunch adapts to cafeteria or eating out, and dinner becomes a beginner-friendly single-serving execution card, together with a shopping list, online filtering keywords, and a three-day ingredient reuse direction. The system reads the last 14 completed dinners and rotates dishes and flavor profiles by default; if repetition is necessary because of recovery, expiring ingredients, or shopping constraints, the reason must be stated explicitly. High-priority foods still require an item-by-item `use` or `skip` decision instead of being mechanically forced into the menu.
+The daily menu always covers breakfast, lunch, dinner, a conditional snack, training-day adjustments, and gut-symptom adjustments. When `home_cooking` is enabled in private settings, breakfast becomes low-friction assembly, lunch adapts to cafeteria or eating out, and dinner becomes a beginner-friendly single-serving execution card, together with a shopping list, online filtering keywords, and a three-day ingredient reuse direction. The system reads the last 14 completed dinners plus likely carryover ingredients from previous reuse plans, and rotates dishes and flavor profiles by default; if repetition is necessary because of recovery, expiring ingredients, or shopping constraints, the reason must be stated explicitly. High-priority foods still require an item-by-item `use` or `skip` decision instead of being mechanically forced into the menu.
 
 “Today Status” shows five daily modules by default. You answer one question at a time, and single-question drafts are preserved automatically; only after a full module is completed do its answers enter the agent context and re-queue the daily review. Modules can be hidden, reordered, or switched to on-demand recording in “Adjust Modules”. An explicit skip only means the user did not provide the information; the system does not infer “no training” or “no symptoms” from that.
 
@@ -96,7 +96,7 @@ python -m mealcircuit.agent_cli correct <TASK_ID> --text "User-confirmed correct
 
 Agents should strictly follow `doctrine.content` and `result_schema` in the exported context. Daily reviews must also read `target_checkin`, `checkin_coverage`, and `recent_checkins`; drafts are not exported, and skips or missing answers remain unknown. Photo analysis uses nutrition ranges; any range that cannot be judged is `null`, and invisible details go into `unknowns`.
 
-In solo-cooking mode, `day-context` also includes `home_cooking_preferences`, `recent_home_dinners`, `recent_online_categories`, and the generation protocol. Online shopping advice only describes specs, ingredient filters, and search keywords; it does not perform external lookups or claim real product prices or inventory.
+In solo-cooking mode, `day-context` also includes `home_cooking_preferences`, `recent_home_dinners`, `recent_online_categories`, `ingredient_carryover_obligations`, and the generation protocol. `ingredient_carryover_obligations` is derived from previous three-day reuse plans where required ingredients may have been bought and are still inside the reuse window; agent results must cover each item in `ingredient_carryover_decisions` as `use`, `skip`, or `discard`. Online shopping advice only describes specs, ingredient filters, and search keywords; it does not perform external lookups or claim real product prices or inventory.
 
 ## Data & Boundaries
 
@@ -208,7 +208,7 @@ flowchart LR
 | **食品营养库** | 管理品牌标签、默认份量、优先级、使用条件及历史版本 |
 | **记录与记忆** | 保存每日饮食、长期趋势、当前调整和复盘版本历史 |
 
-每日菜单固定覆盖早餐、午餐、晚餐、条件加餐、训练日调整和肠胃异常调整。启用私人设置中的 `home_cooking` 后，早餐转为低摩擦组装、午餐适配食堂或外食、晚餐提供一人份新手执行卡，并同时给出采购清单、网购筛选关键词和三日食材复用方向。系统读取近 14 天已完成晚餐，默认轮换菜式和主风味；确因恢复、临期食材或采购限制重复时必须说明原因。高优先级食品仍须逐项给出 `use` 或 `skip`，不会因为“优先”二字机械塞进菜单。
+每日菜单固定覆盖早餐、午餐、晚餐、条件加餐、训练日调整和肠胃异常调整。启用私人设置中的 `home_cooking` 后，早餐转为低摩擦组装、午餐适配食堂或外食、晚餐提供一人份新手执行卡，并同时给出采购清单、网购筛选关键词和三日食材复用方向。系统读取近 14 天已完成晚餐和上一轮可能剩余食材，默认轮换菜式和主风味；确因恢复、临期食材或采购限制重复时必须说明原因。高优先级食品仍须逐项给出 `use` 或 `skip`，不会因为“优先”二字机械塞进菜单。
 
 “今日状态”默认显示五个每日模块。每次只回答一个问题，单题草稿会自动保留；完成整个模块后，答案才会进入 Agent 上下文并重新排队当日复盘。模块可以在“调整模块”中隐藏、排序或改为按需记录。明确跳过只表示用户不提供，系统不会据此推断“未训练”或“没有症状”。
 
@@ -236,7 +236,7 @@ python -m mealcircuit.agent_cli correct <任务ID> --text "用户确认的更正
 
 Agent 应严格遵循上下文中的 `doctrine.content` 与 `result_schema`。每日复盘还必须读取 `target_checkin`、`checkin_coverage` 和 `recent_checkins`；草稿不会被导出，跳过与缺失保持未知。照片分析使用营养区间；无法判断的区间为 `null`，不可见信息进入 `unknowns`。
 
-独居模式还会在 `day-context` 中提供 `home_cooking_preferences`、`recent_home_dinners`、`recent_online_categories` 和生成协议。网购建议只描述规格、配料筛选标准与搜索关键词，不执行外部查询，也不声称具体商品的价格或库存。
+独居模式还会在 `day-context` 中提供 `home_cooking_preferences`、`recent_home_dinners`、`recent_online_categories`、`ingredient_carryover_obligations` 和生成协议。`ingredient_carryover_obligations` 来自上一轮三日复用计划中可能已买且仍在复用窗口内的食材；Agent 必须在结果中用 `ingredient_carryover_decisions` 逐项说明使用、跳过或丢弃。网购建议只描述规格、配料筛选标准与搜索关键词，不执行外部查询，也不声称具体商品的价格或库存。
 
 ## 数据与边界
 
