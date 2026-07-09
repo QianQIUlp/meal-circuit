@@ -853,8 +853,18 @@ class WebAppTest(unittest.TestCase):
         finally:
             conn.close()
 
+    def rejected_post(self, path, body=None, headers=None):
+        transient = (ConnectionAbortedError, ConnectionResetError, http.client.RemoteDisconnected)
+        for attempt in range(3):
+            try:
+                return self.request("POST", path, body, headers)
+            except transient:
+                if attempt == 2:
+                    raise
+        raise AssertionError("unreachable")
+
     def test_pages_and_material_form(self):
-        for path in ("/", "/daily", "/history", "/tasks/photo", "/tasks/material", "/foods", "/overview"):
+        for path in ("/", "/daily", "/history", "/tasks/photo", "/tasks/material", "/tasks", "/ai", "/foods", "/overview"):
             status, _, body = self.request("GET", path)
             self.assertEqual(status, 200)
             self.assertIn(b"MealCircuit", body)
@@ -1019,6 +1029,44 @@ class WebAppTest(unittest.TestCase):
             self.assertEqual(service.get_task(failing["id"])["status"], "pending")
         finally:
             service.generate_task_result = original
+
+    def test_runtime_ai_key_mode_form_sets_and_clears_process_environment(self):
+        status, _, page = self.request("GET", "/ai")
+        decoded = page.decode("utf-8")
+        self.assertEqual(status, 200)
+        self.assertIn("API Key 接入", decoded)
+        self.assertIn("启用本次运行的 API Key 模式", decoded)
+        self.assertNotIn("secret-runtime-key", decoded)
+
+        form = urllib.parse.urlencode({
+            "provider": "deepseek",
+            "model": "deepseek-v4-flash",
+            "api_key": "secret-runtime-key",
+            "timeout_seconds": "33",
+            "max_output_tokens": "444",
+        }).encode()
+        status, headers, _ = self.request(
+            "POST", "/ai/configure", form,
+            {"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        self.assertEqual(status, 303)
+        self.assertEqual(headers["Location"], "/ai")
+        self.assertEqual(os.environ["MEALCIRCUIT_AI_PROVIDER"], "deepseek")
+        self.assertEqual(os.environ["MEALCIRCUIT_AI_MODEL"], "deepseek-v4-flash")
+        self.assertEqual(os.environ["MEALCIRCUIT_DEEPSEEK_API_KEY"], "secret-runtime-key")
+
+        status, _, configured = self.request("GET", "/ai")
+        decoded_configured = configured.decode("utf-8")
+        self.assertEqual(status, 200)
+        self.assertIn("已启用", decoded_configured)
+        self.assertIn("MEALCIRCUIT_DEEPSEEK_API_KEY 已设置", decoded_configured)
+        self.assertNotIn("secret-runtime-key", decoded_configured)
+
+        status, headers, _ = self.request("POST", "/ai/disable", b"", {"Content-Length": "0"})
+        self.assertEqual(status, 303)
+        self.assertEqual(headers["Location"], "/ai")
+        self.assertNotIn("MEALCIRCUIT_AI_PROVIDER", os.environ)
+        self.assertNotIn("MEALCIRCUIT_DEEPSEEK_API_KEY", os.environ)
 
     def test_daily_review_web_display_and_record_redirect(self):
         review_date = date.today().isoformat()
@@ -1241,7 +1289,9 @@ class WebAppTest(unittest.TestCase):
         with redirect_stderr(output):
             for extra in cases:
                 headers = {"Content-Type": "application/x-www-form-urlencoded", **extra}
-                status, _, response = self.request("POST", f"/check-ins/{date.today().isoformat()}/weight/skip", body, headers)
+                status, _, response = self.rejected_post(
+                    f"/check-ins/{date.today().isoformat()}/weight/skip", body, headers
+                )
                 self.assertEqual(status, 400)
                 self.assertTrue(
                     "拒绝跨来源写入请求" in response.decode("utf-8")
