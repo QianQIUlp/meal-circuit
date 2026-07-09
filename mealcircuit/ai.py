@@ -13,7 +13,7 @@ from typing import Any, Callable
 from .validation import ValidationError
 
 
-SUPPORTED_PROVIDERS = {"openai", "anthropic"}
+SUPPORTED_PROVIDERS = {"openai", "anthropic", "deepseek"}
 DEFAULT_TIMEOUT_SECONDS = 120
 DEFAULT_MAX_OUTPUT_TOKENS = 8192
 
@@ -57,9 +57,9 @@ def ai_status() -> dict:
 def load_config() -> AIConfig:
     provider = (os.environ.get("MEALCIRCUIT_AI_PROVIDER") or "").strip().lower()
     if not provider:
-        raise ValidationError("缺少 MEALCIRCUIT_AI_PROVIDER；可选 openai 或 anthropic")
+        raise ValidationError("缺少 MEALCIRCUIT_AI_PROVIDER；可选 openai、anthropic 或 deepseek")
     if provider not in SUPPORTED_PROVIDERS:
-        raise ValidationError("MEALCIRCUIT_AI_PROVIDER 只能是 openai 或 anthropic")
+        raise ValidationError("MEALCIRCUIT_AI_PROVIDER 只能是 openai、anthropic 或 deepseek")
     model = (os.environ.get("MEALCIRCUIT_AI_MODEL") or "").strip()
     if not model:
         raise ValidationError("缺少 MEALCIRCUIT_AI_MODEL；请明确填写要使用的模型名")
@@ -82,6 +82,8 @@ def provider_from_environment() -> "AIProvider":
         return OpenAIProvider(config)
     if config.provider == "anthropic":
         return AnthropicProvider(config)
+    if config.provider == "deepseek":
+        return DeepSeekProvider(config)
     raise ValidationError("未知模型供应商")
 
 
@@ -198,6 +200,41 @@ class AnthropicProvider(AIProvider):
                 "input_schema": request.json_schema,
             }],
             "tool_choice": {"type": "tool", "name": "submit_mealcircuit_result"},
+        }
+
+
+class DeepSeekProvider(AIProvider):
+    url = "https://api.deepseek.com/chat/completions"
+
+    def __init__(self, config: AIConfig, transport: Transport | None = None):
+        self.config = config
+        self.transport = transport or _post_json
+
+    def generate(self, request: GenerationRequest) -> dict:
+        if request.image_path:
+            raise ValidationError("DeepSeek 官方 API 当前未提供 MealCircuit 照片任务所需的图片输入；请改用支持视觉输入的 provider")
+        response = self.transport(
+            self.url,
+            {
+                "Authorization": f"Bearer {self.config.api_key}",
+                "Content-Type": "application/json",
+            },
+            self.build_payload(request),
+            self.config.timeout_seconds,
+        )
+        return _parse_json_text(_chat_completion_text(response))
+
+    def build_payload(self, request: GenerationRequest) -> dict:
+        return {
+            "model": self.config.model,
+            "messages": [
+                {"role": "system", "content": _system_prompt(request.kind)},
+                {"role": "user", "content": _user_prompt(request)},
+            ],
+            "response_format": {"type": "json_object"},
+            "max_tokens": self.config.max_output_tokens,
+            "stream": False,
+            "thinking": {"type": "disabled"},
         }
 
 
@@ -444,6 +481,19 @@ def _openai_text(response: dict) -> str:
     raise ValidationError("模型 API 返回中没有可解析的文本结果")
 
 
+def _chat_completion_text(response: dict) -> str:
+    choices = response.get("choices")
+    if not isinstance(choices, list) or not choices:
+        raise ValidationError("模型 API 返回中没有 choices")
+    first = choices[0]
+    if not isinstance(first, dict):
+        raise ValidationError("模型 API 返回 choices 格式无效")
+    message = first.get("message")
+    if not isinstance(message, dict) or not isinstance(message.get("content"), str):
+        raise ValidationError("模型 API 返回中没有 message.content")
+    return message["content"]
+
+
 def _anthropic_tool_input(response: dict) -> dict:
     for item in response.get("content") or []:
         if (
@@ -502,7 +552,11 @@ def _string_array(min_items: int = 0, max_items: int | None = None) -> dict:
 
 
 def _key_name(provider: str) -> str:
-    return "MEALCIRCUIT_OPENAI_API_KEY" if provider == "openai" else "MEALCIRCUIT_ANTHROPIC_API_KEY"
+    if provider == "openai":
+        return "MEALCIRCUIT_OPENAI_API_KEY"
+    if provider == "anthropic":
+        return "MEALCIRCUIT_ANTHROPIC_API_KEY"
+    return "MEALCIRCUIT_DEEPSEEK_API_KEY"
 
 
 def _int_environment(name: str, default: int) -> int:

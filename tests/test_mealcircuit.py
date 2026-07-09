@@ -54,7 +54,7 @@ def configure_private_home(path: Path) -> dict[str, str | None]:
     old = {key: os.environ.get(key) for key in (
         "MEALCIRCUIT_HOME", "MEALCIRCUIT_DB", "MEALCIRCUIT_AI_PROVIDER",
         "MEALCIRCUIT_AI_MODEL", "MEALCIRCUIT_OPENAI_API_KEY",
-        "MEALCIRCUIT_ANTHROPIC_API_KEY", "MEALCIRCUIT_AI_TIMEOUT_SECONDS",
+        "MEALCIRCUIT_ANTHROPIC_API_KEY", "MEALCIRCUIT_DEEPSEEK_API_KEY", "MEALCIRCUIT_AI_TIMEOUT_SECONDS",
         "MEALCIRCUIT_AI_MAX_OUTPUT_TOKENS",
     )}
     os.environ["MEALCIRCUIT_HOME"] = str(path)
@@ -330,7 +330,7 @@ class MealCircuitTest(unittest.TestCase):
         env = os.environ.copy()
         for key in (
             "MEALCIRCUIT_AI_PROVIDER", "MEALCIRCUIT_AI_MODEL",
-            "MEALCIRCUIT_OPENAI_API_KEY", "MEALCIRCUIT_ANTHROPIC_API_KEY",
+            "MEALCIRCUIT_OPENAI_API_KEY", "MEALCIRCUIT_ANTHROPIC_API_KEY", "MEALCIRCUIT_DEEPSEEK_API_KEY",
         ):
             env.pop(key, None)
         env["PYTHONUTF8"] = "1"
@@ -396,6 +396,33 @@ class MealCircuitTest(unittest.TestCase):
         self.assertEqual(completed["status"], "completed")
         self.assertEqual(payloads[0]["tool_choice"], {"type": "tool", "name": "submit_mealcircuit_result"})
         self.assertEqual(payloads[0]["tools"][0]["input_schema"]["type"], "object")
+
+    def test_deepseek_generate_material_uses_chat_json_mode_and_rejects_photo(self):
+        task = service.create_material_task("鸡蛋 2 个")
+        valid = {
+            "summary": "可分一餐使用", "combinations": ["鸡蛋配主食和蔬菜"],
+            "batch_nutrition": nutrition(), "per_serving_nutrition": nutrition(),
+            "gaps": ["蔬菜未知"], "risks": ["数量粗略"], "minimal_adjustments": ["补一份蔬菜"],
+        }
+        payloads = []
+
+        def transport(url, headers, payload, timeout):
+            payloads.append(payload)
+            return {"choices": [{"message": {"content": json.dumps(valid, ensure_ascii=False)}}]}
+
+        provider = ai.DeepSeekProvider(
+            ai.AIConfig("deepseek", "deepseek-v4-flash", "test-key"),
+            transport=transport,
+        )
+        completed = service.generate_task_result(task["id"], provider)
+        self.assertEqual(completed["status"], "completed")
+        self.assertEqual(payloads[0]["response_format"], {"type": "json_object"})
+        self.assertEqual(payloads[0]["thinking"], {"type": "disabled"})
+
+        photo = service.create_photo_task(io.BytesIO(b"GIF89a" + b"photo"))
+        with self.assertRaisesRegex(ValidationError, "图片输入"):
+            service.generate_task_result(photo["id"], provider)
+        self.assertEqual(service.get_task(photo["id"])["status"], "pending")
 
     def test_generate_does_not_complete_when_model_json_is_invalid(self):
         task = service.create_material_task("鸡蛋 2 个")
