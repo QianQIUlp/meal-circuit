@@ -15,7 +15,7 @@ from contextlib import redirect_stderr
 from datetime import date, timedelta
 from pathlib import Path
 
-from mealcircuit import checkins, service
+from mealcircuit import ai, checkins, service
 from mealcircuit import storage
 from mealcircuit.configuration import configuration_status, initialize_private_home
 from mealcircuit.db import init_db
@@ -51,9 +51,17 @@ HOME_COOKING = {
 
 
 def configure_private_home(path: Path) -> dict[str, str | None]:
-    old = {key: os.environ.get(key) for key in ("MEALCIRCUIT_HOME", "MEALCIRCUIT_DB")}
+    old = {key: os.environ.get(key) for key in (
+        "MEALCIRCUIT_HOME", "MEALCIRCUIT_DB", "MEALCIRCUIT_AI_PROVIDER",
+        "MEALCIRCUIT_AI_MODEL", "MEALCIRCUIT_OPENAI_API_KEY",
+        "MEALCIRCUIT_ANTHROPIC_API_KEY", "MEALCIRCUIT_AI_TIMEOUT_SECONDS",
+        "MEALCIRCUIT_AI_MAX_OUTPUT_TOKENS",
+    )}
     os.environ["MEALCIRCUIT_HOME"] = str(path)
     os.environ["MEALCIRCUIT_DB"] = str(path / "mealcircuit.db")
+    for key in old:
+        if key not in {"MEALCIRCUIT_HOME", "MEALCIRCUIT_DB"}:
+            os.environ.pop(key, None)
     path.mkdir(parents=True, exist_ok=True)
     (path / "settings.json").write_text(json.dumps(TEST_SETTINGS, ensure_ascii=False), encoding="utf-8")
     (path / "doctrine.private.md").write_text("# 系统最高目标\n\n测试私人总纲。\n", encoding="utf-8")
@@ -316,6 +324,89 @@ class MealCircuitTest(unittest.TestCase):
         invalid = {"summary": "x", "candidates": [{"name": "x", "portion_range": "x", "nutrition": nutrition(), "confidence": 1.2}], "unknowns": [], "advice": []}
         with self.assertRaises(ValidationError):
             service.complete_task(task["id"], invalid)
+
+    def test_generate_requires_user_api_environment_and_preserves_pending(self):
+        task = service.create_material_task("鸡蛋 2 个")
+        env = os.environ.copy()
+        for key in (
+            "MEALCIRCUIT_AI_PROVIDER", "MEALCIRCUIT_AI_MODEL",
+            "MEALCIRCUIT_OPENAI_API_KEY", "MEALCIRCUIT_ANTHROPIC_API_KEY",
+        ):
+            env.pop(key, None)
+        env["PYTHONUTF8"] = "1"
+        completed = subprocess.run(
+            [sys.executable, "-m", "mealcircuit.agent_cli", "generate", task["id"]],
+            cwd=Path(__file__).resolve().parent.parent,
+            env=env,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        self.assertEqual(completed.returncode, 2)
+        self.assertIn("MEALCIRCUIT_AI_PROVIDER", completed.stderr)
+        self.assertEqual(service.get_task(task["id"])["status"], "pending")
+
+    def test_openai_generate_photo_uses_image_payload_and_validates_result(self):
+        task = service.create_photo_task(io.BytesIO(b"\x89PNG\r\n\x1a\n" + b"ai-photo"), "午餐")
+        valid = {
+            "summary": "照片可见米饭和肉类",
+            "candidates": [{"name": "米饭配肉", "portion_range": "一盘", "nutrition": nutrition(), "confidence": 0.8}],
+            "unknowns": ["用油不可见"],
+            "advice": ["按区间记录"],
+        }
+        payloads = []
+
+        def transport(url, headers, payload, timeout):
+            payloads.append(payload)
+            return {"output": [{"content": [{"text": json.dumps(valid, ensure_ascii=False)}]}]}
+
+        provider = ai.OpenAIProvider(
+            ai.AIConfig("openai", "test-openai-model", "test-key"),
+            transport=transport,
+        )
+        completed = service.generate_task_result(task["id"], provider)
+        self.assertEqual(completed["status"], "completed")
+        content = payloads[0]["input"][0]["content"]
+        self.assertEqual(content[0]["type"], "input_image")
+        self.assertTrue(content[0]["image_url"].startswith("data:image/png;base64,"))
+        self.assertEqual(payloads[0]["text"]["format"]["type"], "json_schema")
+
+    def test_anthropic_generate_daily_uses_forced_tool_result(self):
+        today = date.today().isoformat()
+        service.add_daily_record(today, "今天记录待复盘")
+        valid = daily_review_result(today)
+        payloads = []
+
+        def transport(url, headers, payload, timeout):
+            payloads.append(payload)
+            return {
+                "content": [{
+                    "type": "tool_use",
+                    "name": "submit_mealcircuit_result",
+                    "input": valid,
+                }]
+            }
+
+        provider = ai.AnthropicProvider(
+            ai.AIConfig("anthropic", "test-claude-model", "test-key"),
+            transport=transport,
+        )
+        completed = service.generate_daily_review(today, provider)
+        self.assertEqual(completed["status"], "completed")
+        self.assertEqual(payloads[0]["tool_choice"], {"type": "tool", "name": "submit_mealcircuit_result"})
+        self.assertEqual(payloads[0]["tools"][0]["input_schema"]["type"], "object")
+
+    def test_generate_does_not_complete_when_model_json_is_invalid(self):
+        task = service.create_material_task("鸡蛋 2 个")
+
+        class InvalidClient:
+            def generate(self, request):
+                return {"summary": "缺字段"}
+
+        with self.assertRaises(ValidationError):
+            service.generate_task_result(task["id"], InvalidClient())
+        self.assertEqual(service.get_task(task["id"])["status"], "pending")
 
     def test_daily_review_queue_context_complete_and_reopen_history(self):
         today = date.today().isoformat()
@@ -825,6 +916,8 @@ class WebAppTest(unittest.TestCase):
         decoded_pending = pending.decode("utf-8")
         self.assertEqual(status, 200)
         self.assertIn(f'action="/tasks/{task["id"]}/input"', decoded_pending)
+        self.assertIn(f'action="/tasks/{task["id"]}/generate"', decoded_pending)
+        self.assertIn("用 API Key 生成", decoded_pending)
         self.assertIn('name="expected_version" value="1"', decoded_pending)
         self.assertIn('maxlength="10000"', decoded_pending)
         self.assertIn("鸡蛋 2 个</textarea>", decoded_pending)
@@ -865,6 +958,41 @@ class WebAppTest(unittest.TestCase):
         self.assertEqual(status, 400)
         self.assertIn("只能修改待处理任务", response.decode("utf-8"))
 
+    def test_web_task_generate_success_and_failure(self):
+        task = service.create_material_task("鸡蛋 2 个")
+        result = {
+            "summary": "可分两份", "combinations": ["鸡蛋配主食与蔬菜"],
+            "batch_nutrition": nutrition(), "per_serving_nutrition": nutrition(),
+            "gaps": ["蔬菜未知"], "risks": ["数量粗略"], "minimal_adjustments": ["补充蔬菜"],
+        }
+        original = service.generate_task_result
+
+        def fake_success(task_id):
+            return service.complete_task(task_id, result)
+
+        service.generate_task_result = fake_success
+        try:
+            status, headers, _ = self.request("POST", f'/tasks/{task["id"]}/generate', b"", {"Content-Length": "0"})
+            self.assertEqual(status, 303)
+            self.assertEqual(headers["Location"], f'/tasks/{task["id"]}')
+            self.assertEqual(service.get_task(task["id"])["status"], "completed")
+        finally:
+            service.generate_task_result = original
+
+        failing = service.create_material_task("牛奶 1 盒")
+
+        def fake_failure(task_id):
+            raise ValidationError("缺少 MEALCIRCUIT_AI_MODEL")
+
+        service.generate_task_result = fake_failure
+        try:
+            status, _, body = self.request("POST", f'/tasks/{failing["id"]}/generate', b"", {"Content-Length": "0"})
+            self.assertEqual(status, 400)
+            self.assertIn("缺少 MEALCIRCUIT_AI_MODEL", body.decode("utf-8"))
+            self.assertEqual(service.get_task(failing["id"])["status"], "pending")
+        finally:
+            service.generate_task_result = original
+
     def test_daily_review_web_display_and_record_redirect(self):
         review_date = date.today().isoformat()
         priority_food = service.create_food({
@@ -883,7 +1011,10 @@ class WebAppTest(unittest.TestCase):
         self.assertIn("等待 Agent 生成核心建议和次日菜单", pending_body.decode("utf-8"))
         daily_pending_status, _, daily_pending = self.request("GET", "/daily")
         self.assertEqual(daily_pending_status, 200)
-        self.assertIn("等待 Agent 生成核心建议和明日菜单", daily_pending.decode("utf-8"))
+        decoded_daily_pending = daily_pending.decode("utf-8")
+        self.assertIn("等待 Agent 生成核心建议和明日菜单", decoded_daily_pending)
+        self.assertIn(f'action="/reviews/{review_date}/generate"', decoded_daily_pending)
+        self.assertIn("用 API Key 生成今日建议", decoded_daily_pending)
         result = daily_review_result(review_date, unsafe=True)
         result["priority_food_decisions"] = [{"food_id": priority_food["id"], "decision": "use", "reason": "早餐主食优先"}]
         service.complete_daily_review(review_date, result)
@@ -912,6 +1043,38 @@ class WebAppTest(unittest.TestCase):
         self.assertIn("最近建议", decoded_overview)
         self.assertIn("review-card", decoded_overview)
         self.assertNotIn("今天蛋白很多", decoded_overview)
+
+    def test_web_daily_generate_success_and_failure(self):
+        review_date = date.today().isoformat()
+        service.add_daily_record(review_date, "今天蛋白很多")
+        original = service.generate_daily_review
+
+        def fake_success(date_text):
+            return service.complete_daily_review(date_text, daily_review_result(date_text))
+
+        service.generate_daily_review = fake_success
+        try:
+            status, headers, _ = self.request("POST", f"/reviews/{review_date}/generate", b"", {"Content-Length": "0"})
+            self.assertEqual(status, 303)
+            self.assertEqual(headers["Location"], f"/reviews/{review_date}")
+            self.assertEqual(service.get_daily_review(review_date)["status"], "completed")
+        finally:
+            service.generate_daily_review = original
+
+        next_date = (date.today() - timedelta(days=1)).isoformat()
+        service.add_daily_record(next_date, "昨天记录")
+
+        def fake_failure(date_text):
+            raise ValidationError("模型 API 请求失败")
+
+        service.generate_daily_review = fake_failure
+        try:
+            status, _, body = self.request("POST", f"/reviews/{next_date}/generate", b"", {"Content-Length": "0"})
+            self.assertEqual(status, 400)
+            self.assertIn("模型 API 请求失败", body.decode("utf-8"))
+            self.assertEqual(service.get_daily_review(next_date)["status"], "pending")
+        finally:
+            service.generate_daily_review = original
 
     def test_home_cooking_menu_web_display(self):
         settings_path = Path(self.temp.name) / "settings.json"

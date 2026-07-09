@@ -178,6 +178,14 @@ def configuration_status() -> dict:
         doctrine_mode = load_doctrine()["mode"]
     except (ValidationError, OSError):
         pass
+    try:
+        from .ai import ai_status
+
+        ai = ai_status()
+        ai_error = None
+    except ValidationError as exc:
+        ai = None
+        ai_error = str(exc)
     return {
         "home": str(app_home()),
         "database": str(db_path()),
@@ -185,4 +193,6 @@ def configuration_status() -> dict:
         "settings_valid": settings_ok,
         "settings_error": settings_error,
         "doctrine_mode": doctrine_mode,
+        "ai": ai,
+        "ai_error": ai_error,
     }
