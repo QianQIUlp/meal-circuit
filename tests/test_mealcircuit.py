@@ -15,7 +15,7 @@ from contextlib import redirect_stderr
 from datetime import date, timedelta
 from pathlib import Path
 
-from mealcircuit import ai, checkins, service
+from mealcircuit import ai, checkins, personalization, service
 from mealcircuit import storage
 from mealcircuit.configuration import configuration_status, initialize_private_home
 from mealcircuit.db import init_db
@@ -74,6 +74,53 @@ def restore_environment(old: dict[str, str | None]) -> None:
             os.environ.pop(key, None)
         else:
             os.environ[key] = value
+
+
+def complete_standard_test_onboarding() -> dict:
+    session = personalization.start_onboarding()
+    payloads = {
+        "welcome": {"privacy_ack": True},
+        "goals": {
+            "primary_goal": "eating_consistency",
+            "secondary_goals": [],
+            "motivation": "测试完整生成路径。",
+            "success_metrics": ["execution_rate"],
+        },
+        "baseline": {
+            "age_years": 30,
+            "height_cm": None,
+            "weight_kg": None,
+            "physiological_input": "unspecified",
+            "activity_level": "moderate",
+        },
+        "safety": {
+            "life_stage": "adult",
+            "therapeutic_diet": False,
+            "medication_affects_nutrition": False,
+            "eating_disorder_risk": False,
+            "rapid_unexplained_change": False,
+            "severe_persistent_symptoms": False,
+            "severe_allergy_management": False,
+        },
+        "training": {"types": [], "frequency_per_week": 0},
+        "constraints": {
+            "meal_environment": TEST_SETTINGS["meal_environment"],
+            "portion_method": TEST_SETTINGS["portion_method"],
+            "cooking_time_minutes": 25,
+            "equipment": [],
+            "food_exclusions": [],
+            "preferences": [],
+            "question_budget": 2,
+        },
+    }
+    current = session
+    for step, payload in payloads.items():
+        current = personalization.save_onboarding_step(current["id"], step, payload, current["version"])
+    return personalization.complete_onboarding(
+        current["id"],
+        current["version"],
+        {"accept_profile": True, "accept_strategy": True, "planning_mode": "portion_guided"},
+    )
 
 
 def nutrition(low=1, high=2):
@@ -187,6 +234,7 @@ class MealCircuitTest(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.old_environment = configure_private_home(Path(self.temp.name))
         init_db()
+        complete_standard_test_onboarding()
 
     def tearDown(self):
         restore_environment(self.old_environment)
@@ -832,6 +880,7 @@ class WebAppTest(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.old_environment = configure_private_home(Path(self.temp.name))
         init_db()
+        complete_standard_test_onboarding()
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()

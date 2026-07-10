@@ -75,6 +75,10 @@ def exports_root() -> Path:
     return app_home() / "exports"
 
 
+def backups_root() -> Path:
+    return app_home() / "backups"
+
+
 def resolve_data_path(value: str | Path) -> Path:
     path = Path(value)
     return path.resolve() if path.is_absolute() else (app_home() / path).resolve()

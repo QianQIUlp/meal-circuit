@@ -8,6 +8,9 @@ class ValidationError(ValueError):
     pass
 
 
+VALIDATOR_VERSION = "validator-v2"
+
+
 def _required_object(value: Any, name: str) -> dict:
     if not isinstance(value, dict):
         raise ValidationError(f"{name} 必须是对象")
@@ -46,7 +49,7 @@ def _validate_nutrition(value: Any, name: str) -> None:
         _validate_range(obj[field], f"{name}.{field}")
 
 
-def validate_result(task_type: str, value: Any) -> dict:
+def validate_result(task_type: str, value: Any, *, fact_only: bool = False) -> dict:
     obj = _required_object(value, "结果")
     _required_text(obj.get("summary"), "summary")
     if task_type == "photo":
@@ -62,14 +65,26 @@ def validate_result(task_type: str, value: Any) -> dict:
                 raise ValidationError(f"candidates[{i}].confidence 必须在 0 到 1 之间")
             _validate_nutrition(item.get("nutrition"), f"candidates[{i}].nutrition")
         _required_list(obj.get("unknowns"), "unknowns")
-        _required_list(obj.get("advice"), "advice")
+        if fact_only:
+            if "advice" in obj:
+                raise ValidationError("事实型照片结果不得包含 advice 字段")
+        else:
+            _required_list(obj.get("advice"), "advice")
     elif task_type == "material":
-        _required_list(obj.get("combinations"), "combinations")
+        if fact_only:
+            _required_list(obj.get("observed_items"), "observed_items")
+            _required_list(obj.get("unknowns"), "unknowns")
+            for forbidden in ("combinations", "minimal_adjustments"):
+                if forbidden in obj:
+                    raise ValidationError(f"事实型原材料结果不得包含 {forbidden} 字段")
+        else:
+            _required_list(obj.get("combinations"), "combinations")
         _validate_nutrition(obj.get("batch_nutrition"), "batch_nutrition")
         _validate_nutrition(obj.get("per_serving_nutrition"), "per_serving_nutrition")
         _required_list(obj.get("gaps"), "gaps")
         _required_list(obj.get("risks"), "risks")
-        _required_list(obj.get("minimal_adjustments"), "minimal_adjustments")
+        if not fact_only:
+            _required_list(obj.get("minimal_adjustments"), "minimal_adjustments")
     else:
         raise ValidationError(f"未知任务类型：{task_type}")
     return obj

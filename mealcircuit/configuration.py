@@ -118,6 +118,14 @@ def load_settings() -> dict:
     return validate_settings(value)
 
 
+def load_resolved_settings() -> dict:
+    """Overlay an explicitly confirmed strategy on legacy private settings."""
+    settings = load_settings()
+    from .personalization import resolved_settings
+
+    return resolved_settings(settings)
+
+
 def load_doctrine() -> dict:
     private_path = private_doctrine_path()
     if private_path.is_file():
@@ -186,6 +194,12 @@ def configuration_status() -> dict:
     except ValidationError as exc:
         ai = None
         ai_error = str(exc)
+    try:
+        from .personalization import onboarding_status
+
+        onboarding = onboarding_status()
+    except (ValidationError, OSError):
+        onboarding = {"status": "unavailable", "safety_mode": "setup_required"}
     return {
         "home": str(app_home()),
         "database": str(db_path()),
@@ -195,4 +209,5 @@ def configuration_status() -> dict:
         "doctrine_mode": doctrine_mode,
         "ai": ai,
         "ai_error": ai_error,
+        "onboarding": onboarding,
     }

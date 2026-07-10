@@ -10,10 +10,10 @@ from pathlib import Path
 from typing import BinaryIO
 
 from . import checkins
-from .configuration import load_doctrine, load_settings
+from .configuration import load_doctrine, load_resolved_settings, load_settings
 from .db import connect, init_db, row_dict
 from .storage import resolve_data_path, store_data_path, upload_root
-from .validation import ValidationError, validate_daily_review_result, validate_result
+from .validation import VALIDATOR_VERSION, ValidationError, validate_daily_review_result, validate_result
 
 MAX_UPLOAD_BYTES = 10 * 1024 * 1024
 IMAGE_SIGNATURES = {
@@ -31,6 +31,76 @@ def now() -> str:
 
 def new_id(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex[:12]}"
+
+
+def _client_identity(client=None) -> tuple[str | None, str | None]:
+    if client is not None:
+        config = getattr(client, "config", None)
+        return (
+            getattr(config, "provider", None) or client.__class__.__name__,
+            getattr(config, "model", None) or "injected-client",
+        )
+    from .ai import ai_status
+
+    status = ai_status()
+    return status.get("provider"), status.get("model")
+
+
+def _start_agent_run(kind: str, context: dict, client=None) -> str:
+    provider, model = _client_identity(client)
+    run_id = new_id("agent_run")
+    policy = context.get("generation_policy") or {}
+    source_manifest = dict(context.get("source_manifest") or {})
+    source_manifest["agent_run_id"] = run_id
+    with connect() as conn:
+        conn.execute(
+            """INSERT INTO agent_runs(
+                   id,kind,provider,model,context_hash,context_schema_version,result_schema_version,
+                   policy_version,validator_version,source_manifest_json,status,started_at
+               ) VALUES(?,?,?,?,?,?,?,?,?,?,'running',?)""",
+            (
+                run_id,
+                kind,
+                provider,
+                model,
+                context.get("context_hash") or "",
+                int(context.get("context_schema_version") or 1),
+                int(context.get("result_schema_version") or 1),
+                policy.get("policy_version") or "",
+                VALIDATOR_VERSION,
+                json.dumps(source_manifest, ensure_ascii=False, sort_keys=True),
+                now(),
+            ),
+        )
+    return run_id
+
+
+def _source_manifest_for_commit(context: dict, agent_run_id: str | None) -> dict:
+    manifest = dict(context.get("source_manifest") or {})
+    manifest["agent_run_id"] = agent_run_id
+    return manifest
+
+
+def _finish_agent_run(run_id: str, *, result: dict | None = None, error: Exception | None = None) -> None:
+    status = "failed" if error is not None else "completed"
+    error_summary = "" if error is None else f"{error.__class__.__name__}: {str(error)[:500]}"
+    result_hash = ""
+    attempts = []
+    if result is not None:
+        result_hash = hashlib.sha256(
+            json.dumps(result, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+        ).hexdigest()
+        attempts.append({"attempt": 1, "status": "valid"})
+    elif error is not None:
+        attempts.append({"attempt": 1, "status": "failed", "error": error_summary})
+    with connect() as conn:
+        updated = conn.execute(
+            """UPDATE agent_runs SET status=?,error_summary=?,validation_attempts_json=?,result_hash=?,completed_at=?
+               WHERE id=? AND status='running'""",
+            (status, error_summary, json.dumps(attempts, ensure_ascii=False), result_hash, now(), run_id),
+        )
+        if updated.rowcount != 1:
+            raise ValidationError("Agent 运行状态已变化")
 
 
 def _detect_image(data: bytes) -> str:
@@ -156,30 +226,69 @@ def update_task_input(task_id: str, text: str, expected_version: int) -> dict:
     return get_task(task_id)
 
 
-def complete_task(task_id: str, result: dict) -> dict:
+def complete_task(
+    task_id: str,
+    result: dict,
+    *,
+    provenance_context: dict | None = None,
+    agent_run_id: str | None = None,
+) -> dict:
     task = get_task(task_id)
     if task["status"] == "completed":
         raise ValidationError("任务已完成；不得覆盖原结果，请新增用户校正")
-    validate_result(task["type"], result)
+    from .personalization import require_generation
+
+    policy = require_generation(task["type"])
+    context = provenance_context or task_context(task_id)
+    validate_result(task["type"], result, fact_only=policy["fact_only"])
     with connect() as conn:
         updated = conn.execute(
             """UPDATE tasks SET status='completed', result_json=?, result_version=1,
-               completed_at=? WHERE id=? AND status='pending'""",
-            (json.dumps(result, ensure_ascii=False), now(), task_id),
+               schema_version=2,policy_version=?,validator_version=?,source_manifest_json=?,
+               context_hash=?,agent_run_id=?,completed_at=? WHERE id=? AND status='pending'""",
+            (
+                json.dumps(result, ensure_ascii=False),
+                policy["policy_version"],
+                VALIDATOR_VERSION,
+                json.dumps(_source_manifest_for_commit(context, agent_run_id), ensure_ascii=False, sort_keys=True),
+                context.get("context_hash") or "",
+                agent_run_id,
+                now(),
+                task_id,
+            ),
         )
         if updated.rowcount != 1:
             raise ValidationError("任务状态已变化，请重新读取")
+    from .adaptive import linked_dates
+
+    for observed_date in linked_dates(task_id):
+        queue_review_for_external_change(observed_date, "task_evidence_completed")
     return get_task(task_id)
 
 
 def generate_task_result(task_id: str, client=None) -> dict:
     from .ai import generate_json
+    from .personalization import require_generation
 
     task = get_task(task_id)
     if task["status"] == "completed":
         raise ValidationError("任务已完成；不得覆盖原结果，请新增用户校正")
-    result = generate_json(task_context(task_id), task["type"], client)
-    return complete_task(task_id, result)
+    require_generation(task["type"])
+    context = task_context(task_id)
+    run_id = _start_agent_run(task["type"], context, client)
+    try:
+        result = generate_json(context, task["type"], client)
+        completed = complete_task(
+            task_id,
+            result,
+            provenance_context=context,
+            agent_run_id=run_id,
+        )
+    except Exception as exc:
+        _finish_agent_run(run_id, error=exc)
+        raise
+    _finish_agent_run(run_id, result=result)
+    return completed
 
 
 def add_correction(task_id: str, correction: dict) -> dict:
@@ -195,6 +304,10 @@ def add_correction(task_id: str, correction: dict) -> dict:
             "INSERT INTO task_corrections(id,task_id,correction_json,created_at) VALUES(?,?,?,?)",
             (correction_id, task_id, json.dumps(payload, ensure_ascii=False), now()),
         )
+    from .adaptive import linked_dates
+
+    for observed_date in linked_dates(task_id):
+        queue_review_for_external_change(observed_date, "task_evidence_corrected")
     return get_task(task_id)
 
 
@@ -347,6 +460,20 @@ def _checkin_versions_for_date(conn, record_date: str) -> dict[str, int]:
     return {row["module_key"]: row["version"] for row in rows}
 
 
+def _evidence_link_ids_for_date(conn, record_date: str) -> list[str]:
+    return [row["id"] for row in conn.execute(
+        "SELECT id FROM task_evidence_links WHERE observed_date=? ORDER BY created_at,id", (record_date,)
+    ).fetchall()]
+
+
+def _has_daily_source(conn, record_date: str) -> bool:
+    return bool(
+        _record_ids_for_date(conn, record_date)
+        or _checkin_versions_for_date(conn, record_date)
+        or _evidence_link_ids_for_date(conn, record_date)
+    )
+
+
 def _queue_daily_review(conn, record_date: str, archive_reason: str = "new_daily_record") -> None:
     timestamp = now()
     source_ids = _record_ids_for_date(conn, record_date)
@@ -366,19 +493,40 @@ def _queue_daily_review(conn, record_date: str, archive_reason: str = "new_daily
         conn.execute(
             """INSERT INTO daily_review_history(
                 id,review_id,version,source_record_ids_json,source_checkin_versions_json,
-                result_json,completed_at,archived_at,archive_reason
-            ) VALUES(?,?,?,?,?,?,?,?,?)""",
+                result_json,completed_at,archived_at,archive_reason,schema_version,review_mode,
+                source_manifest_json,context_hash,agent_run_id,policy_version,validator_version
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 new_id("review_history"), review["id"], review["result_version"],
                 review["source_record_ids_json"], review["source_checkin_versions_json"],
                 review["result_json"], review["completed_at"], timestamp, archive_reason,
+                review["schema_version"], review["review_mode"], review["source_manifest_json"], review["context_hash"],
+                review["agent_run_id"], review["policy_version"], review["validator_version"],
             ),
         )
     conn.execute(
-        """UPDATE daily_reviews SET status='pending',source_record_ids_json=?,source_checkin_versions_json=?,result_json=NULL,
-           updated_at=?,completed_at=NULL WHERE review_date=?""",
+        """UPDATE daily_reviews SET status='pending',source_record_ids_json=?,source_checkin_versions_json=?,
+           result_json=NULL,source_manifest_json='{}',context_hash='',agent_run_id=NULL,
+           policy_version='',validator_version='',updated_at=?,completed_at=NULL
+           WHERE review_date=?""",
         (source_json, checkin_versions_json, timestamp, record_date),
     )
+
+
+def queue_review_for_external_change(record_date: str, reason: str) -> dict:
+    try:
+        date.fromisoformat(record_date)
+    except ValueError as exc:
+        raise ValidationError("日期必须是 YYYY-MM-DD") from exc
+    reason = reason.strip()
+    if not reason:
+        raise ValidationError("重新排队必须说明原因")
+    init_db()
+    with connect() as conn:
+        if not _has_daily_source(conn, record_date):
+            raise ValidationError("该日期没有可用记录、状态或任务证据")
+        _queue_daily_review(conn, record_date, reason)
+    return get_daily_review(record_date)
 
 
 def _validate_checkin_date(value: str) -> str:
@@ -639,8 +787,8 @@ def ensure_daily_review(review_date: str) -> dict:
         raise ValidationError("日期必须是 YYYY-MM-DD") from exc
     init_db()
     with connect() as conn:
-        if not _record_ids_for_date(conn, review_date) and not _checkin_versions_for_date(conn, review_date):
-            raise ValidationError("该日期没有每日记录或已发布状态")
+        if not _has_daily_source(conn, review_date):
+            raise ValidationError("该日期没有每日记录、已发布状态或任务证据")
         existing = conn.execute("SELECT id FROM daily_reviews WHERE review_date=?", (review_date,)).fetchone()
         if existing is None:
             _queue_daily_review(conn, review_date)
@@ -660,16 +808,20 @@ def requeue_daily_review(review_date: str, reason: str) -> dict:
         conn.execute(
             """INSERT INTO daily_review_history(
                 id,review_id,version,source_record_ids_json,source_checkin_versions_json,
-                result_json,completed_at,archived_at,archive_reason
-            ) VALUES(?,?,?,?,?,?,?,?,?)""",
+                result_json,completed_at,archived_at,archive_reason,schema_version,review_mode,
+                source_manifest_json,context_hash,agent_run_id,policy_version,validator_version
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 new_id("review_history"), current["id"], current["result_version"],
                 current["source_record_ids_json"], current["source_checkin_versions_json"],
                 current["result_json"], current["completed_at"], timestamp, reason,
+                current["schema_version"], current["review_mode"], current["source_manifest_json"], current["context_hash"],
+                current["agent_run_id"], current["policy_version"], current["validator_version"],
             ),
         )
         conn.execute(
-            """UPDATE daily_reviews SET status='pending',result_json=NULL,updated_at=?,completed_at=NULL
+            """UPDATE daily_reviews SET status='pending',result_json=NULL,source_manifest_json='{}',context_hash='',
+                   agent_run_id=NULL,policy_version='',validator_version='',updated_at=?,completed_at=NULL
                WHERE review_date=?""", (timestamp, review_date)
         )
     return get_daily_review(review_date)
@@ -700,7 +852,7 @@ def list_daily_reviews(status: str | None = None) -> list[dict]:
 
 
 def daily_review_schema(settings: dict | None = None) -> dict:
-    settings = settings or load_settings()
+    settings = settings or load_resolved_settings()
     schema = {
         "system_status": "stable|observe|adjust|risk",
         "facts": ["string"],
@@ -904,11 +1056,14 @@ def _recent_review_rows_for_carryover(review_date: str, days: int = 14) -> list:
 
 
 def daily_review_context(review_date: str, days: int = 14) -> dict:
+    from .personalization import require_generation
+
+    generation_policy = require_generation("daily")
     review = ensure_daily_review(review_date)
     end = date.fromisoformat(review_date)
     cutoff = (end - timedelta(days=days - 1)).isoformat()
     doctrine = load_doctrine()
-    settings = load_settings()
+    settings = load_resolved_settings()
     with connect() as conn:
         records = [row_dict(row) for row in conn.execute(
             """SELECT * FROM daily_records WHERE record_date BETWEEN ? AND ?
@@ -954,7 +1109,57 @@ def daily_review_context(review_date: str, days: int = 14) -> dict:
         }
         for item in target_state["modules"] if item["version"] > 0
     ]
-    return {
+    from . import adaptive
+    from .personalization import active_personalization
+
+    personalization = active_personalization()
+    evidence = [item for item in adaptive.meal_evidence(cutoff, review_date) if item["status"] == "completed"]
+    execution_feedback = adaptive.list_plan_feedback(cutoff, review_date)
+    adaptations = adaptive.active_adaptations(review_date)
+    inventory = adaptive.list_inventory()
+    experiment = adaptive.active_experiment()
+    source_manifest = {
+        "records": [item["id"] for item in records],
+        "memories": [{"id": item["id"], "updated_at": item["updated_at"]} for item in memories],
+        "adjustments": [{"id": item["id"], "updated_at": item["updated_at"]} for item in adjustments],
+        "priority_foods": [{"id": item["id"], "updated_at": item["updated_at"]} for item in list_priority_foods()],
+        "checkins": [{"date": item["checkin_date"], "module": item["module_key"], "version": item["version"]} for item in recent_checkins],
+        "meal_evidence": [{
+            "link_id": item["id"], "task_id": item["task_id"], "result_version": item["result_version"],
+            "correction_ids": [correction["id"] for correction in item["corrections"]],
+        } for item in evidence],
+        "profile": ({"id": personalization["profile"]["id"], "version": personalization["profile"]["version"]} if personalization.get("profile") else None),
+        "goals": [{"id": item["id"], "version": item["version"]} for item in personalization.get("goals") or []],
+        "strategy": ({"id": personalization["strategy"]["id"], "version": personalization["strategy"]["version"]} if personalization.get("strategy") else None),
+        "targets": [{
+            "id": item["id"], "key": item["target_key"], "version": item["version"],
+            "policy_version": item["policy_version"], "source_kind": item["source_kind"],
+        } for item in personalization.get("targets") or []],
+        "feedback": [{"id": item["id"], "version": item["version"]} for item in execution_feedback],
+        "rules": [{
+            "id": item["id"], "updated_at": item["updated_at"],
+            "scope_policy_version": item.get("scope_policy_version") or "",
+            "strategy_version_id": item.get("strategy_version_id"),
+        } for item in adaptations["confirmed_rules"]],
+        "inventory": [{"id": item["id"], "version": item["version"]} for item in inventory],
+        "experiment": ({
+            "id": experiment["id"], "updated_at": experiment["updated_at"],
+            "scope_policy_version": experiment.get("scope_policy_version") or "",
+        } if experiment else None),
+        "doctrine": {
+            "mode": doctrine["mode"],
+            "sha256": hashlib.sha256(doctrine["content"].encode("utf-8")).hexdigest(),
+        },
+        "policy_version": generation_policy["policy_version"],
+        "context_schema_version": 2,
+        "result_schema_version": 2,
+        "validator_version": VALIDATOR_VERSION,
+        "agent_run_id": None,
+    }
+    context = {
+        "context_schema_version": 2,
+        "result_schema_version": 2,
+        "generation_policy": generation_policy,
         "daily_review": review,
         "doctrine": doctrine,
         "recent_days": days,
@@ -974,6 +1179,17 @@ def daily_review_context(review_date: str, days: int = 14) -> dict:
         "recent_home_dinners": recent_home_dinners,
         "recent_online_categories": recent_online_categories,
         "ingredient_carryover_obligations": carryover_obligations,
+        "safety": personalization["safety"],
+        "active_profile": personalization.get("profile"),
+        "current_goals": personalization.get("goals") or [],
+        "active_strategy": personalization.get("strategy"),
+        "meal_evidence": evidence,
+        "recent_execution_feedback": execution_feedback,
+        "confirmed_rules": adaptations["confirmed_rules"],
+        "transient_adaptations": adaptations["transient"],
+        "inventory": inventory,
+        "active_experiment": experiment,
+        "source_manifest": source_manifest,
         "home_cooking_generation_protocol": [
             "早餐使用低摩擦组装，午餐给外食规则，只有晚餐生成新手菜谱。",
             "优先复用食材但轮换菜式；连续晚餐不重复 dish_key 或 flavor_profile。",
@@ -986,13 +1202,27 @@ def daily_review_context(review_date: str, days: int = 14) -> dict:
         ] if home_cooking.get("enabled") else [],
         "result_schema": daily_review_schema(settings),
     }
+    context["context_hash"] = hashlib.sha256(
+        json.dumps(context, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()
+    return context
 
 
-def complete_daily_review(review_date: str, result: dict) -> dict:
+def complete_daily_review(
+    review_date: str,
+    result: dict,
+    *,
+    provenance_context: dict | None = None,
+    agent_run_id: str | None = None,
+) -> dict:
+    from .personalization import require_generation
+
+    policy = require_generation("daily")
     review = ensure_daily_review(review_date)
     if review["status"] == "completed":
         raise ValidationError("该日期复盘已完成；新增每日记录后才可重新复盘")
-    settings = load_settings()
+    context = provenance_context or daily_review_context(review_date)
+    settings = context["settings"]
     validate_daily_review_result(result, settings)
     _validate_dinner_rotation(review_date, result, settings)
     expected_priority_ids = {food["id"] for food in list_priority_foods()}
@@ -1011,11 +1241,35 @@ def complete_daily_review(review_date: str, result: dict) -> dict:
         )
         _validate_ingredient_carryover_decisions(result, obligations)
     timestamp = now()
+    next_version = review["result_version"] + 1
+    menu = result.get("tomorrow_menu") or {}
+    for meal in menu.get("meals") or []:
+        if not meal.get("plan_item_id"):
+            meal["plan_item_id"] = "plan_" + hashlib.sha256(
+                f"{review['id']}|{next_version}|{meal.get('name','meal')}".encode("utf-8")
+            ).hexdigest()[:12]
+        if not meal.get("strategy_key"):
+            rotation = menu.get("rotation") or {}
+            if meal.get("name") == "晚餐" and rotation.get("dish_key"):
+                meal["strategy_key"] = rotation["dish_key"]
+            else:
+                normalized = "|".join(sorted(str(item).strip().lower() for item in meal.get("foods") or []))
+                meal["strategy_key"] = "meal_" + hashlib.sha256(
+                    f"{meal.get('name','meal')}|{normalized}".encode("utf-8")
+                ).hexdigest()[:12]
+    safety_mode = (context.get("safety") or {}).get("mode") or "setup_required"
     with connect() as conn:
         updated = conn.execute(
             """UPDATE daily_reviews SET status='completed',result_json=?,result_version=result_version+1,
-               updated_at=?,completed_at=? WHERE review_date=? AND status='pending'""",
-            (json.dumps(result, ensure_ascii=False), timestamp, timestamp, review_date),
+               schema_version=2,review_mode=?,source_manifest_json=?,context_hash=?,agent_run_id=?,
+               policy_version=?,validator_version=?,updated_at=?,completed_at=?
+               WHERE review_date=? AND status='pending'""",
+            (
+                json.dumps(result, ensure_ascii=False), safety_mode,
+                json.dumps(_source_manifest_for_commit(context, agent_run_id), ensure_ascii=False, sort_keys=True), context["context_hash"],
+                agent_run_id, policy["policy_version"], VALIDATOR_VERSION,
+                timestamp, timestamp, review_date,
+            ),
         )
         if updated.rowcount != 1:
             raise ValidationError("复盘状态已变化，请重新读取")
@@ -1024,12 +1278,27 @@ def complete_daily_review(review_date: str, result: dict) -> dict:
 
 def generate_daily_review(review_date: str, client=None) -> dict:
     from .ai import generate_json
+    from .personalization import require_generation
 
     review = ensure_daily_review(review_date)
     if review["status"] == "completed":
         raise ValidationError("该日期复盘已完成；新增每日记录后才可重新复盘")
-    result = generate_json(daily_review_context(review_date), "daily", client)
-    return complete_daily_review(review_date, result)
+    require_generation("daily")
+    context = daily_review_context(review_date)
+    run_id = _start_agent_run("daily", context, client)
+    try:
+        result = generate_json(context, "daily", client)
+        completed = complete_daily_review(
+            review_date,
+            result,
+            provenance_context=context,
+            agent_run_id=run_id,
+        )
+    except Exception as exc:
+        _finish_agent_run(run_id, error=exc)
+        raise
+    _finish_agent_run(run_id, result=result)
+    return completed
 
 
 def _non_empty_text(value: object, name: str) -> str:
@@ -1256,8 +1525,15 @@ def overview() -> dict:
 
 def task_context(task_id: str, days: int = 14) -> dict:
     task = get_task(task_id)
-    cutoff = (date.today() - timedelta(days=days - 1)).isoformat()
+    from .adaptive import active_adaptations, list_inventory, task_evidence_links
+    from .personalization import active_personalization, require_generation
+
+    generation_policy = require_generation(task["type"])
+    evidence_links = task_evidence_links(task_id)
+    anchor = max((date.fromisoformat(item["observed_date"]) for item in evidence_links), default=date.today())
+    cutoff = (anchor - timedelta(days=days - 1)).isoformat()
     doctrine = load_doctrine()
+    personalization = active_personalization()
     with connect() as conn:
         records = [row_dict(r) for r in conn.execute(
             "SELECT * FROM daily_records WHERE record_date>=? ORDER BY record_date,created_at", (cutoff,)
@@ -1272,27 +1548,76 @@ def task_context(task_id: str, days: int = 14) -> dict:
         matches = all_foods
     if task.get("image_path"):
         task["image_path"] = str(resolve_data_path(task["image_path"]))
-    return {
+    adaptations = active_adaptations(anchor.isoformat())
+    inventory = list_inventory()
+    source_manifest = {
+        "task": {"id": task["id"], "input_version": task.get("input_version", 1)},
+        "records": [item["id"] for item in records],
+        "evidence_links": [item["id"] for item in evidence_links],
+        "foods": [{"id": item["id"], "updated_at": item["updated_at"]} for item in matches],
+        "memories": [{"id": item["id"], "updated_at": item["updated_at"]} for item in memories],
+        "adjustments": [{"id": item["id"], "updated_at": item["updated_at"]} for item in adjustments],
+        "profile": ({"id": personalization["profile"]["id"], "version": personalization["profile"]["version"]} if personalization.get("profile") else None),
+        "goals": [{"id": item["id"], "version": item["version"]} for item in personalization.get("goals") or []],
+        "strategy": ({"id": personalization["strategy"]["id"], "version": personalization["strategy"]["version"]} if personalization.get("strategy") else None),
+        "targets": [{"id": item["id"], "key": item["target_key"], "version": item["version"]} for item in personalization.get("targets") or []],
+        "rules": [{"id": item["id"], "updated_at": item["updated_at"]} for item in adaptations["confirmed_rules"]],
+        "inventory": [{"id": item["id"], "version": item["version"]} for item in inventory],
+        "doctrine": {
+            "mode": doctrine["mode"],
+            "sha256": hashlib.sha256(doctrine["content"].encode("utf-8")).hexdigest(),
+        },
+        "policy_version": generation_policy["policy_version"],
+        "context_schema_version": 2,
+        "result_schema_version": 2,
+        "validator_version": VALIDATOR_VERSION,
+        "agent_run_id": None,
+    }
+    context = {
         "task": task,
+        "context_schema_version": 2,
+        "result_schema_version": 2,
+        "generation_policy": generation_policy,
         "doctrine": doctrine,
         "recent_days": days,
         "recent_records": records,
         "food_library_matches": matches,
         "long_term_memories": memories,
         "current_adjustments": adjustments,
-        "result_schema": result_schema(task["type"]),
+        "evidence_links": evidence_links,
+        "safety": personalization["safety"],
+        "active_profile": personalization.get("profile"),
+        "current_goals": personalization.get("goals") or [],
+        "active_strategy": personalization.get("strategy"),
+        "active_targets": personalization.get("targets") or [],
+        "confirmed_rules": adaptations["confirmed_rules"],
+        "inventory": inventory,
+        "source_manifest": source_manifest,
+        "result_schema": result_schema(task["type"], fact_only=generation_policy["fact_only"]),
         "analysis_boundary": "照片与数量只能区间估算；不可伪造不可见油、酱汁、重量或品牌。",
     }
+    context["context_hash"] = hashlib.sha256(
+        json.dumps(context, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()
+    return context
 
 
-def result_schema(task_type: str) -> dict:
+def result_schema(task_type: str, *, fact_only: bool = False) -> dict:
     nutrition = {"energy_kcal": [0, 0], "protein_g": [0, 0], "carbs_g": [0, 0], "fat_g": [0, 0]}
     if task_type == "photo":
-        return {
+        schema = {
             "summary": "string",
             "candidates": [{"name": "string", "portion_range": "string", "nutrition": nutrition, "confidence": 0.0}],
             "unknowns": ["string"],
-            "advice": ["string"],
+        }
+        if not fact_only:
+            schema["advice"] = ["string"]
+        return schema
+    if fact_only:
+        return {
+            "summary": "string", "observed_items": ["string"], "batch_nutrition": nutrition,
+            "per_serving_nutrition": nutrition, "gaps": ["string"], "risks": ["string"],
+            "unknowns": ["string"],
         }
     return {
         "summary": "string", "combinations": ["string"], "batch_nutrition": nutrition,

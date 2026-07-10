@@ -193,3 +193,13 @@
 - 仍未实现：Skill 不会自动合并或替用户审批 PR；没有 Git remote 的本地目录只执行本地修改与验证，并明确跳过发布步骤。
 - 下一最小任务：重启 Codex 后，在下一次仓库修改任务中验证隐式触发、原子提交和草稿 PR 交付链路。
 - 用户用法：正常提出任何仓库修改需求即可；也可显式说“使用 `$ship-changes-via-draft-pr` 完成这次改动”。
+
+## 2026-07-11：自适应闭环 P0 安全与可追溯基础
+
+- 目标：保留已实现的闭环领域代码，同时把审计发现的安全门、目标来源、受限模式泄漏、反馈历史、规则作用域、迁移兼容和生成 provenance 问题纳入正式实现。
+- 改动文件：`mealcircuit/db.py`、`personalization.py`、`adaptive.py`、`service.py`、`ai.py`、`validation.py`、`configuration.py`、`storage.py`、测试与 `docs/adaptive-closed-loop-verification.md`。
+- 核心功能：引入带校验和的 v1/v2 迁移账本与升级前备份；新增独立营养目标版本及来源、方法、适用范围、确认与有效期；区分 standard、clinician-guided 与 halt-and-refer 安全资格；统一 context/generate/complete 安全门；受限模式使用不含建议字段的 fact-only Schema；执行回执修订写入追加事件；候选、规则、实验和反馈绑定档案、目标、策略、安全模式及 Policy；任务、复盘和 Agent run 保存 doctrine hash、Policy/Schema/Validator 版本、source manifest、context/result hash，且不保存 API Key。
+- 验证：`.\test.ps1` 58 项测试全部通过；`python -m compileall -q mealcircuit tests\test_adaptive.py tests\test_mealcircuit.py` 通过；`git diff --check` 通过。新增覆盖未初始化门禁、孕期无专业指导的受限行为、专业目标 provenance、fact-only 字段拒绝、反馈历史和 Agent run 审计。
+- 仍未实现：计划投影与硬约束编译、救场生成、完整 Web/CLI 闭环、数据导入导出、周期校准 UI、浏览器与无障碍验收尚未完成；本检查点不是交付终点。
+- 下一任务：建立 plan versions/items 投影和确定性约束编译器，将确认规则、库存、目标和安全模式真正约束下一份计划及救场结果。
+- 用户用法：现有记录入口保持可用；生成和提交现在要求先完成目标/安全初始化，clinician-guided 模式还要求已确认且仍有效的专业指导。
