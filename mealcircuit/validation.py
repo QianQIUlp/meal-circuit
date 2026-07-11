@@ -133,7 +133,8 @@ def validate_daily_review_result(value: Any, expected_settings: dict | None = No
         raise ValidationError("tomorrow_menu.date 必须是 YYYY-MM-DD") from exc
     _required_text(menu.get("environment"), "tomorrow_menu.environment")
     target = menu.get("protein_target_g")
-    _validate_range(target, "tomorrow_menu.protein_target_g")
+    if target is not None:
+        _validate_range(target, "tomorrow_menu.protein_target_g")
     if expected_settings and target != expected_settings["protein_target_g"]:
         raise ValidationError(
             f"tomorrow_menu.protein_target_g 必须是 {expected_settings['protein_target_g']}"

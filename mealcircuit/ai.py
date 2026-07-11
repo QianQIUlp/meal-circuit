@@ -363,6 +363,19 @@ def result_json_schema(kind: str, context: dict | None = None) -> dict:
         home = ((context or {}).get("settings") or {}).get("home_cooking") or {"enabled": False}
         schema = _daily_json_schema(nutrition, bool(home.get("enabled")))
         return schema
+    if kind == "rescue":
+        return {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["reason", "steps", "replacement_foods", "portion_change", "safety_notes"],
+            "properties": {
+                "reason": {"type": "string"},
+                "steps": _string_array(min_items=1),
+                "replacement_foods": _string_array(),
+                "portion_change": {"type": "string"},
+                "safety_notes": _string_array(),
+            },
+        }
     raise ValidationError(f"未知生成类型：{kind}")
 
 
@@ -383,7 +396,7 @@ def _daily_json_schema(nutrition: dict, home_cooking: bool) -> dict:
     menu_properties = {
         "date": {"type": "string"},
         "environment": {"type": "string"},
-        "protein_target_g": _range_schema(),
+        "protein_target_g": {"anyOf": [_range_schema(), {"type": "null"}]},
         "meals": {"type": "array", "minItems": 3, "maxItems": 3, "items": meal},
         "conditional_snack": {
             "type": "object",

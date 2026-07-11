@@ -2,7 +2,7 @@
   "meal_environment": "请填写主要用餐环境",
   "protein_target_g": null,
   "portion_method": "请填写常用份量表达方式",
-  "missing_training_default": "请填写训练信息缺失时的默认处理",
+  "missing_training_default": "按普通日处理，并将训练状态保持未知",
   "compensation_boundary": "不跳餐、不清零主食、不极端压低热量；只撤掉重复加餐并恢复标准份量。",
   "home_cooking": {
     "enabled": false,

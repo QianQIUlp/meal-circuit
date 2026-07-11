@@ -8,8 +8,8 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 from .db import connect, init_db, row_dict
-from .personalization import active_personalization
-from .validation import ValidationError
+from .personalization import active_personalization, require_generation
+from .validation import VALIDATOR_VERSION, ValidationError
 
 
 MEAL_SLOTS = {"breakfast", "lunch", "dinner", "snack", "unknown"}
@@ -27,6 +27,14 @@ REASON_CODES = {
     "other",
 }
 INVENTORY_STATUSES = {"available", "used", "not_bought", "discarded", "unknown"}
+RESCUE_ISSUES = {
+    "ingredient_missing": "missing_ingredient",
+    "not_enough_time": "not_enough_time",
+    "too_complex": "too_complex",
+    "gut_change": "gut_change",
+    "schedule_change": "schedule_change",
+    "other": "other",
+}
 FRICTION_LABELS = {
     "missing_ingredient": "缺少所需食材",
     "not_enough_time": "可用时间不足",
@@ -41,15 +49,21 @@ FRICTION_LABELS = {
 QUESTION_CATALOG = {
     "tomorrow_training": {
         "category": "planning",
+        "prompt": "明天安排训练吗？",
         "reason": "明天是否训练会改变主食与餐次安排。",
         "expected_impact": "训练日调整",
         "priority": 60,
+        "schema": {"kind": "choice", "options": ["yes", "no", "unknown"]},
+        "cooldown_days": 1,
     },
     "tomorrow_environment": {
         "category": "planning",
+        "prompt": "明天主要在哪里吃饭？",
         "reason": "明天的用餐地点会改变菜单可执行方式。",
         "expected_impact": "外食或在家方案",
         "priority": 55,
+        "schema": {"kind": "choice", "options": ["home", "away", "mixed", "unknown"]},
+        "cooldown_days": 1,
     },
 }
 
@@ -220,13 +234,79 @@ def _strategy_key(menu: dict, meal: dict) -> str:
     return _stable_id("meal", meal.get("name", "meal"), normalized)
 
 
-def get_plan_for_date(plan_date: str) -> dict | None:
+def _plan_scope_current(source_manifest: dict, safety_mode: str) -> bool:
+    current = active_personalization()
+    if current["status"] != "completed" or current["safety"]["mode"] != safety_mode:
+        return False
+    manifest_profile = (source_manifest.get("profile") or {}).get("id")
+    manifest_strategy = (source_manifest.get("strategy") or {}).get("id")
+    return bool(
+        manifest_profile
+        and manifest_profile == current["profile"]["id"]
+        and manifest_strategy
+        and current.get("strategy")
+        and manifest_strategy == current["strategy"]["id"]
+    )
+
+
+def get_plan_for_date(plan_date: str, *, include_restricted_history: bool = False) -> dict | None:
     _validate_date(plan_date, "计划日期")
+    current = active_personalization()
+    if (
+        not include_restricted_history
+        and (
+            current["status"] != "completed"
+            or "daily_plan" not in (current.get("safety") or {}).get("allowed_actions", [])
+        )
+    ):
+        return None
     init_db()
     with connect() as conn:
+        projected = conn.execute(
+            """SELECT p.*,r.review_date,r.review_mode FROM plan_versions p
+               JOIN daily_reviews r ON r.id=p.review_id
+               WHERE p.plan_date=? AND p.status='published'
+               ORDER BY p.created_at DESC LIMIT 1""",
+            (plan_date,),
+        ).fetchone()
+        projected_items = []
+        if projected:
+            projected_items = conn.execute(
+                "SELECT * FROM plan_items WHERE plan_version_id=? ORDER BY sort_order",
+                (projected["id"],),
+            ).fetchall()
         rows = conn.execute(
             "SELECT * FROM daily_reviews WHERE status='completed' ORDER BY review_date DESC,updated_at DESC"
         ).fetchall()
+    if projected:
+        plan_version = row_dict(projected)
+        meals = []
+        for row in projected_items:
+            item = row_dict(row)
+            meal = item["item_json"]
+            meal["plan_item_id"] = item["id"]
+            meal["strategy_key"] = item["strategy_key"]
+            meals.append(meal)
+        menu = {**plan_version["menu_json"], "meals": meals}
+        feedback = list_plan_feedback(
+            plan_date,
+            review_id=plan_version["review_id"],
+            result_version=plan_version["result_version"],
+        )
+        return {
+            "plan_version_id": plan_version["id"],
+            "review_id": plan_version["review_id"],
+            "review_date": plan_version["review_date"],
+            "result_version": plan_version["result_version"],
+            "plan_date": plan_date,
+            "menu": menu,
+            "feedback": {item["plan_item_id"]: item for item in feedback},
+            "source_manifest": plan_version["source_manifest_json"],
+            "safety_mode": plan_version.get("review_mode") or "setup_required",
+            "policy_version": plan_version["policy_version"],
+            "context_hash": plan_version["context_hash"],
+            "scope_current": _plan_scope_current(plan_version["source_manifest_json"], plan_version.get("review_mode") or "setup_required"),
+        }
     for row in rows:
         review = row_dict(row)
         menu = (review.get("result_json") or {}).get("tomorrow_menu") or {}
@@ -250,6 +330,7 @@ def get_plan_for_date(plan_date: str) -> dict | None:
             "source_manifest": review.get("source_manifest_json") or {},
             "safety_mode": review.get("review_mode") or "setup_required",
             "policy_version": review.get("policy_version") or "",
+            "scope_current": _plan_scope_current(review.get("source_manifest_json") or {}, review.get("review_mode") or "setup_required"),
         }
     return None
 
@@ -277,7 +358,7 @@ def save_plan_feedback(
     if not isinstance(outcome, dict):
         raise ValidationError("执行结果必须是对象")
     actor_source = _text(actor_source, "回执来源", maximum=50)
-    plan = get_plan_for_date(plan_date)
+    plan = get_plan_for_date(plan_date, include_restricted_history=True)
     if not plan:
         raise ValidationError("该日期没有已发布计划")
     meal = next((item for item in plan["menu"]["meals"] if item["plan_item_id"] == plan_item_id), None)
@@ -466,6 +547,42 @@ def _positive_outcome(item: dict) -> bool:
     return bool(outcome.get("would_repeat")) or outcome.get("result") in {"appropriate", "would_repeat"}
 
 
+def _friction_effect(reason: str, meal_name: str) -> dict:
+    if reason == "not_enough_time":
+        current = active_personalization()
+        profile = ((current.get("profile") or {}).get("profile_json") or {})
+        configured = ((profile.get("constraints") or {}).get("cooking_time_minutes") or 20)
+        return {
+            "action": "max_active_minutes",
+            "meal_name": meal_name,
+            "value": max(10, min(15, int(configured))),
+            "expires_after_days": 7,
+            "expires_after_plans": 3,
+        }
+    if reason == "too_complex":
+        return {
+            "action": "max_steps",
+            "meal_name": meal_name,
+            "value": 5,
+            "expires_after_days": 7,
+            "expires_after_plans": 3,
+        }
+    if reason == "missing_ingredient":
+        return {
+            "action": "prefer_inventory",
+            "meal_name": meal_name,
+            "expires_after_days": 7,
+            "expires_after_plans": 3,
+        }
+    return {
+        "action": "temporary_downrank",
+        "reason_code": reason,
+        "meal_name": meal_name,
+        "expires_after_days": 7,
+        "expires_after_plans": 3,
+    }
+
+
 def recompute_candidates(as_of: str | None = None) -> list[dict]:
     as_of_date = date.fromisoformat(_validate_date(as_of or date.today().isoformat()))
     cutoff = (as_of_date - timedelta(days=41)).isoformat()
@@ -513,13 +630,7 @@ def recompute_candidates(as_of: str | None = None) -> list[dict]:
                     "counterexample_count": len(counterexamples),
                 },
                 confidence,
-                {
-                    "action": "temporary_downrank",
-                    "reason_code": reason,
-                    "meal_name": meal_name,
-                    "expires_after_days": 7,
-                    "expires_after_plans": 3,
-                },
+                _friction_effect(reason, meal_name),
                 supports,
                 counterexamples,
             )
@@ -584,6 +695,8 @@ def decide_candidate(candidate_id: str, decision: str, *, statement: str | None 
     mapping = {"accept": "accepted", "reject": "rejected", "snooze": "snoozed"}
     if decision not in mapping:
         raise ValidationError("候选操作无效")
+    if decision == "accept":
+        require_generation("adaptation")
     timestamp = _now()
     current_scope = _scope_snapshot()
     with connect() as conn:
@@ -631,6 +744,7 @@ def decide_candidate(candidate_id: str, decision: str, *, statement: str | None 
 
 
 def create_rule(statement: str, kind: str = "constraint", scope: dict | None = None, effect: dict | None = None) -> dict:
+    require_generation("adaptation")
     timestamp = _now()
     rule_id = _id("rule")
     scope_snapshot = _scope_snapshot()
@@ -666,7 +780,7 @@ def list_rules(active_only: bool = True) -> list[dict]:
     today = date.today().isoformat()
     with connect() as conn:
         conn.execute(
-            "UPDATE adaptive_rules SET status='expired',updated_at=? WHERE status='active' AND expires_on IS NOT NULL AND expires_on<?",
+            "UPDATE adaptive_rules SET status='expired',version=version+1,updated_at=? WHERE status='active' AND expires_on IS NOT NULL AND expires_on<?",
             (_now(), today),
         )
         sql = "SELECT * FROM adaptive_rules" + (" WHERE status='active'" if active_only else "") + " ORDER BY created_at DESC"
@@ -681,9 +795,17 @@ def list_rules(active_only: bool = True) -> list[dict]:
 def set_rule_status(rule_id: str, status: str) -> dict:
     if status not in {"active", "inactive"}:
         raise ValidationError("规则状态无效")
+    if status == "active":
+        require_generation("adaptation")
+        with connect() as conn:
+            existing = row_dict(conn.execute("SELECT * FROM adaptive_rules WHERE id=?", (rule_id,)).fetchone())
+        if not existing:
+            raise KeyError(rule_id)
+        if not _scope_matches(existing):
+            raise ValidationError("该规则属于旧目标或安全策略，不能重新启用")
     with connect() as conn:
         updated = conn.execute(
-            "UPDATE adaptive_rules SET status=?,updated_at=? WHERE id=?", (status, _now(), rule_id)
+            "UPDATE adaptive_rules SET status=?,version=version+1,updated_at=? WHERE id=?", (status, _now(), rule_id)
         )
         if updated.rowcount != 1:
             raise KeyError(rule_id)
@@ -787,37 +909,71 @@ def schedule_questions(question_date: str | None = None) -> list[dict]:
     if current["status"] == "setup_required":
         proposals.append({
             "key": "complete_setup", "category": "setup", "priority": 100,
+            "prompt": "完成目标和安全初始化",
             "reason": "完成目标和安全档案后，系统才能生成适合你的计划。",
             "expected_impact": "启用个性化工作台",
+            "schema": {"kind": "action", "href": "/setup/welcome"},
+            "subject": {},
         })
         budget = 1
     else:
         budget = int(current["profile"]["profile_json"]["constraints"].get("question_budget", 2))
-        plan = get_plan_for_date(target)
-        if plan:
-            for meal in plan["menu"]["meals"]:
-                if meal["plan_item_id"] not in plan["feedback"]:
-                    proposals.append({
-                        "key": f"feedback:{meal['plan_item_id']}",
-                        "category": "feedback",
-                        "priority": 80,
-                        "reason": f"确认{meal.get('name','这餐')}是否执行，才能区分计划问题和执行摩擦。",
-                        "expected_impact": "下一次计划与阻力学习",
-                    })
-        proposals.extend({"key": key, **value} for key, value in QUESTION_CATALOG.items())
+        if "daily_plan" not in current["safety"].get("allowed_actions", []):
+            budget = min(budget, 1)
+            if current["safety"]["mode"] == "clinician_guided" and not current["safety"].get("professional_guidance_current"):
+                proposals.append({
+                    "key": "professional_guidance_review", "category": "safety", "priority": 100,
+                    "prompt": "是否要录入或更新专业指导？",
+                    "reason": "当前安全模式不会自行生成营养计划；只有仍有效且来源明确的专业指导才能启用受约束计划。",
+                    "expected_impact": "安全资格与允许的规划范围",
+                    "schema": {"kind": "action", "href": "/profile"}, "subject": {},
+                })
+        else:
+            plan = get_plan_for_date(target)
+            if plan:
+                for meal in plan["menu"]["meals"]:
+                    if meal["plan_item_id"] not in plan["feedback"]:
+                        proposals.append({
+                            "key": f"feedback:{meal['plan_item_id']}",
+                            "category": "feedback",
+                            "priority": 80,
+                            "prompt": f"{meal.get('name','这餐')}实际执行得怎么样？",
+                            "reason": f"确认{meal.get('name','这餐')}是否执行，才能区分计划问题和执行摩擦。",
+                            "expected_impact": "下一次计划与阻力学习",
+                            "schema": {
+                                "kind": "plan_feedback",
+                                "statuses": sorted(FEEDBACK_STATUSES),
+                                "reason_codes": sorted(REASON_CODES),
+                            },
+                            "subject": {
+                                "plan_date": target,
+                                "plan_item_id": meal["plan_item_id"],
+                                "meal_name": meal.get("name") or "",
+                            },
+                        })
+            proposals.extend({"key": key, "subject": {}, **value} for key, value in QUESTION_CATALOG.items())
     proposals.sort(key=lambda item: (-item["priority"], item["key"]))
-    selected = proposals[:budget]
+    feedback_proposals = [item for item in proposals if item["category"] == "feedback"]
+    other_proposals = [item for item in proposals if item["category"] != "feedback"]
+    if budget >= 2 and feedback_proposals and other_proposals:
+        selected = [feedback_proposals[0], other_proposals[0]]
+        selected.extend((feedback_proposals[1:] + other_proposals[1:])[:budget - 2])
+    else:
+        selected = proposals[:budget]
     timestamp = _now()
     with connect() as conn:
         for proposal in selected:
             conn.execute(
                 """INSERT OR IGNORE INTO question_events(
-                       id,question_date,question_key,category,status,priority,reason,expected_impact,
-                       version,created_at,updated_at
-                   ) VALUES(?,?,?,?,'pending',?,?,?,?,?,?)""",
+                       id,question_date,question_key,category,status,priority,prompt,reason,expected_impact,
+                       question_schema_json,subject_json,cooldown_key,version,created_at,updated_at
+                   ) VALUES(?,?,?,?,'pending',?,?,?,?,?,?,?,0,?,?)""",
                 (
                     _id("question"), target, proposal["key"], proposal["category"], proposal["priority"],
-                    proposal["reason"], proposal["expected_impact"], 0, timestamp, timestamp,
+                    proposal.get("prompt") or proposal["reason"], proposal["reason"], proposal["expected_impact"],
+                    json.dumps(proposal.get("schema") or {}, ensure_ascii=False),
+                    json.dumps(proposal.get("subject") or {}, ensure_ascii=False),
+                    proposal["key"], timestamp, timestamp,
                 ),
             )
         rows = conn.execute(
@@ -830,12 +986,35 @@ def schedule_questions(question_date: str | None = None) -> list[dict]:
 def answer_question(question_id: str, answer: object, expected_version: int, *, skip: bool = False) -> dict:
     timestamp = _now()
     with connect() as conn:
-        conn.execute("BEGIN IMMEDIATE")
         row = conn.execute("SELECT * FROM question_events WHERE id=?", (question_id,)).fetchone()
         if not row:
             raise KeyError(question_id)
         if row["status"] != "pending" or row["version"] != expected_version:
             raise ValidationError("问题状态已变化，请刷新后重试")
+        item = row_dict(row)
+    if not skip:
+        schema = item.get("question_schema_json") or {}
+        if schema.get("kind") == "choice":
+            if not isinstance(answer, str) or answer not in schema.get("options", []):
+                raise ValidationError("问题答案不在允许选项中")
+        elif schema.get("kind") == "plan_feedback":
+            if not isinstance(answer, dict):
+                raise ValidationError("计划回执答案必须是对象")
+            subject = item.get("subject_json") or {}
+            save_plan_feedback(
+                subject["plan_date"],
+                subject["plan_item_id"],
+                answer.get("status"),
+                reason_codes=answer.get("reason_codes"),
+                actual_text=answer.get("actual_text") or "",
+                outcome=answer.get("outcome") or {},
+                expected_version=None,
+                actor_source="question",
+            )
+        elif schema.get("kind") == "action":
+            raise ValidationError("该问题需要完成对应操作，不能直接提交答案")
+    with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
         status = "skipped" if skip else "answered"
         answer_json = None if skip else json.dumps(answer, ensure_ascii=False)
         conn.execute(
@@ -847,7 +1026,30 @@ def answer_question(question_id: str, answer: object, expected_version: int, *, 
     return row_dict(updated)
 
 
+def question_events_for_date(question_date: str, *, include_pending: bool = True) -> list[dict]:
+    _validate_date(question_date, "问题日期")
+    init_db()
+    sql = "SELECT * FROM question_events WHERE question_date=?"
+    params: tuple[Any, ...] = (question_date,)
+    if not include_pending:
+        sql += " AND status IN ('answered','skipped')"
+    sql += " ORDER BY priority DESC,created_at"
+    with connect() as conn:
+        rows = conn.execute(sql, params).fetchall()
+    return [row_dict(row) for row in rows]
+
+
+def get_question_event(question_id: str) -> dict:
+    init_db()
+    with connect() as conn:
+        row = conn.execute("SELECT * FROM question_events WHERE id=?", (question_id,)).fetchone()
+    if not row:
+        raise KeyError(question_id)
+    return row_dict(row)
+
+
 def propose_experiment(variable_key: str, plan: dict) -> dict:
+    require_generation("adaptation")
     if not isinstance(plan, dict) or not plan.get("action") or not plan.get("success_signal"):
         raise ValidationError("实验必须包含 action 和 success_signal")
     init_db()
@@ -883,6 +1085,8 @@ def propose_experiment(variable_key: str, plan: dict) -> dict:
 
 
 def activate_experiment(experiment_id: str, starts_on: str, days: int) -> dict:
+    require_generation("adaptation")
+    current_scope = _scope_snapshot()
     starts = date.fromisoformat(_validate_date(starts_on, "实验开始日期"))
     if days < 3 or days > 7:
         raise ValidationError("实验观察窗必须是 3–7 天")
@@ -894,8 +1098,10 @@ def activate_experiment(experiment_id: str, starts_on: str, days: int) -> dict:
             raise KeyError(experiment_id)
         if row["status"] != "proposed":
             raise ValidationError("只有待确认实验可以开始")
+        if not _scope_matches(row_dict(row), current_scope):
+            raise ValidationError("该实验属于旧目标或安全策略，不能开始")
         conn.execute(
-            """UPDATE adaptive_experiments SET status='active',starts_on=?,ends_on=?,updated_at=? WHERE id=?""",
+            """UPDATE adaptive_experiments SET status='active',starts_on=?,ends_on=?,version=version+1,updated_at=? WHERE id=?""",
             (starts.isoformat(), ends.isoformat(), _now(), experiment_id),
         )
         updated = conn.execute("SELECT * FROM adaptive_experiments WHERE id=?", (experiment_id,)).fetchone()
@@ -913,7 +1119,7 @@ def finish_experiment(experiment_id: str, result: dict, *, cancel: bool = False)
             raise ValidationError("实验已结束")
         status = "cancelled" if cancel else "completed"
         conn.execute(
-            "UPDATE adaptive_experiments SET status=?,result_json=?,updated_at=? WHERE id=?",
+            "UPDATE adaptive_experiments SET status=?,result_json=?,version=version+1,updated_at=? WHERE id=?",
             (status, json.dumps(result, ensure_ascii=False), _now(), experiment_id),
         )
         updated = conn.execute("SELECT * FROM adaptive_experiments WHERE id=?", (experiment_id,)).fetchone()
@@ -928,6 +1134,16 @@ def active_experiment() -> dict | None:
         ).fetchone()
     item = row_dict(row)
     return item if item and _scope_matches(item) else None
+
+
+def list_experiments(*, current_scope_only: bool = True) -> list[dict]:
+    init_db()
+    with connect() as conn:
+        rows = conn.execute("SELECT * FROM adaptive_experiments ORDER BY created_at DESC").fetchall()
+    result = [row_dict(row) for row in rows]
+    if current_scope_only:
+        result = [item for item in result if _scope_matches(item)]
+    return result
 
 
 def calibration_snapshot(as_of: str | None = None) -> dict:
@@ -960,19 +1176,26 @@ def create_rescue_session(
     issue_code: str,
     input_text: str = "",
 ) -> dict:
+    from .personalization import require_generation
+
+    require_generation("rescue")
     plan = get_plan_for_date(plan_date)
     if not plan or not any(item["plan_item_id"] == plan_item_id for item in plan["menu"]["meals"]):
         raise ValidationError("救场计划项目不存在")
+    if not plan.get("scope_current"):
+        raise ValidationError("该计划属于旧目标或策略版本，不能生成新的救场建议")
     issue_code = _text(issue_code, "救场问题", maximum=100)
+    if issue_code not in RESCUE_ISSUES:
+        raise ValidationError("救场问题类型无效")
     timestamp = _now()
     rescue_id = _id("rescue")
     with connect() as conn:
         conn.execute(
             """INSERT INTO rescue_sessions(
-                   id,review_id,result_version,plan_item_id,issue_code,input_text,status,created_at,updated_at
-               ) VALUES(?,?,?,?,?,?,'pending',?,?)""",
+                   id,review_id,result_version,plan_date,plan_item_id,issue_code,input_text,status,created_at,updated_at
+               ) VALUES(?,?,?,?,?,?,?,'pending',?,?)""",
             (
-                rescue_id, plan["review_id"], plan["result_version"], plan_item_id, issue_code,
+                rescue_id, plan["review_id"], plan["result_version"], plan_date, plan_item_id, issue_code,
                 _text(input_text, "救场补充", required=False, maximum=2000), timestamp, timestamp,
             ),
         )
@@ -980,17 +1203,75 @@ def create_rescue_session(
     return row_dict(row)
 
 
-def complete_rescue_session(rescue_id: str, result: dict) -> dict:
-    if not isinstance(result, dict) or not result.get("steps") or not result.get("reason"):
-        raise ValidationError("救场结果必须包含 reason 和 steps")
+def get_rescue_session(rescue_id: str) -> dict:
+    init_db()
+    with connect() as conn:
+        row = conn.execute("SELECT * FROM rescue_sessions WHERE id=?", (rescue_id,)).fetchone()
+    if not row:
+        raise KeyError(rescue_id)
+    return row_dict(row)
+
+
+def complete_rescue_session(
+    rescue_id: str,
+    result: dict,
+    *,
+    provenance_context: dict | None = None,
+    agent_run_id: str | None = None,
+) -> dict:
+    from .personalization import require_generation
+    from .planning import compile_constraints, validate_rescue_result
+
+    policy = require_generation("rescue")
+    session = get_rescue_session(rescue_id)
+    if session["status"] != "pending":
+        raise ValidationError("救场任务不存在或已完成")
+    if provenance_context is None:
+        from . import service
+
+        provenance_context = service.rescue_context(rescue_id)
+    plan = get_plan_for_date(session["plan_date"])
+    if not plan:
+        raise ValidationError("原计划已不可用")
+    plan_item = next(
+        (item for item in plan["menu"]["meals"] if item["plan_item_id"] == session["plan_item_id"]),
+        None,
+    )
+    if not plan_item:
+        raise ValidationError("原计划项目已不可用")
+    result = validate_rescue_result(result, plan_item, compile_constraints(provenance_context))
     timestamp = _now()
+    manifest = dict(provenance_context.get("source_manifest") or {})
+    manifest["agent_run_id"] = agent_run_id
     with connect() as conn:
         updated = conn.execute(
-            """UPDATE rescue_sessions SET status='completed',result_json=?,updated_at=?,completed_at=?
+            """UPDATE rescue_sessions SET status='completed',result_json=?,source_manifest_json=?,context_hash=?,
+               agent_run_id=?,policy_version=?,validator_version=?,updated_at=?,completed_at=?
                WHERE id=? AND status='pending'""",
-            (json.dumps(result, ensure_ascii=False), timestamp, timestamp, rescue_id),
+            (
+                json.dumps(result, ensure_ascii=False),
+                json.dumps(manifest, ensure_ascii=False, sort_keys=True),
+                provenance_context.get("context_hash") or "",
+                agent_run_id,
+                policy["policy_version"],
+                VALIDATOR_VERSION,
+                timestamp,
+                timestamp,
+                rescue_id,
+            ),
         )
         if updated.rowcount != 1:
             raise ValidationError("救场任务不存在或已完成")
         row = conn.execute("SELECT * FROM rescue_sessions WHERE id=?", (rescue_id,)).fetchone()
+    existing = plan["feedback"].get(session["plan_item_id"])
+    save_plan_feedback(
+        session["plan_date"],
+        session["plan_item_id"],
+        "modified",
+        reason_codes=[RESCUE_ISSUES[session["issue_code"]]],
+        actual_text=result["reason"],
+        outcome={"rescue_session_id": rescue_id, "rescue_applied": True},
+        expected_version=existing["version"] if existing else None,
+        actor_source="rescue",
+    )
     return row_dict(row)

@@ -46,8 +46,14 @@ def _client_identity(client=None) -> tuple[str | None, str | None]:
     return status.get("provider"), status.get("model")
 
 
-def _start_agent_run(kind: str, context: dict, client=None) -> str:
-    provider, model = _client_identity(client)
+def _start_agent_run(
+    kind: str,
+    context: dict,
+    client=None,
+    *,
+    identity: tuple[str | None, str | None] | None = None,
+) -> str:
+    provider, model = identity or _client_identity(client)
     run_id = new_id("agent_run")
     policy = context.get("generation_policy") or {}
     source_manifest = dict(context.get("source_manifest") or {})
@@ -241,6 +247,9 @@ def complete_task(
     policy = require_generation(task["type"])
     context = provenance_context or task_context(task_id)
     validate_result(task["type"], result, fact_only=policy["fact_only"])
+    from .planning import enrich_task_result
+
+    result = enrich_task_result(result, context)
     with connect() as conn:
         updated = conn.execute(
             """UPDATE tasks SET status='completed', result_json=?, result_version=1,
@@ -284,6 +293,21 @@ def generate_task_result(task_id: str, client=None) -> dict:
             provenance_context=context,
             agent_run_id=run_id,
         )
+    except Exception as exc:
+        _finish_agent_run(run_id, error=exc)
+        raise
+    _finish_agent_run(run_id, result=result)
+    return completed
+
+
+def submit_task_result(task_id: str, result: dict) -> dict:
+    task = get_task(task_id)
+    context = task_context(task_id)
+    run_id = _start_agent_run(
+        task["type"], context, identity=("external_agent", "structured_json_submission")
+    )
+    try:
+        completed = complete_task(task_id, result, provenance_context=context, agent_run_id=run_id)
     except Exception as exc:
         _finish_agent_run(run_id, error=exc)
         raise
@@ -494,20 +518,21 @@ def _queue_daily_review(conn, record_date: str, archive_reason: str = "new_daily
             """INSERT INTO daily_review_history(
                 id,review_id,version,source_record_ids_json,source_checkin_versions_json,
                 result_json,completed_at,archived_at,archive_reason,schema_version,review_mode,
-                source_manifest_json,context_hash,agent_run_id,policy_version,validator_version
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                source_manifest_json,context_hash,agent_run_id,policy_version,validator_version,plan_version_id
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 new_id("review_history"), review["id"], review["result_version"],
                 review["source_record_ids_json"], review["source_checkin_versions_json"],
                 review["result_json"], review["completed_at"], timestamp, archive_reason,
                 review["schema_version"], review["review_mode"], review["source_manifest_json"], review["context_hash"],
                 review["agent_run_id"], review["policy_version"], review["validator_version"],
+                review["plan_version_id"],
             ),
         )
     conn.execute(
         """UPDATE daily_reviews SET status='pending',source_record_ids_json=?,source_checkin_versions_json=?,
            result_json=NULL,source_manifest_json='{}',context_hash='',agent_run_id=NULL,
-           policy_version='',validator_version='',updated_at=?,completed_at=NULL
+           policy_version='',validator_version='',plan_version_id=NULL,updated_at=?,completed_at=NULL
            WHERE review_date=?""",
         (source_json, checkin_versions_json, timestamp, record_date),
     )
@@ -809,19 +834,21 @@ def requeue_daily_review(review_date: str, reason: str) -> dict:
             """INSERT INTO daily_review_history(
                 id,review_id,version,source_record_ids_json,source_checkin_versions_json,
                 result_json,completed_at,archived_at,archive_reason,schema_version,review_mode,
-                source_manifest_json,context_hash,agent_run_id,policy_version,validator_version
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                source_manifest_json,context_hash,agent_run_id,policy_version,validator_version,plan_version_id
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 new_id("review_history"), current["id"], current["result_version"],
                 current["source_record_ids_json"], current["source_checkin_versions_json"],
                 current["result_json"], current["completed_at"], timestamp, reason,
                 current["schema_version"], current["review_mode"], current["source_manifest_json"], current["context_hash"],
                 current["agent_run_id"], current["policy_version"], current["validator_version"],
+                current["plan_version_id"],
             ),
         )
         conn.execute(
             """UPDATE daily_reviews SET status='pending',result_json=NULL,source_manifest_json='{}',context_hash='',
-                   agent_run_id=NULL,policy_version='',validator_version='',updated_at=?,completed_at=NULL
+                   agent_run_id=NULL,policy_version='',validator_version='',plan_version_id=NULL,
+                   updated_at=?,completed_at=NULL
                WHERE review_date=?""", (timestamp, review_date)
         )
     return get_daily_review(review_date)
@@ -1057,6 +1084,7 @@ def _recent_review_rows_for_carryover(review_date: str, days: int = 14) -> list:
 
 def daily_review_context(review_date: str, days: int = 14) -> dict:
     from .personalization import require_generation
+    from .planning import PLANNING_POLICY_VERSION
 
     generation_policy = require_generation("daily")
     review = ensure_daily_review(review_date)
@@ -1118,6 +1146,7 @@ def daily_review_context(review_date: str, days: int = 14) -> dict:
     adaptations = adaptive.active_adaptations(review_date)
     inventory = adaptive.list_inventory()
     experiment = adaptive.active_experiment()
+    planning_answers = adaptive.question_events_for_date(review_date, include_pending=False)
     source_manifest = {
         "records": [item["id"] for item in records],
         "memories": [{"id": item["id"], "updated_at": item["updated_at"]} for item in memories],
@@ -1128,7 +1157,11 @@ def daily_review_context(review_date: str, days: int = 14) -> dict:
             "link_id": item["id"], "task_id": item["task_id"], "result_version": item["result_version"],
             "correction_ids": [correction["id"] for correction in item["corrections"]],
         } for item in evidence],
-        "profile": ({"id": personalization["profile"]["id"], "version": personalization["profile"]["version"]} if personalization.get("profile") else None),
+        "profile": ({
+            "id": personalization["profile"]["id"],
+            "version": personalization["profile"]["version"],
+            "safety_mode": personalization["safety"]["mode"],
+        } if personalization.get("profile") else None),
         "goals": [{"id": item["id"], "version": item["version"]} for item in personalization.get("goals") or []],
         "strategy": ({"id": personalization["strategy"]["id"], "version": personalization["strategy"]["version"]} if personalization.get("strategy") else None),
         "targets": [{
@@ -1136,14 +1169,17 @@ def daily_review_context(review_date: str, days: int = 14) -> dict:
             "policy_version": item["policy_version"], "source_kind": item["source_kind"],
         } for item in personalization.get("targets") or []],
         "feedback": [{"id": item["id"], "version": item["version"]} for item in execution_feedback],
+        "questions": [{
+            "id": item["id"], "key": item["question_key"], "version": item["version"], "status": item["status"],
+        } for item in planning_answers],
         "rules": [{
-            "id": item["id"], "updated_at": item["updated_at"],
+            "id": item["id"], "version": item["version"], "updated_at": item["updated_at"],
             "scope_policy_version": item.get("scope_policy_version") or "",
             "strategy_version_id": item.get("strategy_version_id"),
         } for item in adaptations["confirmed_rules"]],
         "inventory": [{"id": item["id"], "version": item["version"]} for item in inventory],
         "experiment": ({
-            "id": experiment["id"], "updated_at": experiment["updated_at"],
+            "id": experiment["id"], "version": experiment["version"], "updated_at": experiment["updated_at"],
             "scope_policy_version": experiment.get("scope_policy_version") or "",
         } if experiment else None),
         "doctrine": {
@@ -1154,6 +1190,7 @@ def daily_review_context(review_date: str, days: int = 14) -> dict:
         "context_schema_version": 2,
         "result_schema_version": 2,
         "validator_version": VALIDATOR_VERSION,
+        "planning_policy_version": PLANNING_POLICY_VERSION,
         "agent_run_id": None,
     }
     context = {
@@ -1189,6 +1226,7 @@ def daily_review_context(review_date: str, days: int = 14) -> dict:
         "transient_adaptations": adaptations["transient"],
         "inventory": inventory,
         "active_experiment": experiment,
+        "planning_answers": planning_answers,
         "source_manifest": source_manifest,
         "home_cooking_generation_protocol": [
             "早餐使用低摩擦组装，午餐给外食规则，只有晚餐生成新手菜谱。",
@@ -1240,6 +1278,9 @@ def complete_daily_review(
             review_date, _recent_review_rows_for_carryover(review_date)
         )
         _validate_ingredient_carryover_decisions(result, obligations)
+    from .planning import validate_and_enrich_daily_result
+
+    result = validate_and_enrich_daily_result(result, context)
     timestamp = now()
     next_version = review["result_version"] + 1
     menu = result.get("tomorrow_menu") or {}
@@ -1258,21 +1299,65 @@ def complete_daily_review(
                     f"{meal.get('name','meal')}|{normalized}".encode("utf-8")
                 ).hexdigest()[:12]
     safety_mode = (context.get("safety") or {}).get("mode") or "setup_required"
+    from .planning import MEAL_SLOTS
+
+    plan_version_id = new_id("plan_version")
+    plan_date = menu["date"]
+    committed_manifest = _source_manifest_for_commit(context, agent_run_id)
     with connect() as conn:
         updated = conn.execute(
             """UPDATE daily_reviews SET status='completed',result_json=?,result_version=result_version+1,
                schema_version=2,review_mode=?,source_manifest_json=?,context_hash=?,agent_run_id=?,
-               policy_version=?,validator_version=?,updated_at=?,completed_at=?
+               policy_version=?,validator_version=?,plan_version_id=?,updated_at=?,completed_at=?
                WHERE review_date=? AND status='pending'""",
             (
                 json.dumps(result, ensure_ascii=False), safety_mode,
                 json.dumps(_source_manifest_for_commit(context, agent_run_id), ensure_ascii=False, sort_keys=True), context["context_hash"],
                 agent_run_id, policy["policy_version"], VALIDATOR_VERSION,
-                timestamp, timestamp, review_date,
+                plan_version_id, timestamp, timestamp, review_date,
             ),
         )
         if updated.rowcount != 1:
             raise ValidationError("复盘状态已变化，请重新读取")
+        conn.execute(
+            "UPDATE plan_versions SET status='superseded' WHERE plan_date=? AND status='published'",
+            (plan_date,),
+        )
+        conn.execute(
+            """INSERT INTO plan_versions(
+                   id,review_id,result_version,plan_date,status,schema_version,menu_json,
+                   source_manifest_json,context_hash,policy_version,validator_version,agent_run_id,created_at
+               ) VALUES(?,?,?,?,'published',2,?,?,?,?,?,?,?)""",
+            (
+                plan_version_id,
+                review["id"],
+                next_version,
+                plan_date,
+                json.dumps(menu, ensure_ascii=False),
+                json.dumps(committed_manifest, ensure_ascii=False, sort_keys=True),
+                context["context_hash"],
+                policy["policy_version"],
+                VALIDATOR_VERSION,
+                agent_run_id,
+                timestamp,
+            ),
+        )
+        for sort_order, meal in enumerate(menu.get("meals") or []):
+            conn.execute(
+                """INSERT INTO plan_items(
+                       id,plan_version_id,meal_slot,name,strategy_key,item_json,sort_order,created_at
+                   ) VALUES(?,?,?,?,?,?,?,?)""",
+                (
+                    meal["plan_item_id"],
+                    plan_version_id,
+                    MEAL_SLOTS.get(meal.get("name"), "other"),
+                    meal.get("name") or "未命名餐次",
+                    meal.get("strategy_key") or "",
+                    json.dumps(meal, ensure_ascii=False),
+                    sort_order,
+                    timestamp,
+                ),
+            )
     return get_daily_review(review_date)
 
 
@@ -1293,6 +1378,141 @@ def generate_daily_review(review_date: str, client=None) -> dict:
             result,
             provenance_context=context,
             agent_run_id=run_id,
+        )
+    except Exception as exc:
+        _finish_agent_run(run_id, error=exc)
+        raise
+    _finish_agent_run(run_id, result=result)
+    return completed
+
+
+def submit_daily_review(review_date: str, result: dict) -> dict:
+    context = daily_review_context(review_date)
+    run_id = _start_agent_run(
+        "daily", context, identity=("external_agent", "structured_json_submission")
+    )
+    try:
+        completed = complete_daily_review(
+            review_date, result, provenance_context=context, agent_run_id=run_id
+        )
+    except Exception as exc:
+        _finish_agent_run(run_id, error=exc)
+        raise
+    _finish_agent_run(run_id, result=result)
+    return completed
+
+
+def rescue_context(rescue_id: str) -> dict:
+    from . import adaptive
+    from .personalization import active_personalization, require_generation
+    from .planning import PLANNING_POLICY_VERSION, compile_constraints
+
+    policy = require_generation("rescue")
+    session = adaptive.get_rescue_session(rescue_id)
+    plan = adaptive.get_plan_for_date(session["plan_date"])
+    if not plan:
+        raise ValidationError("救场对应的正式计划不存在")
+    plan_item = next(
+        (item for item in plan["menu"]["meals"] if item["plan_item_id"] == session["plan_item_id"]),
+        None,
+    )
+    if not plan_item:
+        raise ValidationError("救场对应的计划项目不存在")
+    personalization = active_personalization()
+    adaptations = adaptive.active_adaptations(session["plan_date"])
+    inventory = adaptive.list_inventory()
+    doctrine = load_doctrine()
+    context = {
+        "context_schema_version": 2,
+        "result_schema_version": 2,
+        "generation_policy": policy,
+        "doctrine": doctrine,
+        "rescue_session": session,
+        "plan": plan,
+        "plan_item": plan_item,
+        "settings": load_resolved_settings(),
+        "safety": personalization["safety"],
+        "active_profile": personalization.get("profile"),
+        "current_goals": personalization.get("goals") or [],
+        "active_strategy": personalization.get("strategy"),
+        "active_targets": personalization.get("targets") or [],
+        "confirmed_rules": adaptations["confirmed_rules"],
+        "inventory": inventory,
+        "result_schema": {
+            "reason": "string",
+            "steps": ["string"],
+            "replacement_foods": ["string"],
+            "portion_change": "string",
+            "safety_notes": ["string"],
+        },
+    }
+    context["compiled_constraints"] = compile_constraints(context)
+    context["source_manifest"] = {
+        "rescue_session": {"id": session["id"], "plan_item_id": session["plan_item_id"]},
+        "plan": {
+            "plan_version_id": plan.get("plan_version_id"),
+            "review_id": plan["review_id"],
+            "result_version": plan["result_version"],
+            "context_hash": plan.get("context_hash") or "",
+        },
+        "profile": ({
+            "id": personalization["profile"]["id"],
+            "version": personalization["profile"]["version"],
+            "safety_mode": personalization["safety"]["mode"],
+        } if personalization.get("profile") else None),
+        "goals": [{"id": item["id"], "version": item["version"]} for item in personalization.get("goals") or []],
+        "strategy": ({"id": personalization["strategy"]["id"], "version": personalization["strategy"]["version"]} if personalization.get("strategy") else None),
+        "targets": [{"id": item["id"], "key": item["target_key"], "version": item["version"]} for item in personalization.get("targets") or []],
+        "rules": [{"id": item["id"], "version": item["version"], "updated_at": item["updated_at"]} for item in adaptations["confirmed_rules"]],
+        "inventory": [{"id": item["id"], "version": item["version"]} for item in inventory],
+        "doctrine": {
+            "mode": doctrine["mode"],
+            "sha256": hashlib.sha256(doctrine["content"].encode("utf-8")).hexdigest(),
+        },
+        "policy_version": policy["policy_version"],
+        "planning_policy_version": PLANNING_POLICY_VERSION,
+        "context_schema_version": 2,
+        "result_schema_version": 2,
+        "validator_version": VALIDATOR_VERSION,
+        "agent_run_id": None,
+    }
+    context["context_hash"] = hashlib.sha256(
+        json.dumps(context, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()
+    return context
+
+
+def generate_rescue(rescue_id: str, client=None) -> dict:
+    from . import adaptive
+    from .ai import generate_json
+
+    context = rescue_context(rescue_id)
+    run_id = _start_agent_run("rescue", context, client)
+    try:
+        result = generate_json(context, "rescue", client)
+        completed = adaptive.complete_rescue_session(
+            rescue_id,
+            result,
+            provenance_context=context,
+            agent_run_id=run_id,
+        )
+    except Exception as exc:
+        _finish_agent_run(run_id, error=exc)
+        raise
+    _finish_agent_run(run_id, result=result)
+    return completed
+
+
+def submit_rescue_result(rescue_id: str, result: dict) -> dict:
+    from . import adaptive
+
+    context = rescue_context(rescue_id)
+    run_id = _start_agent_run(
+        "rescue", context, identity=("external_agent", "structured_json_submission")
+    )
+    try:
+        completed = adaptive.complete_rescue_session(
+            rescue_id, result, provenance_context=context, agent_run_id=run_id
         )
     except Exception as exc:
         _finish_agent_run(run_id, error=exc)
@@ -1561,7 +1781,7 @@ def task_context(task_id: str, days: int = 14) -> dict:
         "goals": [{"id": item["id"], "version": item["version"]} for item in personalization.get("goals") or []],
         "strategy": ({"id": personalization["strategy"]["id"], "version": personalization["strategy"]["version"]} if personalization.get("strategy") else None),
         "targets": [{"id": item["id"], "key": item["target_key"], "version": item["version"]} for item in personalization.get("targets") or []],
-        "rules": [{"id": item["id"], "updated_at": item["updated_at"]} for item in adaptations["confirmed_rules"]],
+        "rules": [{"id": item["id"], "version": item["version"], "updated_at": item["updated_at"]} for item in adaptations["confirmed_rules"]],
         "inventory": [{"id": item["id"], "version": item["version"]} for item in inventory],
         "doctrine": {
             "mode": doctrine["mode"],

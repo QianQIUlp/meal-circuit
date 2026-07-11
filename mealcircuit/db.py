@@ -14,6 +14,8 @@ from .storage import ROOT, backups_root, db_path
 MIGRATIONS = {
     1: "adaptive closed-loop domain tables and review provenance",
     2: "safety policy, target provenance, scoped learning, and append-only feedback",
+    3: "published plan projections and constrained rescue provenance",
+    4: "versioned rule and experiment provenance",
 }
 CURRENT_SCHEMA_VERSION = max(MIGRATIONS)
 
@@ -353,6 +355,32 @@ def init_db(path: Path | None = None) -> None:
                 updated_at TEXT NOT NULL,
                 UNIQUE(review_id, result_version, plan_item_id)
             );
+            CREATE TABLE IF NOT EXISTS plan_versions (
+                id TEXT PRIMARY KEY,
+                review_id TEXT NOT NULL REFERENCES daily_reviews(id),
+                result_version INTEGER NOT NULL,
+                plan_date TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'published' CHECK (status IN ('published','superseded')),
+                schema_version INTEGER NOT NULL DEFAULT 2,
+                menu_json TEXT NOT NULL,
+                source_manifest_json TEXT NOT NULL DEFAULT '{}',
+                context_hash TEXT NOT NULL DEFAULT '',
+                policy_version TEXT NOT NULL DEFAULT '',
+                validator_version TEXT NOT NULL DEFAULT '',
+                agent_run_id TEXT,
+                created_at TEXT NOT NULL,
+                UNIQUE(review_id, result_version)
+            );
+            CREATE TABLE IF NOT EXISTS plan_items (
+                id TEXT PRIMARY KEY,
+                plan_version_id TEXT NOT NULL REFERENCES plan_versions(id),
+                meal_slot TEXT NOT NULL CHECK (meal_slot IN ('breakfast','lunch','dinner','snack','other')),
+                name TEXT NOT NULL,
+                strategy_key TEXT NOT NULL DEFAULT '',
+                item_json TEXT NOT NULL,
+                sort_order INTEGER NOT NULL,
+                created_at TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS plan_execution_feedback_events (
                 id TEXT PRIMARY KEY,
                 feedback_id TEXT NOT NULL REFERENCES plan_execution_feedback(id),
@@ -371,8 +399,12 @@ def init_db(path: Path | None = None) -> None:
                     CHECK (status IN ('pending','answered','skipped','expired')),
                 answer_json TEXT,
                 priority INTEGER NOT NULL DEFAULT 0,
+                prompt TEXT NOT NULL DEFAULT '',
                 reason TEXT NOT NULL DEFAULT '',
                 expected_impact TEXT NOT NULL DEFAULT '',
+                question_schema_json TEXT NOT NULL DEFAULT '{}',
+                subject_json TEXT NOT NULL DEFAULT '{}',
+                cooldown_key TEXT NOT NULL DEFAULT '',
                 version INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
@@ -439,6 +471,7 @@ def init_db(path: Path | None = None) -> None:
                 safety_mode TEXT NOT NULL DEFAULT 'setup_required',
                 scope_policy_version TEXT NOT NULL DEFAULT '',
                 status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','inactive','expired')),
+                version INTEGER NOT NULL DEFAULT 1,
                 expires_on TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
@@ -457,6 +490,7 @@ def init_db(path: Path | None = None) -> None:
                 strategy_version_id TEXT,
                 safety_mode TEXT NOT NULL DEFAULT 'setup_required',
                 scope_policy_version TEXT NOT NULL DEFAULT '',
+                version INTEGER NOT NULL DEFAULT 1,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
@@ -464,11 +498,17 @@ def init_db(path: Path | None = None) -> None:
                 id TEXT PRIMARY KEY,
                 review_id TEXT NOT NULL REFERENCES daily_reviews(id),
                 result_version INTEGER NOT NULL,
+                plan_date TEXT NOT NULL DEFAULT '',
                 plan_item_id TEXT NOT NULL,
                 issue_code TEXT NOT NULL,
                 input_text TEXT NOT NULL DEFAULT '',
                 status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','completed')),
                 result_json TEXT,
+                source_manifest_json TEXT NOT NULL DEFAULT '{}',
+                context_hash TEXT NOT NULL DEFAULT '',
+                agent_run_id TEXT,
+                policy_version TEXT NOT NULL DEFAULT '',
+                validator_version TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 completed_at TEXT
@@ -508,6 +548,8 @@ def init_db(path: Path | None = None) -> None:
             CREATE INDEX IF NOT EXISTS idx_metric_date ON metric_observations(metric_key, observed_date);
             CREATE INDEX IF NOT EXISTS idx_task_evidence_date ON task_evidence_links(observed_date, role);
             CREATE INDEX IF NOT EXISTS idx_feedback_plan_date ON plan_execution_feedback(plan_date, status);
+            CREATE INDEX IF NOT EXISTS idx_plan_date ON plan_versions(plan_date, status, created_at);
+            CREATE INDEX IF NOT EXISTS idx_plan_items ON plan_items(plan_version_id, sort_order);
             CREATE INDEX IF NOT EXISTS idx_feedback_events ON plan_execution_feedback_events(feedback_id, event_version);
             CREATE INDEX IF NOT EXISTS idx_question_date ON question_events(question_date, status, priority);
             CREATE INDEX IF NOT EXISTS idx_inventory_status ON inventory_items(status, updated_at);
@@ -603,6 +645,7 @@ def init_db(path: Path | None = None) -> None:
                 "strategy_version_id": "TEXT",
                 "safety_mode": "TEXT NOT NULL DEFAULT 'setup_required'",
                 "scope_policy_version": "TEXT NOT NULL DEFAULT ''",
+                "version": "INTEGER NOT NULL DEFAULT 1",
             },
             "adaptive_experiments": {
                 "goal_version_ids_json": "TEXT NOT NULL DEFAULT '[]'",
@@ -610,6 +653,7 @@ def init_db(path: Path | None = None) -> None:
                 "strategy_version_id": "TEXT",
                 "safety_mode": "TEXT NOT NULL DEFAULT 'setup_required'",
                 "scope_policy_version": "TEXT NOT NULL DEFAULT ''",
+                "version": "INTEGER NOT NULL DEFAULT 1",
             },
             "agent_runs": {
                 "policy_version": "TEXT NOT NULL DEFAULT ''",
@@ -629,6 +673,7 @@ def init_db(path: Path | None = None) -> None:
             "agent_run_id": "TEXT",
             "policy_version": "TEXT NOT NULL DEFAULT ''",
             "validator_version": "TEXT NOT NULL DEFAULT ''",
+            "plan_version_id": "TEXT",
         }
         for name, definition in review_provenance.items():
             if name not in review_columns:
@@ -637,6 +682,28 @@ def init_db(path: Path | None = None) -> None:
         for name, definition in review_provenance.items():
             if name not in history_columns:
                 conn.execute(f"ALTER TABLE daily_review_history ADD COLUMN {name} {definition}")
+        rescue_columns = {row["name"] for row in conn.execute("PRAGMA table_info(rescue_sessions)")}
+        rescue_provenance = {
+            "plan_date": "TEXT NOT NULL DEFAULT ''",
+            "source_manifest_json": "TEXT NOT NULL DEFAULT '{}'",
+            "context_hash": "TEXT NOT NULL DEFAULT ''",
+            "agent_run_id": "TEXT",
+            "policy_version": "TEXT NOT NULL DEFAULT ''",
+            "validator_version": "TEXT NOT NULL DEFAULT ''",
+        }
+        for name, definition in rescue_provenance.items():
+            if name not in rescue_columns:
+                conn.execute(f"ALTER TABLE rescue_sessions ADD COLUMN {name} {definition}")
+        question_columns = {row["name"] for row in conn.execute("PRAGMA table_info(question_events)")}
+        question_metadata = {
+            "prompt": "TEXT NOT NULL DEFAULT ''",
+            "question_schema_json": "TEXT NOT NULL DEFAULT '{}'",
+            "subject_json": "TEXT NOT NULL DEFAULT '{}'",
+            "cooldown_key": "TEXT NOT NULL DEFAULT ''",
+        }
+        for name, definition in question_metadata.items():
+            if name not in question_columns:
+                conn.execute(f"ALTER TABLE question_events ADD COLUMN {name} {definition}")
         timestamp = "1970-01-01T00:00:00+00:00"
         for sort_order, module_key in enumerate(("weight", "training", "hunger", "sleep", "gut")):
             conn.execute(
@@ -676,10 +743,10 @@ def row_dict(row: sqlite3.Row | None) -> dict | None:
         "source_checkin_versions_json", "answers_json", "draft_json", "profile_json",
         "goal_json", "goal_version_ids_json", "strategy_json", "value_json",
         "source_detail_json", "applicability_json",
-        "reason_codes_json", "outcome_json", "answer_json", "payload_json",
+        "reason_codes_json", "outcome_json", "answer_json", "payload_json", "question_schema_json", "subject_json",
         "planned_snapshot_json",
         "scope_json", "evidence_summary_json", "proposed_effect_json", "effect_json",
-        "plan_json", "usage_json", "source_manifest_json", "validation_attempts_json",
+        "plan_json", "menu_json", "item_json", "usage_json", "source_manifest_json", "validation_attempts_json",
     ):
         if key in result and result[key]:
             result[key] = json.loads(result[key])

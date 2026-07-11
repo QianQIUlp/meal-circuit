@@ -192,6 +192,50 @@ def _legacy_prefill() -> dict:
     return result
 
 
+def _active_prefill() -> dict | None:
+    with connect() as conn:
+        profile_row = row_dict(conn.execute(
+            "SELECT * FROM profile_versions WHERE active=1 ORDER BY version DESC LIMIT 1"
+        ).fetchone())
+        if not profile_row:
+            return None
+        goal_rows = [row_dict(row) for row in conn.execute(
+            "SELECT * FROM goal_versions WHERE active=1 ORDER BY created_at,id"
+        ).fetchall()]
+    profile = profile_row["profile_json"]
+    goal_rows.sort(key=lambda item: item["goal_json"].get("priority", 99))
+    primary = goal_rows[0]["goal_json"] if goal_rows else {}
+    secondary = [item["goal_json"]["type"] for item in goal_rows[1:]]
+    safety = {
+        "life_stage": profile.get("life_stage", "adult"),
+        **{flag: bool(profile.get(flag)) for flag in OBSERVATION_FLAGS},
+        "professional_guidance": profile.get("professional_guidance") or _professional_guidance(None),
+    }
+    return {
+        **_legacy_prefill(),
+        "welcome": {"privacy_ack": True},
+        "goals": {
+            "primary_goal": primary.get("type", "general_wellbeing"),
+            "secondary_goals": secondary,
+            "motivation": primary.get("motivation", ""),
+            "success_metrics": primary.get("success_metrics") or ["execution_rate"],
+            "target_weight_kg": primary.get("target_weight_kg"),
+            "horizon": primary.get("horizon", ""),
+        },
+        "baseline": {
+            "age_years": profile.get("age_years"),
+            "height_cm": profile.get("height_cm"),
+            "weight_kg": profile.get("weight_kg"),
+            "physiological_input": profile.get("physiological_input", "unspecified"),
+            "activity_level": profile.get("activity_level", "moderate"),
+        },
+        "safety": safety,
+        "training": profile.get("training") or {"types": [], "frequency_per_week": 0},
+        "constraints": profile.get("constraints") or {},
+        "legacy_profile_notes": profile.get("legacy_profile_notes", ""),
+    }
+
+
 def onboarding_status() -> dict:
     init_db()
     with connect() as conn:
@@ -221,11 +265,12 @@ def start_onboarding() -> dict:
             return row_dict(existing)
         timestamp = _now()
         session_id = _id("onboarding")
+        prefill = _active_prefill() or _legacy_prefill()
         conn.execute(
             """INSERT INTO onboarding_sessions(
                    id,status,current_step,answers_json,version,created_at,updated_at
                ) VALUES(?,?,?,?,?,?,?)""",
-            (session_id, "in_progress", "welcome", json.dumps(_legacy_prefill(), ensure_ascii=False), 0, timestamp, timestamp),
+            (session_id, "in_progress", "welcome", json.dumps(prefill, ensure_ascii=False), 0, timestamp, timestamp),
         )
     return get_onboarding(session_id)
 
@@ -243,6 +288,7 @@ def save_onboarding_step(session_id: str, step: str, payload: dict, expected_ver
     if step not in ONBOARDING_STEPS:
         raise ValidationError("未知的初始化步骤")
     payload = _object(payload, "初始化答案")
+    _validate_onboarding_step(step, payload)
     timestamp = _now()
     with connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
@@ -263,6 +309,42 @@ def save_onboarding_step(session_id: str, step: str, payload: dict, expected_ver
         if updated.rowcount != 1:
             raise ValidationError("初始化状态已变化，请刷新后重试")
     return get_onboarding(session_id)
+
+
+def _validate_onboarding_step(step: str, payload: dict) -> None:
+    if step == "welcome":
+        if payload.get("privacy_ack") is not True:
+            raise ValidationError("必须确认本地存储与模型发送边界")
+    elif step == "goals":
+        _validate_goals({"goals": payload})
+    elif step == "baseline":
+        _number(payload.get("age_years"), "年龄", minimum=13, maximum=120)
+        _number(payload.get("height_cm"), "身高", minimum=100, maximum=250, required=False)
+        _number(payload.get("weight_kg"), "体重", minimum=20, maximum=400, required=False)
+        physiological = _text(payload.get("physiological_input", "unspecified"), "能量估算生理参数", maximum=20)
+        activity = _text(payload.get("activity_level", "moderate"), "活动水平", maximum=20)
+        if physiological not in PHYSIOLOGICAL_INPUTS or activity not in ACTIVITY_LEVELS:
+            raise ValidationError("基线选项无效")
+    elif step == "safety":
+        life_stage = _text(payload.get("life_stage"), "生命阶段", maximum=30)
+        if life_stage not in LIFE_STAGES:
+            raise ValidationError("生命阶段无效")
+        missing = [flag for flag in OBSERVATION_FLAGS if flag not in payload]
+        if missing:
+            raise ValidationError(f"安全步骤缺少明确回答：{missing}")
+        for flag in OBSERVATION_FLAGS:
+            _bool(payload[flag], flag)
+        _professional_guidance(payload.get("professional_guidance"))
+    elif step == "training":
+        _text_list(payload.get("types"), "训练类型", allowed={"strength", "cardio", "sport", "mobility", "other"})
+        _number(payload.get("frequency_per_week", 0), "每周训练次数", minimum=0, maximum=14)
+    elif step == "constraints":
+        _text(payload.get("meal_environment"), "用餐环境", maximum=300)
+        _text(payload.get("portion_method"), "份量表达", maximum=200)
+        _number(payload.get("cooking_time_minutes", 25), "做饭时间", minimum=0, maximum=180)
+        _number(payload.get("question_budget", 2), "每日问题预算", minimum=0, maximum=5)
+        for name in ("equipment", "food_exclusions", "preferences"):
+            _text_list(payload.get(name), name)
 
 
 def _validate_profile(answers: dict) -> dict:
@@ -345,6 +427,10 @@ def _validate_goals(answers: dict) -> list[dict]:
     if not metrics:
         raise ValidationError("请至少选择一项成功指标")
     target_weight = _number(payload.get("target_weight_kg"), "目标体重", minimum=20, maximum=400, required=False)
+    custom_label = _text(
+        payload.get("custom_goal_text", ""), "自定义目标",
+        required=primary == "custom", maximum=300,
+    )
     result = [{
         "key": "primary",
         "type": primary,
@@ -353,6 +439,7 @@ def _validate_goals(answers: dict) -> list[dict]:
         "success_metrics": metrics,
         "target_weight_kg": target_weight,
         "horizon": _text(payload.get("horizon", ""), "目标周期", required=False, maximum=100),
+        "custom_label": custom_label,
     }]
     for index, goal_type in enumerate(secondary, start=2):
         result.append({"key": f"secondary_{index - 1}", "type": goal_type, "priority": index, "success_metrics": metrics})
@@ -376,7 +463,11 @@ def safety_assessment(profile: dict) -> dict:
     else:
         mode = "standard"
     guidance = profile.get("professional_guidance") or {}
-    guidance_current = bool(guidance.get("confirmed"))
+    guidance_current = bool(
+        guidance.get("confirmed")
+        and guidance.get("confirmed_on")
+        and guidance["confirmed_on"] <= date.today().isoformat()
+    )
     if guidance.get("valid_until") and guidance["valid_until"] < date.today().isoformat():
         guidance_current = False
     return {
@@ -493,12 +584,33 @@ def onboarding_preview(session_id: str) -> dict:
     session = get_onboarding(session_id)
     profile = _validate_profile(session["answers_json"])
     goals = _validate_goals(session["answers_json"])
+    safety = safety_assessment(profile)
+    assessment = target_assessment(profile, goals)
+    legacy_target = (session["answers_json"].get("legacy_settings") or {}).get("protein_target_g")
+    if safety["mode"] == "standard" and not assessment["protein_candidates"] and legacy_target is not None:
+        try:
+            clean_legacy_target = _target_range(legacy_target, "旧蛋白目标")
+        except ValidationError:
+            clean_legacy_target = None
+        if clean_legacy_target:
+            assessment["protein_candidates"].append({
+                "candidate_id": "protein_legacy_setting",
+                "reference": "legacy_setting",
+                "reference_weight_kg": None,
+                "target_g": clean_legacy_target,
+                "factor_g_per_kg": None,
+                "basis": "迁移前私人设置中的蛋白目标；需在本次目标契约中重新确认",
+                "source_kind": "user_confirmed_legacy_setting",
+                "method": "legacy_private_setting",
+                "applicability": "standard_mode_user_confirmed_legacy_setting",
+                "policy_version": TARGET_POLICY_VERSION,
+            })
     return {
         "session_id": session_id,
         "profile": profile,
         "goals": goals,
-        "safety": safety_assessment(profile),
-        "target_assessment": target_assessment(profile, goals),
+        "safety": safety,
+        "target_assessment": assessment,
     }
 
 
@@ -543,7 +655,11 @@ def _protein_target_selection(
         else:
             raise ValidationError("请选择蛋白目标参考体重")
         return [float(value) for value in selected["target_g"]], {
-            "source_kind": "user_confirmed_suggestion",
+            "source_kind": (
+                "user_confirmed_legacy_setting"
+                if selected.get("method") == "legacy_private_setting"
+                else "user_confirmed_suggestion"
+            ),
             "method": selected["method"],
             "source_detail": {
                 "candidate_id": selected["candidate_id"],
@@ -840,6 +956,8 @@ def resolved_settings(legacy_settings: dict) -> dict:
     }
     for key, strategy_value in mappings.items():
         if strategy_value is None:
+            if key == "protein_target_g":
+                resolved[key] = None
             continue
         if key in snapshot and legacy_settings.get(key) != snapshot.get(key):
             conflicts.append({
@@ -850,8 +968,6 @@ def resolved_settings(legacy_settings: dict) -> dict:
             })
             continue
         resolved[key] = strategy_value
-    if current["safety"]["mode"] != "standard" and protein_target is None:
-        resolved["protein_target_g"] = None
     resolved["sources"] = {
         "base": "settings.json",
         "strategy": {"id": strategy_row["id"], "version": strategy_row["version"], "policy_version": strategy_row["policy_version"]},

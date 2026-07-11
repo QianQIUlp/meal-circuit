@@ -3,14 +3,16 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import subprocess
+import sys
 import tempfile
 import unittest
 from contextlib import closing
 from datetime import date, timedelta
 from pathlib import Path
 
-from mealcircuit import adaptive, personalization, service
-from mealcircuit.configuration import load_resolved_settings
+from mealcircuit import adaptive, personalization, portability, service
+from mealcircuit.configuration import initialize_private_home, load_resolved_settings
 from mealcircuit.db import CURRENT_SCHEMA_VERSION, connect, init_db, row_dict
 from mealcircuit.validation import ValidationError
 
@@ -172,6 +174,24 @@ class AdaptiveDomainTest(unittest.TestCase):
             self.assertEqual("kept", conn.execute("SELECT value FROM legacy_marker").fetchone()[0])
             self.assertEqual("ok", conn.execute("PRAGMA integrity_check").fetchone()[0])
 
+    def test_v3_database_migrates_rule_and_experiment_versions_without_data_loss(self):
+        legacy = self.home / "legacy-v3.db"
+        init_db(legacy)
+        with closing(sqlite3.connect(legacy)) as conn:
+            conn.execute("ALTER TABLE adaptive_rules DROP COLUMN version")
+            conn.execute("ALTER TABLE adaptive_experiments DROP COLUMN version")
+            conn.execute("DELETE FROM schema_migrations WHERE version=4")
+            conn.commit()
+        init_db(legacy)
+        with closing(sqlite3.connect(legacy)) as conn:
+            rule_columns = {row[1] for row in conn.execute("PRAGMA table_info(adaptive_rules)")}
+            experiment_columns = {row[1] for row in conn.execute("PRAGMA table_info(adaptive_experiments)")}
+            schema_version = conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0]
+        self.assertIn("version", rule_columns)
+        self.assertIn("version", experiment_columns)
+        self.assertEqual(CURRENT_SCHEMA_VERSION, schema_version)
+        self.assertEqual(1, len(list((self.home / "backups").glob("pre-schema-v4-*.db"))))
+
     def test_standard_onboarding_creates_versioned_profile_goal_and_strategy(self):
         session = self._fill_session()
         preview = personalization.onboarding_preview(session["id"])
@@ -195,6 +215,33 @@ class AdaptiveDomainTest(unittest.TestCase):
         self.assertEqual([112, 160], resolved["protein_target_g"])
         self.assertEqual("工作日食堂，晚餐在家", resolved["meal_environment"])
         self.assertEqual(1, resolved["sources"]["strategy"]["version"])
+
+    def test_web_first_run_template_becomes_valid_after_onboarding(self):
+        (self.home / "settings.json").unlink()
+        initialized = initialize_private_home()
+        self.assertIn(str(self.home / "settings.json"), initialized["created"])
+        self._complete_standard_profile()
+        resolved = load_resolved_settings()
+        self.assertEqual([112.0, 160.0], resolved["protein_target_g"])
+        self.assertEqual("工作日食堂，晚餐在家", resolved["meal_environment"])
+
+        revision = personalization.start_onboarding()
+        baseline = dict(revision["answers_json"]["baseline"])
+        baseline.update({"height_cm": None, "weight_kg": None, "physiological_input": "unspecified"})
+        revision = personalization.save_onboarding_step(
+            revision["id"], "baseline", baseline, revision["version"]
+        )
+        personalization.complete_onboarding(
+            revision["id"], revision["version"],
+            {"accept_profile": True, "accept_strategy": True, "planning_mode": "portion_guided"},
+        )
+        self.assertIsNone(load_resolved_settings()["protein_target_g"])
+        service.add_daily_record("2026-07-10", "没有体重时仍使用份量法。")
+        result = _review_result("2026-07-10")
+        result["tomorrow_menu"]["protein_target_g"] = None
+        result["tomorrow_menu"]["environment"] = load_resolved_settings()["meal_environment"]
+        completed = service.submit_daily_review("2026-07-10", result)
+        self.assertIsNone(completed["result_json"]["tomorrow_menu"]["protein_target_g"])
 
     def test_observation_mode_never_creates_nutrition_targets(self):
         session = self._fill_session(pregnant=True)
@@ -223,6 +270,23 @@ class AdaptiveDomainTest(unittest.TestCase):
             {"accept_profile": True, "accept_strategy": True, "protein_target_g": [84, 120]},
         )
         self.assertEqual([84.0, 120.0], current["strategy"]["strategy_json"]["protein_target_g"])
+
+    def test_custom_goal_requires_the_users_own_outcome_text(self):
+        session = personalization.start_onboarding()
+        with self.assertRaisesRegex(ValidationError, "自定义目标"):
+            personalization.save_onboarding_step(session["id"], "goals", {
+                "primary_goal": "custom", "custom_goal_text": "", "secondary_goals": [],
+                "motivation": "轮班生活", "success_metrics": ["execution_rate"],
+            }, session["version"])
+        updated = personalization.save_onboarding_step(session["id"], "goals", {
+            "primary_goal": "custom", "custom_goal_text": "轮班期间稳定进食并保持白天精力",
+            "secondary_goals": [], "motivation": "降低轮班饮食摩擦",
+            "success_metrics": ["execution_rate", "energy_state"],
+        }, session["version"])
+        self.assertEqual(
+            "轮班期间稳定进食并保持白天精力",
+            personalization.get_onboarding(updated["id"])["answers_json"]["goals"]["custom_goal_text"],
+        )
 
     def test_onboarding_uses_optimistic_version_and_metric_history(self):
         session = personalization.start_onboarding()
@@ -320,6 +384,22 @@ class AdaptiveDomainTest(unittest.TestCase):
         self.assertEqual(["web", "cli"], [item["actor_source"] for item in history])
         self.assertEqual(2, second["version"])
 
+    def test_adaptive_feedback_question_updates_the_plan_event(self):
+        self._complete_standard_profile()
+        plan = self._publish_plan("2026-07-09")
+        questions = adaptive.schedule_questions(plan["plan_date"])
+        feedback_question = next(item for item in questions if item["category"] == "feedback")
+        answered = adaptive.answer_question(
+            feedback_question["id"],
+            {"status": "skipped", "reason_codes": ["schedule_change"], "actual_text": "临时加班"},
+            feedback_question["version"],
+        )
+        self.assertEqual("answered", answered["status"])
+        updated_plan = adaptive.get_plan_for_date(plan["plan_date"])
+        feedback = updated_plan["feedback"][feedback_question["subject_json"]["plan_item_id"]]
+        self.assertEqual("skipped", feedback["status"])
+        self.assertEqual("question", adaptive.plan_feedback_history(feedback["id"])[0]["actor_source"])
+
     def test_agent_run_and_task_source_manifest_are_persisted_without_key(self):
         self._complete_standard_profile()
         task = service.create_photo_task(
@@ -348,6 +428,93 @@ class AdaptiveDomainTest(unittest.TestCase):
         self.assertEqual("completed", run["status"])
         self.assertTrue(run["result_hash"])
         self.assertNotIn("api_key", json.dumps(run, ensure_ascii=False).lower())
+
+        manual = service.create_material_task("豆腐半盒")
+        submitted = service.submit_task_result(manual["id"], {
+            "summary": "可见原材料事实", "combinations": ["豆腐蔬菜"],
+            "batch_nutrition": _nutrition(), "per_serving_nutrition": _nutrition(),
+            "gaps": ["总量未知"], "risks": [], "minimal_adjustments": ["按实际份量调整"],
+        })
+        self.assertEqual(submitted["agent_run_id"], submitted["source_manifest_json"]["agent_run_id"])
+        with connect() as conn:
+            external = row_dict(conn.execute(
+                "SELECT * FROM agent_runs WHERE id=?", (submitted["agent_run_id"],)
+            ).fetchone())
+        self.assertEqual("external_agent", external["provider"])
+        self.assertEqual("completed", external["status"])
+
+    def test_portable_bundle_preview_and_restore_round_trip(self):
+        self._complete_standard_profile()
+        service.add_daily_record("2026-07-09", "导出前记录。")
+        adaptive.create_inventory_item("北豆腐", "半盒", expires_on="2026-07-12")
+        bundle = self.home / "exports" / "round-trip.zip"
+        exported = portability.export_bundle(bundle)
+        self.assertEqual(str(bundle), exported["path"])
+        preview = portability.preview_import(bundle)
+        self.assertEqual("ok", preview["database_integrity"])
+        self.assertGreaterEqual(preview["table_counts"]["daily_records"], 1)
+        service.add_daily_record("2026-07-10", "导出后临时记录。")
+        (self.home / "uploads").mkdir(exist_ok=True)
+        (self.home / "uploads" / "stale-after-export.png").write_bytes(b"stale")
+        changed_settings = {**SETTINGS, "meal_environment": "导出后临时环境"}
+        (self.home / "settings.json").write_text(
+            json.dumps(changed_settings, ensure_ascii=False), encoding="utf-8"
+        )
+        with self.assertRaisesRegex(ValidationError, "confirm=True"):
+            portability.restore_bundle(bundle)
+        restored = portability.restore_bundle(bundle, confirm=True)
+        self.assertTrue(restored["restored"])
+        self.assertTrue(Path(restored["pre_restore_backup"]).is_file())
+        self.assertEqual(".zip", Path(restored["pre_restore_backup"]).suffix)
+        self.assertEqual("ok", portability.preview_import(restored["pre_restore_backup"])["database_integrity"])
+        self.assertFalse((self.home / "uploads" / "stale-after-export.png").exists())
+        restored_settings = json.loads((self.home / "settings.json").read_text(encoding="utf-8"))
+        self.assertEqual("旧设置环境", restored_settings["meal_environment"])
+        with connect() as conn:
+            dates = [row[0] for row in conn.execute("SELECT record_date FROM daily_records ORDER BY record_date")]
+            inventory_count = conn.execute("SELECT COUNT(*) FROM inventory_items").fetchone()[0]
+        self.assertEqual(["2026-07-09"], dates)
+        self.assertEqual(1, inventory_count)
+
+    def test_closed_loop_cli_surfaces_plan_inventory_setup_and_export(self):
+        self._complete_standard_profile()
+        plan = self._publish_plan("2026-07-09")
+        adaptive.create_inventory_item("豆腐", "半盒")
+
+        def run(*arguments: str) -> dict:
+            completed = subprocess.run(
+                [sys.executable, "-m", "mealcircuit.agent_cli", *arguments],
+                cwd=Path(__file__).resolve().parents[1],
+                check=True,
+                capture_output=True,
+                text=True,
+                env=os.environ.copy(),
+            )
+            return json.loads(completed.stdout)
+
+        self.assertEqual("completed", run("setup", "status")["status"])
+        self.assertEqual(plan["plan_version_id"], run("plan", plan["plan_date"])["plan_version_id"])
+        self.assertEqual("豆腐", run("inventory", "list")[0]["name"])
+        bundle = self.home / "exports" / "cli.zip"
+        self.assertEqual(str(bundle), run("export-bundle", "--output", str(bundle))["path"])
+        self.assertEqual("ok", run("import-bundle", str(bundle))["database_integrity"])
+        experiment_file = self.home / "experiment.json"
+        experiment_file.write_text(json.dumps({
+            "action": "晚餐主动时间降到15分钟", "success_signal": "连续三次完成",
+        }, ensure_ascii=False), encoding="utf-8")
+        experiment = run(
+            "learning", "experiment-propose", "dinner_active_minutes", "--file", str(experiment_file)
+        )
+        active = run(
+            "learning", "experiment-start", experiment["id"], "2026-07-10", "--days", "5"
+        )
+        self.assertEqual("active", active["status"])
+        result_file = self.home / "experiment-result.json"
+        result_file.write_text(json.dumps({"summary": "执行完成"}, ensure_ascii=False), encoding="utf-8")
+        finished = run(
+            "learning", "experiment-finish", experiment["id"], "--file", str(result_file)
+        )
+        self.assertEqual("completed", finished["status"])
 
     def test_completed_task_evidence_enters_daily_context_and_requeues_on_correction(self):
         self._complete_standard_profile()
@@ -405,6 +572,28 @@ class AdaptiveDomainTest(unittest.TestCase):
         self.assertEqual("晚餐主动时间最多 15 分钟。", rules[0]["statement"])
         self.assertEqual([], adaptive.active_adaptations("2026-07-10")["transient"])
 
+        service.add_daily_record("2026-07-10", "验证确认规则进入下一份计划。")
+        constrained = _review_result("2026-07-10", "快速番茄鸡肉")
+        settings = load_resolved_settings()
+        constrained["tomorrow_menu"]["protein_target_g"] = settings["protein_target_g"]
+        constrained["tomorrow_menu"]["environment"] = settings["meal_environment"]
+        dinner = next(item for item in constrained["tomorrow_menu"]["meals"] if item["name"] == "晚餐")
+        dinner["execution"] = {"active_minutes": 20, "total_minutes": 25, "cookware": ["pan"]}
+        with self.assertRaisesRegex(ValidationError, "违反确认规则"):
+            service.complete_daily_review("2026-07-10", constrained)
+        dinner["execution"]["active_minutes"] = 15
+        completed = service.complete_daily_review("2026-07-10", constrained)
+        self.assertEqual(2, completed["result_json"]["result_schema_version"])
+        self.assertIn(rules[0]["id"], completed["result_json"]["decision_trace"]["confirmed_rule_ids"])
+        self.assertEqual(1, completed["source_manifest_json"]["rules"][0]["version"])
+        next_plan = adaptive.get_plan_for_date("2026-07-11")
+        self.assertTrue(next_plan["plan_version_id"])
+        with connect() as conn:
+            item_count = conn.execute(
+                "SELECT COUNT(*) FROM plan_items WHERE plan_version_id=?", (next_plan["plan_version_id"],)
+            ).fetchone()[0]
+        self.assertEqual(3, item_count)
+
     def test_repeated_success_creates_strategy_candidate(self):
         self._complete_standard_profile()
         for index, day in enumerate(("2026-07-05", "2026-07-06", "2026-07-07", "2026-07-08")):
@@ -434,7 +623,8 @@ class AdaptiveDomainTest(unittest.TestCase):
 
         questions = adaptive.schedule_questions("2026-07-10")
         self.assertEqual(2, len(questions))
-        answered = adaptive.answer_question(questions[0]["id"], {"value": "yes"}, questions[0]["version"])
+        answer_value = questions[0]["question_schema_json"]["options"][0]
+        answered = adaptive.answer_question(questions[0]["id"], answer_value, questions[0]["version"])
         self.assertEqual("answered", answered["status"])
 
         experiment = adaptive.propose_experiment("dinner_active_minutes", {
@@ -442,8 +632,13 @@ class AdaptiveDomainTest(unittest.TestCase):
         })
         active = adaptive.activate_experiment(experiment["id"], "2026-07-10", 5)
         self.assertEqual("2026-07-14", active["ends_on"])
+        self.assertEqual(2, active["version"])
+        service.add_daily_record("2026-07-10", "验证实验版本进入 source manifest。")
+        context = service.daily_review_context("2026-07-10")
+        self.assertEqual(2, context["source_manifest"]["experiment"]["version"])
         finished = adaptive.finish_experiment(active["id"], {"summary": "执行完成"})
         self.assertEqual("completed", finished["status"])
+        self.assertEqual(3, finished["version"])
         self.assertFalse(adaptive.calibration_snapshot("2026-07-10")["eligible_for_strategy_review"])
 
     def test_rescue_session_is_bound_to_published_plan(self):
@@ -454,8 +649,41 @@ class AdaptiveDomainTest(unittest.TestCase):
         )
         completed = adaptive.complete_rescue_session(rescue["id"], {
             "reason": "改用可直接加热的豆腐。", "steps": ["豆腐沥水", "按原调味完成"],
+            "replacement_foods": ["豆腐"], "portion_change": "保持原份量", "safety_notes": [],
         })
         self.assertEqual("completed", completed["status"])
+        self.assertEqual(2, completed["result_json"]["result_schema_version"])
+        self.assertTrue(completed["context_hash"])
+        self.assertTrue(completed["source_manifest_json"]["doctrine"]["sha256"])
+        updated_plan = adaptive.get_plan_for_date(plan["plan_date"])
+        feedback = updated_plan["feedback"][dinner["plan_item_id"]]
+        self.assertEqual("modified", feedback["status"])
+        self.assertEqual("rescue", adaptive.plan_feedback_history(feedback["id"])[0]["actor_source"])
+
+    def test_restricted_profile_hides_old_prescriptive_plan_but_keeps_factual_feedback_history(self):
+        plan = self._publish_plan("2026-07-10")
+        plan_item = plan["menu"]["meals"][0]
+        session = self._fill_session(safety_overrides={"therapeutic_diet": True})
+        current = personalization.complete_onboarding(
+            session["id"], session["version"], {"accept_profile": True}
+        )
+        self.assertEqual("clinician_guided", current["safety"]["mode"])
+        self.assertIsNone(adaptive.get_plan_for_date(plan["plan_date"]))
+        questions = adaptive.schedule_questions(plan["plan_date"])
+        self.assertEqual(["professional_guidance_review"], [item["question_key"] for item in questions])
+        self.assertNotIn("早餐", json.dumps(questions, ensure_ascii=False))
+        feedback = adaptive.save_plan_feedback(
+            plan["plan_date"], plan_item["plan_item_id"], "followed", actor_source="test"
+        )
+        self.assertEqual("followed", feedback["status"])
+        with self.assertRaisesRegex(ValidationError, "缺少仍有效的专业指导"):
+            adaptive.create_rescue_session(
+                plan["plan_date"], plan_item["plan_item_id"], "not_enough_time"
+            )
+        with self.assertRaisesRegex(ValidationError, "不能生成菜单、适应分析或救场建议"):
+            adaptive.propose_experiment("meal_timing", {
+                "action": "改变餐次时间", "success_signal": "观察完成",
+            })
 
 
 if __name__ == "__main__":
