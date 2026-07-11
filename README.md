@@ -61,7 +61,11 @@ All analysis results must pass JSON Schema-level structural validation before th
 
 | Entry | Problem it solves |
 | :--- | :--- |
-| **Today Overview** | Summarize today's state and review the core advice, risk signals, and next-day three-meal plan |
+| **Today** | Show the highest-value next action, published-plan progress, and low-frequency questions |
+| **Plan** | Execute a published plan, append revisable feedback, and start a constrained rescue when conditions change |
+| **Learning Review** | Confirm or reject evidence-backed candidate rules; candidates never become hard constraints silently |
+| **Inventory** | Track available, used, not-bought, discarded, and unknown states as events |
+| **Goals & Safety** | Revise versioned goals, safety mode, and target provenance; export or restore the workbench |
 | **Today Status** | Record weight, training, hunger/satiety, sleep, and gut response one question at a time, with drafts, skips, and version history |
 | **Meal Photos** | Upload real meals so an agent can estimate nutrition ranges from visible evidence and list unknowns |
 | **Ingredient Analysis** | Combine raw ingredients with user food-library data to judge usage, portions, and risks |
@@ -75,6 +79,8 @@ The daily menu always covers breakfast, lunch, dinner, a conditional snack, trai
 ## Agent Workflow
 
 Pending work is read from the CLI. Photos and raw ingredients use task context; daily reviews use date context.
+
+The adaptive loop is available in both Web and CLI. First use creates a resumable, versioned goal and safety contract. Published plan items receive stable IDs; actual execution is appended as versioned feedback. Repeated evidence can propose a rule scoped to the current goal, strategy, and safety mode, but only explicit user confirmation activates it. Restricted modes keep recording and fact-only analysis available while blocking prescriptive planning.
 
 ```powershell
 # 1. List pending photo, ingredient, and daily review work
@@ -98,6 +104,18 @@ python -m mealcircuit.agent_cli day-generate 2026-01-01
 
 # 3. Append a user-confirmed correction without overwriting the original result
 python -m mealcircuit.agent_cli correct <TASK_ID> --text "User-confirmed correction"
+
+# Adaptive loop and portable backup
+python -m mealcircuit.agent_cli setup status
+python -m mealcircuit.agent_cli plan 2026-01-02
+python -m mealcircuit.agent_cli questions list 2026-01-02
+python -m mealcircuit.agent_cli learning list
+python -m mealcircuit.agent_cli inventory list
+python -m mealcircuit.agent_cli calibration
+# Experiment JSON: {"action":"...","success_signal":"..."}
+python -m mealcircuit.agent_cli learning experiment-propose dinner_active_minutes --file experiment.json
+python -m mealcircuit.agent_cli export-bundle --output mealcircuit-backup.zip
+python -m mealcircuit.agent_cli import-bundle mealcircuit-backup.zip
 ```
 
 Agents should strictly follow `doctrine.content` and `result_schema` in the exported context. Daily reviews must also read `target_checkin`, `checkin_coverage`, and `recent_checkins`; drafts are not exported, and skips or missing answers remain unknown. Photo analysis uses nutrition ranges; any range that cannot be judged is `null`, and invisible details go into `unknowns`.
@@ -195,7 +213,7 @@ python -m mealcircuit.agent_cli doctor
 .\start.ps1
 ```
 
-打开 [http://127.0.0.1:8765](http://127.0.0.1:8765)。首次初始化后，按 `doctor` 显示的位置填写私人 `profile.md` 与 `settings.json`；停止服务使用 `Ctrl+C`。
+打开 [http://127.0.0.1:8765](http://127.0.0.1:8765)。首次使用会进入可恢复的目标与安全初始化；原有记录入口不会因初始化门禁消失。`doctor` 仍可查看私人数据位置；停止服务使用 `Ctrl+C`。
 
 ## 它如何工作
 
@@ -215,7 +233,11 @@ flowchart LR
 
 | 入口 | 解决的问题 |
 | :--- | :--- |
-| **今日总览** | 汇总当天状态，查看核心建议、风险信号与次日三餐菜单 |
+| **今天** | 只显示当前最有价值的下一步、正式计划进度和低频问题 |
+| **计划** | 执行已发布计划、追加可修订回执，并在现实条件变化时进入救场 |
+| **学习确认** | 查看重复证据提出的候选规则；未确认候选不会进入硬约束 |
+| **库存** | 保存可用、用完、未购买、丢弃和未知状态及其事件历史 |
+| **目标与边界** | 修订带版本的目标、安全模式和营养目标来源，并导出或恢复完整工作台 |
 | **今日状态** | 通过逐题卡片记录体重、训练、饥饿饱腹、睡眠和肠胃反应；支持草稿、跳过和版本历史 |
 | **食物照片** | 上传真实餐食，由 Agent 按可见证据估算营养区间并列出未知项 |
 | **原材料分析** | 结合食品库中的用户数据，判断食材用途、份量与风险 |
@@ -229,6 +251,8 @@ flowchart LR
 ## Agent 工作流
 
 待办统一从 CLI 读取。照片与原材料使用任务上下文；每日复盘使用日期上下文。
+
+自适应闭环同时提供 Web 与 CLI。首次使用建立可恢复、带版本的目标与安全契约；正式计划中的餐次具有稳定 ID，真实执行以可追溯事件追加。重复证据只会产生绑定当前目标、策略和安全模式的候选规则，必须由用户确认后才成为正式约束。受限安全模式继续允许记录和事实型分析，但禁止泄漏或继续执行旧处方计划。
 
 ```powershell
 # 1. 查看照片、原材料与每日复盘待办
@@ -252,6 +276,18 @@ python -m mealcircuit.agent_cli day-generate 2026-01-01
 
 # 3. 追加用户确认的更正，不覆盖原始结果
 python -m mealcircuit.agent_cli correct <任务ID> --text "用户确认的更正"
+
+# 自适应回路与可迁移备份
+python -m mealcircuit.agent_cli setup status
+python -m mealcircuit.agent_cli plan 2026-01-02
+python -m mealcircuit.agent_cli questions list 2026-01-02
+python -m mealcircuit.agent_cli learning list
+python -m mealcircuit.agent_cli inventory list
+python -m mealcircuit.agent_cli calibration
+# 实验 JSON：{"action":"...","success_signal":"..."}
+python -m mealcircuit.agent_cli learning experiment-propose dinner_active_minutes --file experiment.json
+python -m mealcircuit.agent_cli export-bundle --output mealcircuit-backup.zip
+python -m mealcircuit.agent_cli import-bundle mealcircuit-backup.zip
 ```
 
 Agent 应严格遵循上下文中的 `doctrine.content` 与 `result_schema`。每日复盘还必须读取 `target_checkin`、`checkin_coverage` 和 `recent_checkins`；草稿不会被导出，跳过与缺失保持未知。照片分析使用营养区间；无法判断的区间为 `null`，不可见信息进入 `unknowns`。

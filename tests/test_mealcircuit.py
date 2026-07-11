@@ -15,7 +15,7 @@ from contextlib import redirect_stderr
 from datetime import date, timedelta
 from pathlib import Path
 
-from mealcircuit import ai, checkins, personalization, service
+from mealcircuit import adaptive, ai, checkins, personalization, service
 from mealcircuit import storage
 from mealcircuit.configuration import configuration_status, initialize_private_home
 from mealcircuit.db import init_db
@@ -927,6 +927,7 @@ class WebAppTest(unittest.TestCase):
         self.assertIn('rel="icon" href="/assets/ui/favicon.svg"', decoded_home)
         self.assertIn('src="/assets/ui/theme-init.js?v=', decoded_home)
         self.assertIn('data-theme-toggle', decoded_home)
+        self.assertEqual(1, decoded_home.count("<h1"))
         self.assertIn('href="/history"', decoded_home)
         self.assertNotIn("最近任务", decoded_home)
         self.assertIn("script-src 'self'", home_headers["Content-Security-Policy"])
@@ -966,6 +967,155 @@ class WebAppTest(unittest.TestCase):
             self.assertIn(label, decoded)
         self.assertIn("&lt;b&gt;鸡胸肉饭&lt;/b&gt;", decoded)
         self.assertNotIn("<b>鸡胸肉饭</b>", decoded)
+
+    def test_adaptive_web_workspace_plan_feedback_inventory_and_setup_revision(self):
+        review_date = date.today().isoformat()
+        service.add_daily_record(review_date, "今天按计划记录实际饮食。")
+        service.complete_daily_review(review_date, daily_review_result(review_date))
+        plan_date = (date.today() + timedelta(days=1)).isoformat()
+        plan = adaptive.get_plan_for_date(plan_date)
+        self.assertIsNotNone(plan)
+
+        for path, label in (
+            ("/", "今天只处理下一步"), ("/capture", "记录发生了什么"),
+            (f"/plans/{plan_date}", "执行计划"), (f"/questions/{plan_date}", "只补齐会改变行动的信息"),
+            ("/learning", "由你确认，系统才学习"), ("/inventory", "食材库存与临期状态"),
+            ("/profile", "目标、边界与来源"), ("/insights", "证据覆盖与校准资格"),
+            ("/data", "备份、恢复与设备迁移"),
+        ):
+            status, _, page = self.request("GET", path)
+            self.assertEqual(200, status, path)
+            self.assertIn(label, page.decode("utf-8"))
+
+        status, export_headers, bundle = self.request("GET", "/data/export")
+        self.assertEqual(200, status)
+        self.assertEqual("application/zip", export_headers["Content-Type"])
+        self.assertIn("attachment;", export_headers["Content-Disposition"])
+        self.assertTrue(bundle.startswith(b"PK"))
+
+        item_id = plan["menu"]["meals"][0]["plan_item_id"]
+        payload = urllib.parse.urlencode({"expected_version": "0", "status": "followed"}).encode()
+        status, headers, _ = self.request("POST", f"/plans/{plan_date}/{item_id}/feedback", payload, {"Content-Type": "application/x-www-form-urlencoded"})
+        self.assertEqual(303, status)
+        self.assertEqual(f"/plans/{plan_date}", headers["Location"])
+        self.assertEqual("followed", adaptive.get_plan_for_date(plan_date)["feedback"][item_id]["status"])
+
+        lunch = next(item for item in plan["menu"]["meals"] if item["name"] == "午餐")
+        rescue = adaptive.create_rescue_session(
+            plan_date, lunch["plan_item_id"], "not_enough_time", "午休只剩十分钟"
+        )
+        adaptive.complete_rescue_session(rescue["id"], {
+            "reason": "改用无需复杂处理的现成组合。", "steps": ["选择现成主食和蛋白", "补一份蔬菜"],
+            "replacement_foods": ["现成米饭", "即食鸡蛋"], "portion_change": "保持原份量结构",
+            "safety_notes": ["不使用排除食品"],
+        })
+        status, _, rescue_page = self.request("GET", f'/rescue/{rescue["id"]}')
+        self.assertEqual(200, status)
+        decoded_rescue = rescue_page.decode("utf-8")
+        self.assertIn("改用无需复杂处理的现成组合", decoded_rescue)
+        self.assertIn("现成米饭", decoded_rescue)
+        self.assertIn("保持原份量结构", decoded_rescue)
+
+        metric_payload = urllib.parse.urlencode({
+            "observed_date": review_date, "metric_key": "weight_kg", "value": "79.4",
+        }).encode()
+        status, headers, _ = self.request(
+            "POST", "/metrics", metric_payload,
+            {"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        self.assertEqual(303, status)
+        self.assertEqual("/insights", headers["Location"])
+        self.assertEqual(79.4, personalization.list_metrics("weight_kg")[0]["value_json"])
+
+        payload = urllib.parse.urlencode({"name": "小白菜", "amount_text": "约一顿", "expires_on": plan_date}).encode()
+        status, _, _ = self.request("POST", "/inventory", payload, {"Content-Type": "application/x-www-form-urlencoded"})
+        self.assertEqual(303, status)
+        self.assertEqual("小白菜", adaptive.list_inventory()[0]["name"])
+
+        for prior in (date.today() - timedelta(days=4), date.today() - timedelta(days=3)):
+            prior_text = prior.isoformat()
+            service.add_daily_record(prior_text, "重复时间阻力的浏览器学习证据。")
+            service.complete_daily_review(prior_text, daily_review_result(prior_text))
+            prior_plan = adaptive.get_plan_for_date((prior + timedelta(days=1)).isoformat())
+            dinner = next(item for item in prior_plan["menu"]["meals"] if item["name"] == "晚餐")
+            adaptive.save_plan_feedback(
+                prior_plan["plan_date"], dinner["plan_item_id"], "modified",
+                reason_codes=["not_enough_time"], actor_source="web_test",
+            )
+        candidate = adaptive.list_candidates("pending")[0]
+        decision = urllib.parse.urlencode({
+            "decision": "accept", "statement": "晚餐主动准备时间最多 15 分钟。",
+        }).encode()
+        status, _, _ = self.request(
+            "POST", f'/learning/{candidate["id"]}/decide', decision,
+            {"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        self.assertEqual(303, status)
+        status, _, learning_page = self.request("GET", "/learning")
+        self.assertEqual(200, status)
+        self.assertIn("没有待确认的学习候选", learning_page.decode("utf-8"))
+        self.assertIn("晚餐主动准备时间最多 15 分钟。", learning_page.decode("utf-8"))
+
+        experiment_payload = urllib.parse.urlencode({
+            "variable_key": "dinner_active_minutes", "action": "晚餐主动时间控制在15分钟",
+            "success_signal": "连续三次完成且负担可接受",
+        }).encode()
+        status, _, _ = self.request(
+            "POST", "/learning/experiments", experiment_payload,
+            {"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        self.assertEqual(303, status)
+        experiment = adaptive.list_experiments()[0]
+        start_payload = urllib.parse.urlencode({"starts_on": review_date, "days": "5"}).encode()
+        status, _, _ = self.request(
+            "POST", f'/learning/experiments/{experiment["id"]}/start', start_payload,
+            {"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        self.assertEqual(303, status)
+        finish_payload = urllib.parse.urlencode({"summary": "验证完成", "decision": "complete"}).encode()
+        status, _, _ = self.request(
+            "POST", f'/learning/experiments/{experiment["id"]}/finish', finish_payload,
+            {"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        self.assertEqual(303, status)
+        self.assertEqual("completed", adaptive.list_experiments()[0]["status"])
+
+        status, headers, _ = self.request("POST", "/setup/start", b"", {"Content-Length": "0"})
+        self.assertEqual(303, status)
+        self.assertEqual("/setup/welcome", headers["Location"])
+        status, _, page = self.request("GET", "/setup/welcome")
+        self.assertEqual(200, status)
+        self.assertIn("隐私与边界", page.decode("utf-8"))
+        session = personalization.onboarding_status()["session"]
+        invalid_welcome = urllib.parse.urlencode({
+            "session_id": session["id"], "version": str(session["version"]),
+        }).encode()
+        status, _, invalid_page = self.request(
+            "POST", "/setup/save/welcome", invalid_welcome,
+            {"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        self.assertEqual(400, status)
+        self.assertIn('role="alert"', invalid_page.decode("utf-8"))
+        self.assertIn("必须确认本地存储与模型发送边界", invalid_page.decode("utf-8"))
+        steps = [
+            ("welcome", {"privacy_ack": "yes"}),
+            ("goals", {"primary_goal": "eating_consistency", "success_metrics": ["execution_rate"], "motivation": "降低操作摩擦"}),
+            ("baseline", {"age_years": "31", "physiological_input": "unspecified", "activity_level": "moderate"}),
+            ("safety", {"life_stage": "adult", **{key: "no" for key in personalization.OBSERVATION_FLAGS}}),
+            ("training", {"types": ["strength"], "frequency_per_week": "3"}),
+            ("constraints", {"meal_environment": "工作日外食，晚餐在家", "portion_method": "手掌份量", "cooking_time_minutes": "20", "question_budget": "2", "equipment": "炒锅, 电饭煲", "food_exclusions": "花生", "preferences": "酸辣"}),
+        ]
+        version = session["version"]
+        for step, values in steps:
+            payload = urllib.parse.urlencode({"session_id": session["id"], "version": str(version), **values}, doseq=True).encode()
+            status, headers, _ = self.request("POST", f"/setup/save/{step}", payload, {"Content-Type": "application/x-www-form-urlencoded"})
+            self.assertEqual(303, status, step)
+            version += 1
+        payload = urllib.parse.urlencode({"session_id": session["id"], "version": str(version), "accept_profile": "yes", "accept_strategy": "yes", "planning_mode": "portion_guided"}).encode()
+        status, headers, _ = self.request("POST", "/setup/complete", payload, {"Content-Type": "application/x-www-form-urlencoded"})
+        self.assertEqual(303, status)
+        self.assertEqual("/", headers["Location"])
+        self.assertEqual(2, personalization.active_personalization()["profile"]["version"])
 
     def test_photo_upload_form(self):
         boundary = "----MealCircuitTestBoundary"

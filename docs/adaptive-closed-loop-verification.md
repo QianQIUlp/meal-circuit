@@ -4,21 +4,21 @@ This file tracks the approved end-to-end delivery against concrete code and veri
 
 | Requirement | Current classification | Code / evidence | Completion gate |
 | --- | --- | --- | --- |
-| Versioned profile, goals, strategy, metrics | keep + fix provenance | `mealcircuit/personalization.py`, `profile_versions`, `goal_versions`, `strategy_versions` | target provenance, edit/version flows, and safety-scope tests pass |
-| Safety-aware onboarding and eligibility | fix (P0) | `generation_policy()` exists but is not yet enforced everywhere | Web, CLI, context, generate and complete paths share one authorization matrix |
-| Restricted-mode schemas and settings | fix (P0) | current observation mode can retain legacy protein target and prescriptive fields | fact-only schemas contain no advice fields; restricted settings expose no legacy target |
-| Evidence capture and review requeue | keep | `task_evidence_links`, context integration, correction requeue tests | Web/CLI capture flow and source-manifest coverage pass |
-| Plan execution feedback | fix (P0) | current materialized row uses optimistic versioning | append-only feedback revisions preserve every prior state and missing remains unknown |
-| Candidate learning and confirmed rules | keep + fix scope | deterministic thresholds and evidence links exist | candidates/rules/experiments bind profile, goal, strategy and safety versions |
-| Constrained planning and rescue | fix | plan IDs and rescue sessions exist; hard-constraint compiler/result schema are incomplete | invalid plans cannot commit; rescue is validated, scoped and feeds execution history |
-| Inventory and carry-over | keep + integrate | inventory event model and existing carry-over protocol | today plan, rescue, Web/CLI, export and restore use the same inventory state |
-| Context / Result v2 and agent-run audit | fix (P0/P1) | context v2/hash exists; `agent_runs` is not wired | full manifest includes doctrine/policy/schema/validator/run provenance and failures are atomic |
-| Web closed-loop journey | missing | existing server-rendered UI only exposes legacy surfaces | setup → today → feedback → learning → profile journey passes real-browser QA |
-| CLI closed-loop journey | missing | legacy agent CLI only | setup/plan/feedback/learning/inventory/rescue/export/import commands pass integration tests |
-| Data portability and recovery | missing | migration backup exists | preview/apply export-import and backup-restore round trips preserve hashes and history |
-| Backward compatibility | fix (P0) | legacy settings/profile prefill exists | legacy users retain recording access and receive a resumable review gate without data loss |
-| Accessibility | keep + fix | semantic SSR baseline and responsive styles exist | keyboard, focus, error summary, trend alternative, 320–1440 px and 200% zoom checks pass |
-| Full verification and draft PR | missing | baseline: 54 tests pass on 2026-07-11 | full automated suite, release check, browser flows, atomic commits, pushed branch and draft PR |
+| Versioned profile, goals, strategy, metrics | implemented | `personalization.py`; versioned target provenance and optimistic onboarding tests | automated tests pass |
+| Safety-aware onboarding and eligibility | implemented | one `generation_policy()` / `require_generation()` gate covers Web, CLI, context, generate, complete and rescue | standard, setup, clinician-guided and restricted tests pass |
+| Restricted-mode schemas and settings | implemented | fact-only Result v2 schemas; restricted settings and plan lookup suppress old targets/prescriptions | no-leak and old-plan tests pass |
+| Evidence capture and review requeue | implemented | task evidence links, capture UI/CLI, correction requeue and manifest IDs | integration tests pass |
+| Plan execution feedback | implemented | materialized current state plus append-only revision events and optimistic version | revision/history tests pass |
+| Candidate learning and confirmed rules | implemented | deterministic thresholds; user decision; goal/profile/strategy/safety/policy scope | constraint and counterexample tests pass |
+| Constrained planning and rescue | implemented | immutable plan projections, Result v2 hard-constraint compiler, scoped rescue provenance | invalid-plan and rescue feedback tests pass |
+| Inventory and carry-over | implemented | inventory events in context, planning, rescue, Web/CLI and portable bundle | round-trip tests pass |
+| Context / Result v2 and agent-run audit | implemented | doctrine hash; profile/goal/strategy/target; versioned rule/experiment; policy/schema/validator/run IDs | generated and external-agent run tests pass |
+| Web closed-loop journey | implemented; final browser rerun pending | `/setup`, `/`, `/capture`, `/plans`, `/questions`, `/learning`, `/inventory`, `/profile`, `/insights`, `/data`, `/rescue` | HTTP integration plus core real-browser flow passed; late experiment/metric UI needs final rerun |
+| CLI closed-loop journey | implemented | setup/plan/feedback/questions/learning/inventory/evidence/rescue/metric/calibration/export/import | CLI integration passes |
+| Data portability and recovery | implemented | SHA manifest, integrity/schema preview, pre-restore backup, atomic DB replacement, Web/CLI | round trip passes |
+| Backward compatibility | implemented | prefill active/legacy settings; setup only gates generation; legacy overview remains reachable | legacy suite passes |
+| Accessibility | implemented; final browser rerun pending | semantic forms/errors, keyboard focus trap/inert drawer, responsive grids, reduced motion | automated markup and 320/720/1440 effective-viewport checks pass; final late-surface QA pending |
+| Full verification and draft PR | in progress | latest full suite: 67 tests; release/compile/diff checks passed | final browser rerun; Web commit, push, draft PR |
 
 ## Classification decision
 
