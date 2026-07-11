@@ -288,6 +288,29 @@ class AdaptiveDomainTest(unittest.TestCase):
             personalization.get_onboarding(updated["id"])["answers_json"]["goals"]["custom_goal_text"],
         )
 
+    def test_target_validity_is_enforced_and_expired_targets_leave_planning_context(self):
+        session = self._fill_session()
+        yesterday = (date.today() - timedelta(days=1)).isoformat()
+        with self.assertRaisesRegex(ValidationError, "有效期不能早于今天"):
+            personalization.complete_onboarding(
+                session["id"], session["version"], {
+                    "accept_profile": True, "accept_strategy": True,
+                    "target_valid_until": yesterday,
+                },
+            )
+        current = personalization.complete_onboarding(
+            session["id"], session["version"],
+            {"accept_profile": True, "accept_strategy": True},
+        )
+        self.assertEqual(1, len(current["targets"]))
+        with connect() as conn:
+            conn.execute(
+                "UPDATE nutrition_target_versions SET valid_until=? WHERE id=?",
+                (yesterday, current["targets"][0]["id"]),
+            )
+        self.assertEqual([], personalization.active_personalization()["targets"])
+        self.assertIsNone(personalization.resolved_settings(SETTINGS)["protein_target_g"])
+
     def test_onboarding_uses_optimistic_version_and_metric_history(self):
         session = personalization.start_onboarding()
         updated = personalization.save_onboarding_step(
@@ -442,6 +465,17 @@ class AdaptiveDomainTest(unittest.TestCase):
             ).fetchone())
         self.assertEqual("external_agent", external["provider"])
         self.assertEqual("completed", external["status"])
+
+        invalid_manual = service.create_material_task("未知原料")
+        with self.assertRaises(ValidationError):
+            service.submit_task_result(invalid_manual["id"], {"summary": "缺少必要字段"})
+        self.assertEqual("pending", service.get_task(invalid_manual["id"])["status"])
+        with connect() as conn:
+            failed = row_dict(conn.execute(
+                "SELECT * FROM agent_runs WHERE status='failed' ORDER BY started_at DESC LIMIT 1"
+            ).fetchone())
+        self.assertEqual("external_agent", failed["provider"])
+        self.assertIn("ValidationError", failed["error_summary"])
 
     def test_portable_bundle_preview_and_restore_round_trip(self):
         self._complete_standard_profile()

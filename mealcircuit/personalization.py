@@ -654,6 +654,9 @@ def _protein_target_selection(
             selected = candidates[0]
         else:
             raise ValidationError("请选择蛋白目标参考体重")
+        valid_until = _date_text(confirmation.get("target_valid_until"), "目标有效期")
+        if valid_until and valid_until < date.today().isoformat():
+            raise ValidationError("目标有效期不能早于今天")
         return [float(value) for value in selected["target_g"]], {
             "source_kind": (
                 "user_confirmed_legacy_setting"
@@ -673,7 +676,7 @@ def _protein_target_selection(
                 "population": selected["applicability"],
             },
             "valid_from": date.today().isoformat(),
-            "valid_until": _date_text(confirmation.get("target_valid_until"), "目标有效期"),
+            "valid_until": valid_until,
         }
     if safety["mode"] == "clinician_guided" and safety["professional_guidance_current"]:
         professional_targets = confirmation.get("professional_targets") or {}
@@ -862,6 +865,12 @@ def active_personalization() -> dict:
         targets = [row_dict(row) for row in conn.execute(
             "SELECT * FROM nutrition_target_versions WHERE active=1 ORDER BY target_key,version DESC"
         ).fetchall()]
+    today = date.today().isoformat()
+    targets = [
+        item for item in targets
+        if (not item.get("valid_from") or item["valid_from"] <= today)
+        and (not item.get("valid_until") or item["valid_until"] >= today)
+    ]
     goals.sort(key=lambda item: item["goal_json"].get("priority", 99))
     return {
         "status": "completed",
