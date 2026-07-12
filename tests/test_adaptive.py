@@ -86,6 +86,7 @@ class AdaptiveDomainTest(unittest.TestCase):
         target_weight: float | None = None,
         safety_overrides: dict | None = None,
         professional_guidance: dict | None = None,
+        constraint_overrides: dict | None = None,
     ):
         session = personalization.start_onboarding()
         payloads = {
@@ -128,6 +129,8 @@ class AdaptiveDomainTest(unittest.TestCase):
             payloads["safety"].update(safety_overrides)
         if professional_guidance is not None:
             payloads["safety"]["professional_guidance"] = professional_guidance
+        if constraint_overrides:
+            payloads["constraints"].update(constraint_overrides)
         current = session
         for step, payload in payloads.items():
             current = personalization.save_onboarding_step(current["id"], step, payload, current["version"])
@@ -215,6 +218,32 @@ class AdaptiveDomainTest(unittest.TestCase):
         self.assertEqual([112, 160], resolved["protein_target_g"])
         self.assertEqual("工作日食堂，晚餐在家", resolved["meal_environment"])
         self.assertEqual(1, resolved["sources"]["strategy"]["version"])
+
+    def test_onboarding_persists_per_meal_preparation_modes_in_versioned_personal_strategy(self):
+        modes = {
+            "breakfast": "quick_assembly",
+            "lunch": "home_cook",
+            "dinner": "home_cook",
+        }
+        session = self._fill_session(constraint_overrides={
+            "meal_environment": "午餐和晚餐在家做",
+            "meal_modes": modes,
+            "cooking_time_minutes": 25,
+        })
+        current = personalization.complete_onboarding(
+            session["id"], session["version"],
+            {"accept_profile": True, "accept_strategy": True, "planning_mode": "portion_guided"},
+        )
+        self.assertEqual(modes, current["profile"]["profile_json"]["constraints"]["meal_modes"])
+        self.assertEqual(modes, current["strategy"]["strategy_json"]["meal_modes"])
+        resolved = personalization.resolved_settings(SETTINGS)
+        self.assertEqual(modes, resolved["meal_modes"])
+        self.assertTrue(resolved["home_cooking"]["enabled"])
+        self.assertEqual("lunch_and_dinner", resolved["home_cooking"]["meal_scope"])
+        self.assertEqual(25, resolved["home_cooking"]["weekday_time_limit_minutes"])
+
+        revision = personalization.start_onboarding()
+        self.assertEqual(modes, revision["answers_json"]["constraints"]["meal_modes"])
 
     def test_web_first_run_template_becomes_valid_after_onboarding(self):
         (self.home / "settings.json").unlink()

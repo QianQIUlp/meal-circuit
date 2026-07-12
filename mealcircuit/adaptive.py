@@ -8,6 +8,7 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 from .db import connect, init_db, row_dict
+from .meal_modes import meal_rotation
 from .personalization import active_personalization, require_generation
 from .validation import VALIDATOR_VERSION, ValidationError
 
@@ -226,8 +227,8 @@ def _plan_item_id(review: dict, meal: dict) -> str:
 def _strategy_key(menu: dict, meal: dict) -> str:
     if meal.get("strategy_key"):
         return str(meal["strategy_key"])
-    rotation = menu.get("rotation") or {}
-    if meal.get("name") == "晚餐" and rotation.get("dish_key"):
+    rotation = meal_rotation(menu, meal) or {}
+    if rotation.get("dish_key"):
         return str(rotation["dish_key"])
     foods = meal.get("foods") or []
     normalized = "|".join(sorted(str(item).strip().lower() for item in foods))

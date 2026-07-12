@@ -7,6 +7,13 @@ from typing import Any
 
 from .configuration import load_settings
 from .db import connect, init_db, row_dict
+from .meal_modes import (
+    LEGACY_DEFAULT_MEAL_MODES,
+    MEAL_KEYS,
+    PREPARATION_MODES,
+    legacy_home_meal_modes,
+    meal_modes_are_valid,
+)
 from .storage import profile_path
 from .validation import ValidationError
 
@@ -47,6 +54,50 @@ OBSERVATION_FLAGS = (
     "severe_persistent_symptoms",
     "severe_allergy_management",
 )
+
+
+def _meal_modes(value: object | None) -> dict[str, str]:
+    if value is None:
+        return dict(LEGACY_DEFAULT_MEAL_MODES)
+    payload = _object(value, "逐餐准备方式")
+    if not meal_modes_are_valid(payload):
+        raise ValidationError("必须分别指定早餐、午餐和晚餐的准备方式")
+    return {key: str(payload[key]) for key in MEAL_KEYS}
+
+
+def _strategy_home_cooking(profile: dict, legacy_settings: dict | None) -> dict:
+    constraints = profile["constraints"]
+    modes = constraints["meal_modes"]
+    home_meals = [key for key in MEAL_KEYS if modes[key] == "home_cook"]
+    if not home_meals:
+        return {"enabled": False, "meal_modes": modes}
+    legacy = ((legacy_settings or {}).get("home_cooking") or {})
+    equipment = constraints.get("equipment") or legacy.get("equipment") or []
+    if not equipment:
+        raise ValidationError("选择在家下厨时必须至少填写一种可用厨具")
+    time_limit = constraints.get("cooking_time_minutes", 25)
+    if not 10 <= time_limit <= 60:
+        raise ValidationError("选择在家下厨时，做饭时间必须在 10–60 分钟之间")
+    scope = (
+        "dinner" if home_meals == ["dinner"] else
+        "lunch_and_dinner" if home_meals == ["lunch", "dinner"] else
+        "custom"
+    )
+    return {
+        "enabled": True,
+        "region": legacy.get("region", "china"),
+        "meal_scope": scope,
+        "meal_modes": modes,
+        "servings": 1,
+        "weekday_time_limit_minutes": time_limit,
+        "equipment": equipment,
+        "recipe_detail": "beginner_card",
+        "rotation_window_days": legacy.get("rotation_window_days", 3),
+        "reuse_policy": "reuse_ingredients_rotate_dishes",
+        "flavor_preferences": constraints.get("preferences") or legacy.get("flavor_preferences") or [],
+        "online_purchase_mode": "spec_and_search_keywords",
+        "food_exclusions": constraints.get("food_exclusions") or legacy.get("food_exclusions") or [],
+    }
 CLINICIAN_GUIDED_FLAGS = {
     "therapeutic_diet",
     "medication_affects_nutrition",
@@ -178,9 +229,15 @@ def _legacy_prefill() -> dict:
     except (ValidationError, OSError):
         settings = None
     if settings:
+        home = settings.get("home_cooking") or {"enabled": False}
         result["constraints"] = {
             "meal_environment": settings["meal_environment"],
             "portion_method": settings["portion_method"],
+            "meal_modes": legacy_home_meal_modes(home),
+            "cooking_time_minutes": home.get("weekday_time_limit_minutes", 25),
+            "equipment": home.get("equipment") or [],
+            "food_exclusions": home.get("food_exclusions") or [],
+            "preferences": home.get("flavor_preferences") or [],
             "question_budget": 2,
         }
         result["legacy_settings"] = settings
@@ -211,8 +268,9 @@ def _active_prefill() -> dict | None:
         **{flag: bool(profile.get(flag)) for flag in OBSERVATION_FLAGS},
         "professional_guidance": profile.get("professional_guidance") or _professional_guidance(None),
     }
+    legacy_prefill = _legacy_prefill()
     return {
-        **_legacy_prefill(),
+        **legacy_prefill,
         "welcome": {"privacy_ack": True},
         "goals": {
             "primary_goal": primary.get("type", "general_wellbeing"),
@@ -231,7 +289,10 @@ def _active_prefill() -> dict | None:
         },
         "safety": safety,
         "training": profile.get("training") or {"types": [], "frequency_per_week": 0},
-        "constraints": profile.get("constraints") or {},
+        "constraints": {
+            **(legacy_prefill.get("constraints") or {}),
+            **(profile.get("constraints") or {}),
+        },
         "legacy_profile_notes": profile.get("legacy_profile_notes", ""),
     }
 
@@ -341,10 +402,13 @@ def _validate_onboarding_step(step: str, payload: dict) -> None:
     elif step == "constraints":
         _text(payload.get("meal_environment"), "用餐环境", maximum=300)
         _text(payload.get("portion_method"), "份量表达", maximum=200)
+        modes = _meal_modes(payload.get("meal_modes")) if "meal_modes" in payload else None
         _number(payload.get("cooking_time_minutes", 25), "做饭时间", minimum=0, maximum=180)
         _number(payload.get("question_budget", 2), "每日问题预算", minimum=0, maximum=5)
         for name in ("equipment", "food_exclusions", "preferences"):
             _text_list(payload.get(name), name)
+        if modes and "home_cook" in modes.values() and not payload.get("equipment"):
+            raise ValidationError("选择在家下厨时必须至少填写一种可用厨具")
 
 
 def _validate_profile(answers: dict) -> dict:
@@ -372,11 +436,12 @@ def _validate_profile(answers: dict) -> dict:
     question_budget = int(_number(
         constraints.get("question_budget", 2), "每日问题预算", minimum=0, maximum=5
     ))
+    meal_modes = _meal_modes(constraints.get("meal_modes")) if "meal_modes" in constraints else None
     equipment = _text_list(constraints.get("equipment"), "炊具")
     food_exclusions = _text_list(constraints.get("food_exclusions"), "排除食品")
     preferences = _text_list(constraints.get("preferences"), "饮食偏好")
 
-    return {
+    profile = {
         "age_years": age,
         "height_cm": _number(baseline.get("height_cm"), "身高", minimum=100, maximum=250, required=False),
         "weight_kg": _number(baseline.get("weight_kg"), "体重", minimum=20, maximum=400, required=False),
@@ -414,6 +479,9 @@ def _validate_profile(answers: dict) -> dict:
             answers.get("legacy_profile_notes", ""), "旧档案备注", required=False, maximum=20000
         ),
     }
+    if meal_modes is not None:
+        profile["constraints"]["meal_modes"] = meal_modes
+    return profile
 
 
 def _validate_goals(answers: dict) -> list[dict]:
@@ -815,6 +883,11 @@ def complete_onboarding(session_id: str, expected_version: int, confirmation: di
             "safety_mode": safety["mode"],
             "legacy_settings_snapshot": session["answers_json"].get("legacy_settings"),
         }
+        if "meal_modes" in profile["constraints"]:
+            strategy["meal_modes"] = profile["constraints"]["meal_modes"]
+            strategy["home_cooking"] = _strategy_home_cooking(
+                profile, session["answers_json"].get("legacy_settings")
+            )
         strategy_id = _id("strategy")
         conn.execute(
             """INSERT INTO strategy_versions(
@@ -977,6 +1050,13 @@ def resolved_settings(legacy_settings: dict) -> dict:
             })
             continue
         resolved[key] = strategy_value
+    meal_modes = strategy.get("meal_modes")
+    if meal_modes_are_valid(meal_modes):
+        resolved["meal_modes"] = dict(meal_modes)
+        resolved["home_cooking"] = dict(strategy.get("home_cooking") or {
+            "enabled": "home_cook" in meal_modes.values(),
+            "meal_modes": meal_modes,
+        })
     resolved["sources"] = {
         "base": "settings.json",
         "strategy": {"id": strategy_row["id"], "version": strategy_row["version"], "policy_version": strategy_row["policy_version"]},

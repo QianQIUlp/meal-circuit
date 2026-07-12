@@ -4,6 +4,7 @@ import json
 import shutil
 from pathlib import Path
 
+from .meal_modes import legacy_home_meal_modes, meal_modes_are_valid
 from .storage import (
     ROOT,
     app_home,
@@ -75,13 +76,18 @@ def _validate_home_cooking(value: object) -> dict:
         raise ValidationError("home_cooking.enabled 必须是布尔值")
     if not value["enabled"]:
         return dict(HOME_COOKING_DEFAULT)
-    missing = sorted(HOME_COOKING_FIELDS - value.keys())
+    missing = sorted((HOME_COOKING_FIELDS - {"meal_scope"}) - value.keys())
     if missing:
         raise ValidationError(f"home_cooking 缺少字段：{missing}")
     if value["region"] != "china":
         raise ValidationError("home_cooking.region 首版仅支持 china")
-    if value["meal_scope"] != "dinner" or value["servings"] != 1:
-        raise ValidationError("home_cooking 首版仅支持一人份晚餐")
+    if value.get("meal_scope") not in {None, "dinner", "lunch_and_dinner", "custom"}:
+        raise ValidationError("home_cooking.meal_scope 无效")
+    meal_modes = value.get("meal_modes") or legacy_home_meal_modes(value)
+    if not meal_modes_are_valid(meal_modes):
+        raise ValidationError("home_cooking.meal_modes 必须逐项指定早餐、午餐和晚餐的准备方式")
+    if value["servings"] != 1:
+        raise ValidationError("home_cooking 目前仅支持一人份")
     if value["recipe_detail"] != "beginner_card":
         raise ValidationError("home_cooking.recipe_detail 必须是 beginner_card")
     if value["reuse_policy"] != "reuse_ingredients_rotate_dishes":
@@ -103,7 +109,8 @@ def _validate_home_cooking(value: object) -> dict:
             raise ValidationError(f"home_cooking.{field} 必须是文本数组")
     return {
         "enabled": True,
-        **{key: value[key] for key in HOME_COOKING_FIELDS},
+        **{key: value[key] for key in HOME_COOKING_FIELDS if key in value},
+        "meal_modes": meal_modes,
         "equipment": list(dict.fromkeys(value["equipment"])),
         "flavor_preferences": list(dict.fromkeys(item.strip() for item in value["flavor_preferences"])),
         "food_exclusions": list(dict.fromkeys(item.strip() for item in value["food_exclusions"])),

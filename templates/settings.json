@@ -7,7 +7,6 @@
   "home_cooking": {
     "enabled": false,
     "region": "china",
-    "meal_scope": "dinner",
     "servings": 1,
     "weekday_time_limit_minutes": 25,
     "equipment": ["rice_cooker", "stovetop_pan", "stovetop_pot", "refrigerator"],

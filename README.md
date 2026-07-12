@@ -72,7 +72,7 @@ All analysis results must pass JSON Schema-level structural validation before th
 | **Food Nutrition Library** | Manage brand labels, default portions, priorities, usage conditions, and version history |
 | **Records & Memory** | Store daily eating, long-term trends, current adjustments, and daily-review history |
 
-The daily menu always covers breakfast, lunch, dinner, a conditional snack, training-day adjustments, and gut-symptom adjustments. When `home_cooking` is enabled in private settings, breakfast becomes low-friction assembly, lunch adapts to cafeteria or eating out, and dinner becomes a beginner-friendly single-serving execution card, together with a shopping list, online filtering keywords, and a three-day ingredient reuse direction. The system reads the last 14 completed dinners plus likely carryover ingredients from previous reuse plans, and rotates dishes and flavor profiles by default; if repetition is necessary because of recovery, expiring ingredients, or shopping constraints, the reason must be stated explicitly. High-priority foods still require an item-by-item `use` or `skip` decision instead of being mechanically forced into the menu.
+The daily menu always covers breakfast, lunch, dinner, a conditional snack, training-day adjustments, and gut-symptom adjustments. During onboarding, each person chooses `home_cook`, `quick_assembly`, or `eat_out` separately for breakfast, lunch, and dinner; this is stored in their versioned personal strategy rather than fixed by repository defaults. Every home-cooked meal gets its own beginner-friendly single-serving execution card, while shopping, online filtering, and three-day ingredient reuse remain coordinated across the day. The system reads recent completed home meals by meal slot plus likely carryover ingredients and rotates dishes and flavor profiles independently for each slot.
 
 “Today Status” shows five daily modules by default. You answer one question at a time, and single-question drafts are preserved automatically; only after a full module is completed do its answers enter the agent context and re-queue the daily review. Modules can be hidden, reordered, or switched to on-demand recording in “Adjust Modules”. An explicit skip only means the user did not provide the information; the system does not infer “no training” or “no symptoms” from that.
 
@@ -128,7 +128,7 @@ DeepSeek uses its OpenAI-compatible Chat API path. As of the current official De
 
 When you click “用 API Key 生成” in the Web UI or run `generate` / `day-generate`, MealCircuit sends the assembled context, and for photo tasks the uploaded image, to the selected model provider. The returned JSON is still validated by the same local schema and business rules before anything is persisted.
 
-In solo-cooking mode, `day-context` also includes `home_cooking_preferences`, `recent_home_dinners`, `recent_online_categories`, `ingredient_carryover_obligations`, and the generation protocol. `ingredient_carryover_obligations` is derived from previous three-day reuse plans where required ingredients may have been bought and are still inside the reuse window; agent results must cover each item in `ingredient_carryover_decisions` as `use`, `skip`, or `discard`. Online shopping advice only describes specs, ingredient filters, and search keywords; it does not perform external lookups or claim real product prices or inventory.
+When any meal is home-cooked, `day-context` also includes versioned `meal_modes`, `home_cooking_preferences`, `recent_home_meals` (plus the legacy dinner alias), `recent_online_categories`, `ingredient_carryover_obligations`, and the generation protocol. `ingredient_carryover_obligations` is derived from previous three-day reuse plans where required ingredients may have been bought and are still inside the reuse window; agent results must cover each item in `ingredient_carryover_decisions` as `use`, `skip`, or `discard`. Online shopping advice only describes specs, ingredient filters, and search keywords; it does not perform external lookups or claim real product prices or inventory.
 
 ## Data & Boundaries
 
@@ -244,7 +244,7 @@ flowchart LR
 | **食品营养库** | 管理品牌标签、默认份量、优先级、使用条件及历史版本 |
 | **记录与记忆** | 保存每日饮食、长期趋势、当前调整和复盘版本历史 |
 
-每日菜单固定覆盖早餐、午餐、晚餐、条件加餐、训练日调整和肠胃异常调整。启用私人设置中的 `home_cooking` 后，早餐转为低摩擦组装、午餐适配食堂或外食、晚餐提供一人份新手执行卡，并同时给出采购清单、网购筛选关键词和三日食材复用方向。系统读取近 14 天已完成晚餐和上一轮可能剩余食材，默认轮换菜式和主风味；确因恢复、临期食材或采购限制重复时必须说明原因。高优先级食品仍须逐项给出 `use` 或 `skip`，不会因为“优先”二字机械塞进菜单。
+每日菜单固定覆盖早餐、午餐、晚餐、条件加餐、训练日调整和肠胃异常调整。初始化时，用户分别为早餐、午餐和晚餐选择“在家下厨”“快速组装”或“外食”；这些选择保存在版本化个人策略中，而不是写死在仓库默认配置里。每个在家下厨餐次都有独立的一人份新手执行卡，同时共享采购清单、网购筛选关键词和三日食材复用方向。系统按餐次读取近期已完成菜单并独立轮换菜式和主风味。
 
 “今日状态”默认显示五个每日模块。每次只回答一个问题，单题草稿会自动保留；完成整个模块后，答案才会进入 Agent 上下文并重新排队当日复盘。模块可以在“调整模块”中隐藏、排序或改为按需记录。明确跳过只表示用户不提供，系统不会据此推断“未训练”或“没有症状”。
 
@@ -300,7 +300,7 @@ DeepSeek 走其 OpenAI-compatible Chat API。按当前官方 DeepSeek API 文档
 
 当你在 Web UI 点击“用 API Key 生成”或运行 `generate` / `day-generate` 时，MealCircuit 会把组装好的上下文发送给所选模型供应商；照片任务还会发送上传图片。模型返回的 JSON 仍必须通过本地结构校验和业务规则后才会保存。
 
-独居模式还会在 `day-context` 中提供 `home_cooking_preferences`、`recent_home_dinners`、`recent_online_categories`、`ingredient_carryover_obligations` 和生成协议。`ingredient_carryover_obligations` 来自上一轮三日复用计划中可能已买且仍在复用窗口内的食材；Agent 必须在结果中用 `ingredient_carryover_decisions` 逐项说明使用、跳过或丢弃。网购建议只描述规格、配料筛选标准与搜索关键词，不执行外部查询，也不声称具体商品的价格或库存。
+存在在家下厨餐次时，`day-context` 会提供版本化 `meal_modes`、`home_cooking_preferences`、`recent_home_meals`（并保留旧晚餐别名）、`recent_online_categories`、`ingredient_carryover_obligations` 和生成协议。`ingredient_carryover_obligations` 来自上一轮三日复用计划中可能已买且仍在复用窗口内的食材；Agent 必须在结果中用 `ingredient_carryover_decisions` 逐项说明使用、跳过或丢弃。网购建议只描述规格、配料筛选标准与搜索关键词，不执行外部查询，也不声称具体商品的价格或库存。
 
 ## 数据与边界
 

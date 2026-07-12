@@ -12,6 +12,15 @@ from typing import BinaryIO
 from . import checkins
 from .configuration import load_doctrine, load_resolved_settings, load_settings
 from .db import connect, init_db, row_dict
+from .meal_modes import (
+    LEGACY_DEFAULT_MEAL_MODES,
+    MEAL_KEYS,
+    MEAL_KEYS_BY_NAME,
+    MEAL_NAMES,
+    home_cooked_meal_names,
+    legacy_home_meal_modes,
+    meal_rotation,
+)
 from .storage import resolve_data_path, store_data_path, upload_root
 from .validation import VALIDATOR_VERSION, ValidationError, validate_daily_review_result, validate_result
 
@@ -903,6 +912,7 @@ def daily_review_schema(settings: dict | None = None) -> dict:
         "one_line_review": "string",
     }
     home = settings.get("home_cooking") or {"enabled": False}
+    meal_modes = settings.get("meal_modes") or legacy_home_meal_modes(home)
     if home.get("enabled"):
         meal_shape = schema["tomorrow_menu"]["meals"][0]
         recipe_card = {
@@ -914,11 +924,19 @@ def daily_review_schema(settings: dict | None = None) -> dict:
             "steps": [{"instruction": "string", "minutes": 1, "heat": "string", "done_signal": "string"}],
             "failure_rescue": ["string"], "cleanup": "string", "gut_fallback": "string",
         }
-        schema["tomorrow_menu"]["meals"] = [
-            {**meal_shape, "name": "早餐", "mode": "quick_assembly"},
-            {**meal_shape, "name": "午餐", "mode": "eat_out"},
-            {**meal_shape, "name": "晚餐", "mode": "home_cook", "recipe_card": recipe_card},
-        ]
+        rotation_card = {
+            "dish_key": "stable_string", "primary_protein": "string",
+            "primary_vegetable": "string", "flavor_profile": "stable_string",
+            "technique": "stable_string",
+            "repeat_reason": "omit unless health_recovery|ingredient_expiry|shopping_constraint",
+        }
+        schema["tomorrow_menu"]["meals"] = []
+        for key in MEAL_KEYS:
+            name, mode = MEAL_NAMES[key], meal_modes[key]
+            meal_spec = {**meal_shape, "name": name, "mode": mode}
+            if mode == "home_cook":
+                meal_spec.update({"recipe_card": recipe_card, "rotation": rotation_card})
+            schema["tomorrow_menu"]["meals"].append(meal_spec)
         schema["tomorrow_menu"].update({
             "shopping_list": [{
                 "name": "string", "amount": "string", "purpose": "string", "required": True,
@@ -932,41 +950,43 @@ def daily_review_schema(settings: dict | None = None) -> dict:
                 "ingredient": "string", "tomorrow_use": "string",
                 "later_uses": [{"date": "YYYY-MM-DD", "use": "string"}], "storage": "string",
             }]},
-            "rotation": {
-                "dish_key": "stable_string", "primary_protein": "string",
-                "primary_vegetable": "string", "flavor_profile": "stable_string",
-                "technique": "stable_string",
-                "repeat_reason": "omit unless health_recovery|ingredient_expiry|shopping_constraint",
-            },
         })
         schema["ingredient_carryover_decisions"] = [{
             "carryover_id": "string", "ingredient": "string", "decision": "use|skip|discard",
             "reason": "string", "planned_use": "string",
         }]
+    elif settings.get("meal_modes"):
+        meal_shape = schema["tomorrow_menu"]["meals"][0]
+        schema["tomorrow_menu"]["meals"] = [
+            {**meal_shape, "name": MEAL_NAMES[key], "mode": meal_modes[key]}
+            for key in MEAL_KEYS
+        ]
     return schema
 
 
 def _home_menu_history(rows: list) -> tuple[list[dict], list[str]]:
-    dinners, online_categories = [], []
+    meals, online_categories = [], []
     for row in rows:
         item = row_dict(row)
         result = item.get("result_json") or {}
         menu = result.get("tomorrow_menu") or {}
-        dinner = next((meal for meal in menu.get("meals", []) if meal.get("name") == "晚餐"), None)
-        if not dinner:
-            continue
-        recipe = dinner.get("recipe_card") or {}
-        dinners.append({
-            "review_date": item["review_date"],
-            "menu_date": menu.get("date"),
-            "title": recipe.get("title") or " / ".join(dinner.get("foods", [])),
-            "rotation": menu.get("rotation"),
-        })
+        for meal in menu.get("meals", []):
+            if meal.get("mode") != "home_cook" and not meal.get("recipe_card"):
+                continue
+            recipe = meal.get("recipe_card") or {}
+            meals.append({
+                "review_date": item["review_date"],
+                "menu_date": menu.get("date"),
+                "meal_name": meal.get("name"),
+                "meal_slot": MEAL_KEYS_BY_NAME.get(meal.get("name"), "unknown"),
+                "title": recipe.get("title") or " / ".join(meal.get("foods", [])),
+                "rotation": meal_rotation(menu, meal),
+            })
         for option in menu.get("online_options", []):
             category = option.get("category")
             if category and category not in online_categories:
                 online_categories.append(category)
-    return dinners, online_categories
+    return meals, online_categories
 
 
 def _carryover_id(source_key: str, menu_date: str, index: int, ingredient: str) -> str:
@@ -1123,7 +1143,8 @@ def daily_review_context(review_date: str, days: int = 14) -> dict:
         item["summary"] = checkins.summarize(item["module_key"], answers, item["status"])
         recent_checkins.append(item)
     target_state = get_checkin_state(review_date)
-    recent_home_dinners, recent_online_categories = _home_menu_history(recent_review_rows)
+    recent_home_meals, recent_online_categories = _home_menu_history(recent_review_rows)
+    recent_home_dinners = [item for item in recent_home_meals if item.get("meal_name") == "晚餐"]
     home_cooking = settings.get("home_cooking") or {"enabled": False}
     carryover_obligations = (
         _ingredient_carryover_obligations(review_date, recent_review_rows)
@@ -1213,6 +1234,8 @@ def daily_review_context(review_date: str, days: int = 14) -> dict:
         "priority_foods": list_priority_foods(),
         "settings": settings,
         "home_cooking_preferences": home_cooking,
+        "meal_modes": settings.get("meal_modes") or legacy_home_meal_modes(home_cooking),
+        "recent_home_meals": recent_home_meals,
         "recent_home_dinners": recent_home_dinners,
         "recent_online_categories": recent_online_categories,
         "ingredient_carryover_obligations": carryover_obligations,
@@ -1229,12 +1252,12 @@ def daily_review_context(review_date: str, days: int = 14) -> dict:
         "planning_answers": planning_answers,
         "source_manifest": source_manifest,
         "home_cooking_generation_protocol": [
-            "早餐使用低摩擦组装，午餐给外食规则，只有晚餐生成新手菜谱。",
-            "优先复用食材但轮换菜式；连续晚餐不重复 dish_key 或 flavor_profile。",
+            "逐餐严格读取 meal_modes；每个 home_cook 餐次分别生成一人份新手执行卡，quick_assembly 使用低摩擦组装，eat_out 给外食选择规则。",
+            "优先复用食材但按餐次轮换菜式；同一餐次连续两天不重复 dish_key 或 flavor_profile。",
             "生成明日菜单前必须逐项评估 ingredient_carryover_obligations；未过期且适合当前状态的食材优先组装进明日午餐或晚餐。",
             "临近过期的食材优先明日用完；已超过保存窗口、今日记录否定库存或与肠胃状态冲突时可跳过或丢弃，但必须说明原因。",
             "新采购清单不得在可用剩余食材能完成同等功能时重复购买。",
-            "总时间不得超过配置上限，最多两件主要炊具，每晚最多引入一个新技巧。",
+            "每个自炊餐次总时间不得超过配置上限，最多两件主要炊具，每餐最多引入一个新技巧。",
             "正常肠胃可用番茄、小米椒、醋和蒜香建立酸辣风味；异常时保留香鲜并降低辣、酸、油。",
             "网购仅给规格、筛选标准和搜索关键词，不提供商品链接、价格或库存断言；近14天已推荐品类默认不重复。",
         ] if home_cooking.get("enabled") else [],
@@ -1262,7 +1285,7 @@ def complete_daily_review(
     context = provenance_context or daily_review_context(review_date)
     settings = context["settings"]
     validate_daily_review_result(result, settings)
-    _validate_dinner_rotation(review_date, result, settings)
+    _validate_home_meal_rotation(review_date, result, settings)
     expected_priority_ids = {food["id"] for food in list_priority_foods()}
     submitted_priority_ids = {item["food_id"] for item in result["priority_food_decisions"]}
     if submitted_priority_ids != expected_priority_ids:
@@ -1290,8 +1313,8 @@ def complete_daily_review(
                 f"{review['id']}|{next_version}|{meal.get('name','meal')}".encode("utf-8")
             ).hexdigest()[:12]
         if not meal.get("strategy_key"):
-            rotation = menu.get("rotation") or {}
-            if meal.get("name") == "晚餐" and rotation.get("dish_key"):
+            rotation = meal_rotation(menu, meal) or {}
+            if rotation.get("dish_key"):
                 meal["strategy_key"] = rotation["dish_key"]
             else:
                 normalized = "|".join(sorted(str(item).strip().lower() for item in meal.get("foods") or []))
@@ -1564,12 +1587,11 @@ def _validate_ingredient_carryover_decisions(result: dict, obligations: list[dic
         raise ValidationError(f"食材承接裁决不完整；缺少={missing}，未知={unknown}")
 
 
-def _validate_dinner_rotation(review_date: str, result: dict, settings: dict) -> None:
+def _validate_home_meal_rotation(review_date: str, result: dict, settings: dict) -> None:
     home = settings.get("home_cooking") or {"enabled": False}
     if not home.get("enabled"):
         return
     current_menu = result["tomorrow_menu"]
-    current = current_menu["rotation"]
     with connect() as conn:
         previous_row = conn.execute(
             """SELECT review_date,result_json FROM daily_reviews
@@ -1580,9 +1602,6 @@ def _validate_dinner_rotation(review_date: str, result: dict, settings: dict) ->
         return
     previous_result = row_dict(previous_row).get("result_json") or {}
     previous_menu = previous_result.get("tomorrow_menu") or {}
-    previous = previous_menu.get("rotation")
-    if not previous:
-        return
     current_date = date.fromisoformat(current_menu["date"])
     try:
         previous_date = date.fromisoformat(previous_menu["date"])
@@ -1590,12 +1609,21 @@ def _validate_dinner_rotation(review_date: str, result: dict, settings: dict) ->
         return
     if previous_date != current_date - timedelta(days=1):
         return
-    repeated = (
-        previous.get("dish_key") == current.get("dish_key")
-        or previous.get("flavor_profile") == current.get("flavor_profile")
-    )
-    if repeated and not current.get("repeat_reason"):
-        raise ValidationError("连续晚餐不得重复菜品或主风味；确需重复时必须提供 repeat_reason")
+    current_meals = {meal.get("name"): meal for meal in current_menu.get("meals", [])}
+    previous_meals = {meal.get("name"): meal for meal in previous_menu.get("meals", [])}
+    for meal_name in home_cooked_meal_names(settings):
+        current_meal = current_meals.get(meal_name) or {}
+        previous_meal = previous_meals.get(meal_name) or {}
+        current = meal_rotation(current_menu, current_meal)
+        previous = meal_rotation(previous_menu, previous_meal)
+        if not current or not previous:
+            continue
+        repeated = (
+            previous.get("dish_key") == current.get("dish_key")
+            or previous.get("flavor_profile") == current.get("flavor_profile")
+        )
+        if repeated and not current.get("repeat_reason"):
+            raise ValidationError(f"连续{meal_name}不得重复菜品或主风味；确需重复时必须提供 repeat_reason")
 
 
 def pending_work() -> dict:

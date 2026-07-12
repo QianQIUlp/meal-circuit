@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import io
 import http.client
 import json
@@ -47,6 +48,15 @@ HOME_COOKING = {
     "flavor_preferences": ["bold", "sour_spicy", "tomato", "xiaomi_chili"],
     "online_purchase_mode": "spec_and_search_keywords",
     "food_exclusions": [],
+}
+HOME_COOKING_LUNCH_DINNER = {
+    **HOME_COOKING,
+    "meal_scope": "lunch_and_dinner",
+    "meal_modes": {
+        "breakfast": "quick_assembly",
+        "lunch": "home_cook",
+        "dinner": "home_cook",
+    },
 }
 
 
@@ -212,6 +222,38 @@ def home_cooking_review_result(review_date: str, dish_key="tomato_chicken", flav
             "flavor_profile": flavor, "technique": "stir_fry",
         },
     })
+    return result
+
+
+def lunch_dinner_home_cooking_result(review_date: str) -> dict:
+    result = home_cooking_review_result(review_date)
+    menu = result["tomorrow_menu"]
+    lunch = next(meal for meal in menu["meals"] if meal["name"] == "午餐")
+    dinner = next(meal for meal in menu["meals"] if meal["name"] == "晚餐")
+    dinner["rotation"] = menu.pop("rotation")
+    lunch["mode"] = "home_cook"
+    lunch["foods"] = ["番茄鸡蛋", "米饭", "蔬菜"]
+    lunch["recipe_card"] = copy.deepcopy(dinner["recipe_card"])
+    lunch["recipe_card"].update({
+        "title": "番茄鸡蛋午餐",
+        "active_minutes": 12,
+        "total_minutes": 18,
+        "ingredients": [
+            {"name": "鸡蛋", "amount": "2个", "prep": "打散"},
+            {"name": "番茄", "amount": "1个", "prep": "切块"},
+        ],
+        "steps": [
+            {"instruction": "鸡蛋炒至凝固后盛出", "minutes": 4, "heat": "中火", "done_signal": "蛋液完全凝固"},
+            {"instruction": "番茄出汁后倒回鸡蛋", "minutes": 5, "heat": "中小火", "done_signal": "汤汁均匀裹住鸡蛋"},
+        ],
+    })
+    lunch["rotation"] = {
+        "dish_key": "tomato_egg_lunch",
+        "primary_protein": "egg",
+        "primary_vegetable": "tomato",
+        "flavor_profile": "tomato_savory",
+        "technique": "stir_fry",
+    }
     return result
 
 
@@ -755,6 +797,47 @@ class MealCircuitTest(unittest.TestCase):
             service.complete_daily_review(today, wrong_date)
         self.assertEqual(service.complete_daily_review(today, home_cooking_review_result(today))["status"], "completed")
 
+    def test_lunch_and_dinner_home_cooking_have_independent_cards_constraints_and_history(self):
+        settings_path = Path(self.temp.name) / "settings.json"
+        settings_path.write_text(
+            json.dumps({**TEST_SETTINGS, "home_cooking": HOME_COOKING_LUNCH_DINNER}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        today_date = date.today() - timedelta(days=1)
+        today = today_date.isoformat()
+        service.add_daily_record(today, "午餐和晚餐都在家做")
+        context = service.daily_review_context(today)
+        schema_meals = {meal["name"]: meal for meal in context["result_schema"]["tomorrow_menu"]["meals"]}
+        self.assertEqual("quick_assembly", schema_meals["早餐"]["mode"])
+        self.assertEqual("home_cook", schema_meals["午餐"]["mode"])
+        self.assertEqual("home_cook", schema_meals["晚餐"]["mode"])
+        self.assertIn("recipe_card", schema_meals["午餐"])
+        self.assertIn("recipe_card", schema_meals["晚餐"])
+
+        missing_lunch_card = home_cooking_review_result(today)
+        missing_lunch_card["tomorrow_menu"]["meals"][1]["mode"] = "home_cook"
+        with self.assertRaisesRegex(ValidationError, "午餐.recipe_card"):
+            service.complete_daily_review(today, missing_lunch_card)
+
+        too_slow = lunch_dinner_home_cooking_result(today)
+        too_slow["tomorrow_menu"]["meals"][1]["recipe_card"]["total_minutes"] = 26
+        with self.assertRaisesRegex(ValidationError, "午餐总时间不得超过 25 分钟"):
+            service.complete_daily_review(today, too_slow)
+
+        completed = service.complete_daily_review(today, lunch_dinner_home_cooking_result(today))
+        self.assertEqual("completed", completed["status"])
+        plan = adaptive.get_plan_for_date((today_date + timedelta(days=1)).isoformat())
+        strategy_keys = {meal["name"]: meal["strategy_key"] for meal in plan["menu"]["meals"]}
+        self.assertEqual("tomato_egg_lunch", strategy_keys["午餐"])
+        self.assertEqual("tomato_chicken", strategy_keys["晚餐"])
+
+        next_day = date.today().isoformat()
+        service.add_daily_record(next_day, "检查分餐次历史")
+        next_context = service.daily_review_context(next_day)
+        recent = {(item["meal_name"], item["rotation"]["dish_key"]) for item in next_context["recent_home_meals"]}
+        self.assertIn(("午餐", "tomato_egg_lunch"), recent)
+        self.assertIn(("晚餐", "tomato_chicken"), recent)
+
     def test_home_cooking_history_rotation_and_repeat_reason(self):
         settings_path = Path(self.temp.name) / "settings.json"
         settings_path.write_text(
@@ -1086,6 +1169,11 @@ class WebAppTest(unittest.TestCase):
         status, _, page = self.request("GET", "/setup/welcome")
         self.assertEqual(200, status)
         self.assertIn("隐私与边界", page.decode("utf-8"))
+        status, _, constraints_page = self.request("GET", "/setup/constraints")
+        self.assertEqual(200, status)
+        decoded_constraints = constraints_page.decode("utf-8")
+        for label in ("早餐通常怎样准备", "午餐通常怎样准备", "晚餐通常怎样准备", "在家下厨（生成执行卡）"):
+            self.assertIn(label, decoded_constraints)
         session = personalization.onboarding_status()["session"]
         invalid_welcome = urllib.parse.urlencode({
             "session_id": session["id"], "version": str(session["version"]),
@@ -1103,7 +1191,7 @@ class WebAppTest(unittest.TestCase):
             ("baseline", {"age_years": "31", "physiological_input": "unspecified", "activity_level": "moderate"}),
             ("safety", {"life_stage": "adult", **{key: "no" for key in personalization.OBSERVATION_FLAGS}}),
             ("training", {"types": ["strength"], "frequency_per_week": "3"}),
-            ("constraints", {"meal_environment": "工作日外食，晚餐在家", "portion_method": "手掌份量", "cooking_time_minutes": "20", "question_budget": "2", "equipment": "炒锅, 电饭煲", "food_exclusions": "花生", "preferences": "酸辣"}),
+            ("constraints", {"meal_environment": "午餐和晚餐在家", "portion_method": "手掌份量", "meal_mode_breakfast": "quick_assembly", "meal_mode_lunch": "home_cook", "meal_mode_dinner": "home_cook", "cooking_time_minutes": "20", "question_budget": "2", "equipment": "炒锅, 电饭煲", "food_exclusions": "花生", "preferences": "酸辣"}),
         ]
         version = session["version"]
         for step, values in steps:
@@ -1115,7 +1203,10 @@ class WebAppTest(unittest.TestCase):
         status, headers, _ = self.request("POST", "/setup/complete", payload, {"Content-Type": "application/x-www-form-urlencoded"})
         self.assertEqual(303, status)
         self.assertEqual("/", headers["Location"])
-        self.assertEqual(2, personalization.active_personalization()["profile"]["version"])
+        active = personalization.active_personalization()
+        self.assertEqual(2, active["profile"]["version"])
+        self.assertEqual("home_cook", active["strategy"]["strategy_json"]["meal_modes"]["lunch"])
+        self.assertEqual("home_cook", active["strategy"]["strategy_json"]["meal_modes"]["dinner"])
 
     def test_photo_upload_form(self):
         boundary = "----MealCircuitTestBoundary"
@@ -1353,18 +1444,18 @@ class WebAppTest(unittest.TestCase):
     def test_home_cooking_menu_web_display(self):
         settings_path = Path(self.temp.name) / "settings.json"
         settings_path.write_text(
-            json.dumps({**TEST_SETTINGS, "home_cooking": HOME_COOKING}, ensure_ascii=False), encoding="utf-8"
+            json.dumps({**TEST_SETTINGS, "home_cooking": HOME_COOKING_LUNCH_DINNER}, ensure_ascii=False), encoding="utf-8"
         )
         review_date = date.today().isoformat()
-        service.add_daily_record(review_date, "独居晚餐页面测试")
-        result = home_cooking_review_result(review_date)
+        service.add_daily_record(review_date, "午餐和晚餐自炊页面测试")
+        result = lunch_dinner_home_cooking_result(review_date)
         result["tomorrow_menu"]["meals"][2]["recipe_card"]["title"] = "番茄<script>鸡肉</script>"
         service.complete_daily_review(review_date, result)
         status, _, body = self.request("GET", f"/reviews/{review_date}")
         decoded = body.decode("utf-8")
         self.assertEqual(status, 200)
         for label in (
-            "快速组装", "食堂 / 外食", "在家下厨", "BEGINNER DINNER", "明日采购清单",
+            "快速组装", "在家下厨", "BEGINNER LUNCH", "BEGINNER DINNER", "明日采购清单",
             "可选网购组件", "3 日食材复用方向", "失败补救", "清洁成本", "肠胃降级",
         ):
             self.assertIn(label, decoded)

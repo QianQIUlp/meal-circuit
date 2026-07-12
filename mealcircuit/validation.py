@@ -3,6 +3,8 @@ from __future__ import annotations
 from typing import Any
 from datetime import date, timedelta
 
+from .meal_modes import MEAL_KEYS, MEAL_NAMES, legacy_home_meal_modes, meal_rotation
+
 
 class ValidationError(ValueError):
     pass
@@ -159,6 +161,13 @@ def validate_daily_review_result(value: Any, expected_settings: dict | None = No
         raise ValidationError("tomorrow_menu.meals 必须各包含一次早餐、午餐、晚餐")
 
     home_cooking = (expected_settings or {}).get("home_cooking") or {"enabled": False}
+    meal_modes = (expected_settings or {}).get("meal_modes") or legacy_home_meal_modes(home_cooking)
+    if expected_settings and (expected_settings.get("meal_modes") or home_cooking.get("enabled")):
+        meals_by_name = {meal["name"]: meal for meal in meals}
+        for key in MEAL_KEYS:
+            name, expected_mode = MEAL_NAMES[key], meal_modes[key]
+            if meals_by_name[name].get("mode") != expected_mode:
+                raise ValidationError(f"{name}.mode 必须是 {expected_mode}")
     if home_cooking.get("enabled"):
         _validate_home_cooking_menu(menu, meals, home_cooking, menu_date)
 
@@ -171,54 +180,14 @@ def validate_daily_review_result(value: Any, expected_settings: dict | None = No
 
 
 def _validate_home_cooking_menu(menu: dict, meals: list, settings: dict, menu_date: str) -> None:
-    expected_modes = {"早餐": "quick_assembly", "午餐": "eat_out", "晚餐": "home_cook"}
     meals_by_name = {meal["name"]: meal for meal in meals}
-    for name, mode in expected_modes.items():
-        if meals_by_name[name].get("mode") != mode:
-            raise ValidationError(f"{name}.mode 必须是 {mode}")
-
-    recipe = _required_object(meals_by_name["晚餐"].get("recipe_card"), "晚餐.recipe_card")
-    _required_text(recipe.get("title"), "晚餐.recipe_card.title")
-    if recipe.get("servings") != settings["servings"]:
-        raise ValidationError(f"晚餐.recipe_card.servings 必须是 {settings['servings']}")
-    active_minutes = recipe.get("active_minutes")
-    total_minutes = recipe.get("total_minutes")
-    for value, name in ((active_minutes, "active_minutes"), (total_minutes, "total_minutes")):
-        if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
-            raise ValidationError(f"晚餐.recipe_card.{name} 必须是正整数")
-    if active_minutes > total_minutes or total_minutes > settings["weekday_time_limit_minutes"]:
-        raise ValidationError(f"晚餐总时间不得超过 {settings['weekday_time_limit_minutes']} 分钟")
-    cookware = _text_list(recipe.get("cookware"), "晚餐.recipe_card.cookware", minimum=1, maximum=2)
-    if any(item not in settings["equipment"] for item in cookware):
-        raise ValidationError("晚餐.recipe_card.cookware 包含配置外设备")
-    ingredients = _required_list(recipe.get("ingredients"), "晚餐.recipe_card.ingredients")
-    if not ingredients:
-        raise ValidationError("晚餐.recipe_card.ingredients 不能为空")
-    for index, item in enumerate(ingredients):
-        item = _required_object(item, f"晚餐.recipe_card.ingredients[{index}]")
-        for field in ("name", "amount", "prep"):
-            _required_text(item.get(field), f"晚餐.recipe_card.ingredients[{index}].{field}")
-    seasonings = _required_list(recipe.get("seasonings"), "晚餐.recipe_card.seasonings")
-    if not seasonings:
-        raise ValidationError("晚餐.recipe_card.seasonings 不能为空")
-    for index, item in enumerate(seasonings):
-        item = _required_object(item, f"晚餐.recipe_card.seasonings[{index}]")
-        for field in ("name", "amount", "timing"):
-            _required_text(item.get(field), f"晚餐.recipe_card.seasonings[{index}].{field}")
-    steps = _required_list(recipe.get("steps"), "晚餐.recipe_card.steps")
-    if not steps:
-        raise ValidationError("晚餐.recipe_card.steps 不能为空")
-    for index, item in enumerate(steps):
-        item = _required_object(item, f"晚餐.recipe_card.steps[{index}]")
-        _required_text(item.get("instruction"), f"晚餐.recipe_card.steps[{index}].instruction")
-        _required_text(item.get("heat"), f"晚餐.recipe_card.steps[{index}].heat")
-        _required_text(item.get("done_signal"), f"晚餐.recipe_card.steps[{index}].done_signal")
-        minutes = item.get("minutes")
-        if not isinstance(minutes, (int, float)) or isinstance(minutes, bool) or minutes <= 0:
-            raise ValidationError(f"晚餐.recipe_card.steps[{index}].minutes 必须是正数")
-    _text_list(recipe.get("failure_rescue"), "晚餐.recipe_card.failure_rescue", minimum=1)
-    _required_text(recipe.get("cleanup"), "晚餐.recipe_card.cleanup")
-    _required_text(recipe.get("gut_fallback"), "晚餐.recipe_card.gut_fallback")
+    meal_modes = settings.get("meal_modes") or legacy_home_meal_modes(settings)
+    home_meal_names = [MEAL_NAMES[key] for key in MEAL_KEYS if meal_modes[key] == "home_cook"]
+    if not home_meal_names:
+        raise ValidationError("home_cooking.enabled 时至少一个餐次必须为 home_cook")
+    for meal_name in home_meal_names:
+        _validate_home_recipe(meals_by_name[meal_name], meal_name, settings)
+        _validate_meal_rotation(menu, meals_by_name[meal_name], meal_name)
 
     shopping = _required_list(menu.get("shopping_list"), "tomorrow_menu.shopping_list")
     if not shopping:
@@ -266,14 +235,61 @@ def _validate_home_cooking_menu(menu: dict, meals: list, settings: dict, menu_da
                 raise ValidationError("reuse date 必须位于明日之后的复用窗口内")
             _required_text(use.get("use"), "reuse use")
 
-    rotation = _required_object(menu.get("rotation"), "tomorrow_menu.rotation")
+
+def _validate_home_recipe(meal: dict, meal_name: str, settings: dict) -> None:
+    recipe = _required_object(meal.get("recipe_card"), f"{meal_name}.recipe_card")
+    _required_text(recipe.get("title"), f"{meal_name}.recipe_card.title")
+    if recipe.get("servings") != settings["servings"]:
+        raise ValidationError(f"{meal_name}.recipe_card.servings 必须是 {settings['servings']}")
+    active_minutes = recipe.get("active_minutes")
+    total_minutes = recipe.get("total_minutes")
+    for value, name in ((active_minutes, "active_minutes"), (total_minutes, "total_minutes")):
+        if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+            raise ValidationError(f"{meal_name}.recipe_card.{name} 必须是正整数")
+    if active_minutes > total_minutes or total_minutes > settings["weekday_time_limit_minutes"]:
+        raise ValidationError(f"{meal_name}总时间不得超过 {settings['weekday_time_limit_minutes']} 分钟")
+    cookware = _text_list(recipe.get("cookware"), f"{meal_name}.recipe_card.cookware", minimum=1, maximum=2)
+    if any(item not in settings["equipment"] for item in cookware):
+        raise ValidationError(f"{meal_name}.recipe_card.cookware 包含配置外设备")
+    ingredients = _required_list(recipe.get("ingredients"), f"{meal_name}.recipe_card.ingredients")
+    if not ingredients:
+        raise ValidationError(f"{meal_name}.recipe_card.ingredients 不能为空")
+    for index, item in enumerate(ingredients):
+        item = _required_object(item, f"{meal_name}.recipe_card.ingredients[{index}]")
+        for field in ("name", "amount", "prep"):
+            _required_text(item.get(field), f"{meal_name}.recipe_card.ingredients[{index}].{field}")
+    seasonings = _required_list(recipe.get("seasonings"), f"{meal_name}.recipe_card.seasonings")
+    if not seasonings:
+        raise ValidationError(f"{meal_name}.recipe_card.seasonings 不能为空")
+    for index, item in enumerate(seasonings):
+        item = _required_object(item, f"{meal_name}.recipe_card.seasonings[{index}]")
+        for field in ("name", "amount", "timing"):
+            _required_text(item.get(field), f"{meal_name}.recipe_card.seasonings[{index}].{field}")
+    steps = _required_list(recipe.get("steps"), f"{meal_name}.recipe_card.steps")
+    if not steps:
+        raise ValidationError(f"{meal_name}.recipe_card.steps 不能为空")
+    for index, item in enumerate(steps):
+        item = _required_object(item, f"{meal_name}.recipe_card.steps[{index}]")
+        _required_text(item.get("instruction"), f"{meal_name}.recipe_card.steps[{index}].instruction")
+        _required_text(item.get("heat"), f"{meal_name}.recipe_card.steps[{index}].heat")
+        _required_text(item.get("done_signal"), f"{meal_name}.recipe_card.steps[{index}].done_signal")
+        minutes = item.get("minutes")
+        if not isinstance(minutes, (int, float)) or isinstance(minutes, bool) or minutes <= 0:
+            raise ValidationError(f"{meal_name}.recipe_card.steps[{index}].minutes 必须是正数")
+    _text_list(recipe.get("failure_rescue"), f"{meal_name}.recipe_card.failure_rescue", minimum=1)
+    _required_text(recipe.get("cleanup"), f"{meal_name}.recipe_card.cleanup")
+    _required_text(recipe.get("gut_fallback"), f"{meal_name}.recipe_card.gut_fallback")
+
+
+def _validate_meal_rotation(menu: dict, meal: dict, meal_name: str) -> None:
+    rotation = _required_object(meal_rotation(menu, meal), f"{meal_name}.rotation")
     for field in ("dish_key", "primary_protein", "primary_vegetable", "flavor_profile", "technique"):
-        _required_text(rotation.get(field), f"tomorrow_menu.rotation.{field}")
+        _required_text(rotation.get(field), f"{meal_name}.rotation.{field}")
     repeat_reason = rotation.get("repeat_reason")
     if repeat_reason is not None and repeat_reason not in {
         "health_recovery", "ingredient_expiry", "shopping_constraint"
     }:
-        raise ValidationError("tomorrow_menu.rotation.repeat_reason 无效")
+        raise ValidationError(f"{meal_name}.rotation.repeat_reason 无效")
 
 
 def nutrition_number(value: str | None, field: str) -> float | None:

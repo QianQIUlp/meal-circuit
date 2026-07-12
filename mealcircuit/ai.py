@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
+from .meal_modes import legacy_home_meal_modes
 from .validation import ValidationError
 
 
@@ -360,8 +361,12 @@ def result_json_schema(kind: str, context: dict | None = None) -> dict:
             },
         }
     if kind == "daily":
-        home = ((context or {}).get("settings") or {}).get("home_cooking") or {"enabled": False}
-        schema = _daily_json_schema(nutrition, bool(home.get("enabled")))
+        settings = (context or {}).get("settings") or {}
+        home = settings.get("home_cooking") or {"enabled": False}
+        meal_modes = settings.get("meal_modes") or (
+            legacy_home_meal_modes(home) if home.get("enabled") else None
+        )
+        schema = _daily_json_schema(nutrition, bool(home.get("enabled")), meal_modes)
         return schema
     if kind == "rescue":
         return {
@@ -379,18 +384,21 @@ def result_json_schema(kind: str, context: dict | None = None) -> dict:
     raise ValidationError(f"未知生成类型：{kind}")
 
 
-def _daily_json_schema(nutrition: dict, home_cooking: bool) -> dict:
+def _daily_json_schema(nutrition: dict, home_cooking: bool, meal_modes: dict | None = None) -> dict:
+    meal_required = ["name", "foods", "portion_guidance", "protein_g", "substitutions"]
+    if meal_modes:
+        meal_required.append("mode")
     meal = {
         "type": "object",
         "additionalProperties": True,
-        "required": ["name", "foods", "portion_guidance", "protein_g", "substitutions"],
+        "required": meal_required,
         "properties": {
             "name": {"type": "string", "enum": ["早餐", "午餐", "晚餐"]},
             "foods": _string_array(min_items=1),
             "portion_guidance": {"type": "string"},
             "protein_g": _range_schema(),
             "substitutions": _string_array(),
-            "mode": {"type": "string"},
+            "mode": {"type": "string", "enum": ["home_cook", "quick_assembly", "eat_out"]},
         },
     }
     menu_properties = {

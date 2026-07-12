@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from .meal_modes import home_cooked_meal_names
 from .validation import VALIDATOR_VERSION, ValidationError
 
 
@@ -55,21 +56,22 @@ def compile_constraints(context: dict) -> list[dict]:
             "source": "confirmed_profile",
         })
     if home.get("enabled"):
-        compiled.extend([{
-            "id": "home-time-limit",
-            "kind": "max_total_minutes",
-            "hard": True,
-            "value": home["weekday_time_limit_minutes"],
-            "meal_name": "晚餐",
-            "source": "home_cooking_settings",
-        }, {
-            "id": "home-equipment",
-            "kind": "allowed_cookware",
-            "hard": True,
-            "value": home["equipment"],
-            "meal_name": "晚餐",
-            "source": "home_cooking_settings",
-        }])
+        for meal_name in home_cooked_meal_names(settings):
+            compiled.extend([{
+                "id": f"home-time-limit:{meal_name}",
+                "kind": "max_total_minutes",
+                "hard": True,
+                "value": home["weekday_time_limit_minutes"],
+                "meal_name": meal_name,
+                "source": "versioned_meal_mode_strategy",
+            }, {
+                "id": f"home-equipment:{meal_name}",
+                "kind": "allowed_cookware",
+                "hard": True,
+                "value": home["equipment"],
+                "meal_name": meal_name,
+                "source": "versioned_meal_mode_strategy",
+            }])
     for rule in context.get("confirmed_rules") or []:
         effect = rule.get("effect_json") or {}
         action = effect.get("action")

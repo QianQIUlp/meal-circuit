@@ -5,6 +5,7 @@ This file tracks the approved end-to-end delivery against concrete code and veri
 | Requirement | Current classification | Code / evidence | Completion gate |
 | --- | --- | --- | --- |
 | Versioned profile, goals, strategy, metrics | implemented | `personalization.py`; versioned target provenance and optimistic onboarding tests | automated tests pass |
+| Per-meal preparation strategy | implemented | onboarding persists breakfast/lunch/dinner modes in the versioned personal strategy; each home-cooked slot has an independent card, constraints, rotation and history | dual lunch/dinner integration and Web tests pass |
 | Safety-aware onboarding and eligibility | implemented | one `generation_policy()` / `require_generation()` gate covers Web, CLI, context, generate, complete and rescue | standard, setup, clinician-guided and restricted tests pass |
 | Restricted-mode schemas and settings | implemented | fact-only Result v2 schemas; restricted settings and plan lookup suppress old targets/prescriptions | no-leak and old-plan tests pass |
 | Evidence capture and review requeue | implemented | task evidence links, capture UI/CLI, correction requeue and manifest IDs | integration tests pass |
@@ -18,7 +19,7 @@ This file tracks the approved end-to-end delivery against concrete code and veri
 | Data portability and recovery | implemented | SHA manifest, integrity/schema preview, pre-restore backup, atomic DB replacement, Web/CLI | round trip passes |
 | Backward compatibility | implemented | prefill active/legacy settings; setup only gates generation; legacy overview remains reachable | legacy suite passes |
 | Accessibility | verified | semantic forms/errors, keyboard focus trap/inert drawer, responsive grids, reduced motion | automated markup and real-browser 320/720/1440 effective-viewport checks pass with one h1, zero unlabeled controls, no horizontal overflow and no console warnings/errors |
-| Full verification and draft PR | verified and delivered | 67/67 tests on local Python 3.11.9 and 3.13; release/compile/diff checks; isolated browser rerun; [Draft PR #14](https://github.com/QianQIUlp/meal-circuit/pull/14) open against `main` | GitHub reports `OPEN`, `isDraft=true`; Python 3.11/3.13 push and pull-request checks pass |
+| Full verification and draft PR | local verification complete | 69/69 tests on Python 3.12.13 and 3.13; isolated real-browser dual-meal flow passed at 320/1440 px; [Draft PR #14](https://github.com/QianQIUlp/meal-circuit/pull/14) remains open against `main` | GitHub push and pull-request checks pass |
 
 ## Classification decision
 
