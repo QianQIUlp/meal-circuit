@@ -215,6 +215,6 @@
 - Web/CLI：Web 主流程为“今天 / 计划 / 记录 / 洞察 / 学习确认 / 库存 / 目标与边界”，并提供初始化、回执修订、救场、指标、实验和备份恢复；CLI 覆盖 setup、plan、feedback、questions、learning/rules/experiments、inventory、evidence、rescue、metric、calibration、export/import。
 - 无障碍：表单错误使用 `role=alert`；移动抽屉设置 `aria-hidden`、背景 inert、焦点进入/返回与 Tab 循环；页面保持单一 h1、原生标签控件、键盘路径、减少动画和 320px 单列响应式布局。
 - 验证：领域专项 22 项通过；最近一次全量 67 项、`compileall`、`git diff --check` 和 `tools/release_check.py` 零命中。隔离数据库真实浏览器已完成七步初始化、实验提出/启动/完成、指标历史、正式计划救场及回执回写；320/720/1440 有效视口均无横向溢出，移动导航通过焦点进入/返回、Escape 与背景 inert 验证，页面保持单一 h1、控件标签完整且无控制台警告或错误。此前还验证了记录、问题、候选规则、数据页和受限模式无旧目标泄漏。
-- 仍未实现：无自动后台模型、账户、云同步、诊断、治疗建议或自动接受学习规则；这些是明确产品边界，不是本闭环缺口。Draft PR 尚待最终全量门禁后创建。
-- 下一任务：重跑全部门禁，提交最终验证记录并推送 Draft PR。
+- 仍未实现：无自动后台模型、账户、云同步、诊断、治疗建议或自动接受学习规则；这些是明确产品边界，不是本闭环缺口。
+- 下一任务：Draft PR #14 已创建并保持 Draft；等待 GitHub Actions 后由 reviewer 审阅，不自动合并或标记 Ready。
 - 用户用法：运行 `.\start.ps1` 后按 Web 初始化进入“今天”；先记录真实情况，打开正式计划执行并回执，重复阻力会出现在“学习确认”；“目标与边界 → 备份与迁移”可导出完整 ZIP。也可用 `python -m mealcircuit.agent_cli --help` 查看同等 CLI 流程。
