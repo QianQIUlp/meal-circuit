@@ -10,10 +10,19 @@ from pathlib import Path
 from typing import BinaryIO
 
 from . import checkins
-from .configuration import load_doctrine, load_settings
+from .configuration import load_doctrine, load_resolved_settings, load_settings
 from .db import connect, init_db, row_dict
+from .meal_modes import (
+    LEGACY_DEFAULT_MEAL_MODES,
+    MEAL_KEYS,
+    MEAL_KEYS_BY_NAME,
+    MEAL_NAMES,
+    home_cooked_meal_names,
+    legacy_home_meal_modes,
+    meal_rotation,
+)
 from .storage import resolve_data_path, store_data_path, upload_root
-from .validation import ValidationError, validate_daily_review_result, validate_result
+from .validation import VALIDATOR_VERSION, ValidationError, validate_daily_review_result, validate_result
 
 MAX_UPLOAD_BYTES = 10 * 1024 * 1024
 IMAGE_SIGNATURES = {
@@ -31,6 +40,82 @@ def now() -> str:
 
 def new_id(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex[:12]}"
+
+
+def _client_identity(client=None) -> tuple[str | None, str | None]:
+    if client is not None:
+        config = getattr(client, "config", None)
+        return (
+            getattr(config, "provider", None) or client.__class__.__name__,
+            getattr(config, "model", None) or "injected-client",
+        )
+    from .ai import ai_status
+
+    status = ai_status()
+    return status.get("provider"), status.get("model")
+
+
+def _start_agent_run(
+    kind: str,
+    context: dict,
+    client=None,
+    *,
+    identity: tuple[str | None, str | None] | None = None,
+) -> str:
+    provider, model = identity or _client_identity(client)
+    run_id = new_id("agent_run")
+    policy = context.get("generation_policy") or {}
+    source_manifest = dict(context.get("source_manifest") or {})
+    source_manifest["agent_run_id"] = run_id
+    with connect() as conn:
+        conn.execute(
+            """INSERT INTO agent_runs(
+                   id,kind,provider,model,context_hash,context_schema_version,result_schema_version,
+                   policy_version,validator_version,source_manifest_json,status,started_at
+               ) VALUES(?,?,?,?,?,?,?,?,?,?,'running',?)""",
+            (
+                run_id,
+                kind,
+                provider,
+                model,
+                context.get("context_hash") or "",
+                int(context.get("context_schema_version") or 1),
+                int(context.get("result_schema_version") or 1),
+                policy.get("policy_version") or "",
+                VALIDATOR_VERSION,
+                json.dumps(source_manifest, ensure_ascii=False, sort_keys=True),
+                now(),
+            ),
+        )
+    return run_id
+
+
+def _source_manifest_for_commit(context: dict, agent_run_id: str | None) -> dict:
+    manifest = dict(context.get("source_manifest") or {})
+    manifest["agent_run_id"] = agent_run_id
+    return manifest
+
+
+def _finish_agent_run(run_id: str, *, result: dict | None = None, error: Exception | None = None) -> None:
+    status = "failed" if error is not None else "completed"
+    error_summary = "" if error is None else f"{error.__class__.__name__}: {str(error)[:500]}"
+    result_hash = ""
+    attempts = []
+    if result is not None:
+        result_hash = hashlib.sha256(
+            json.dumps(result, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+        ).hexdigest()
+        attempts.append({"attempt": 1, "status": "valid"})
+    elif error is not None:
+        attempts.append({"attempt": 1, "status": "failed", "error": error_summary})
+    with connect() as conn:
+        updated = conn.execute(
+            """UPDATE agent_runs SET status=?,error_summary=?,validation_attempts_json=?,result_hash=?,completed_at=?
+               WHERE id=? AND status='running'""",
+            (status, error_summary, json.dumps(attempts, ensure_ascii=False), result_hash, now(), run_id),
+        )
+        if updated.rowcount != 1:
+            raise ValidationError("Agent 运行状态已变化")
 
 
 def _detect_image(data: bytes) -> str:
@@ -156,30 +241,87 @@ def update_task_input(task_id: str, text: str, expected_version: int) -> dict:
     return get_task(task_id)
 
 
-def complete_task(task_id: str, result: dict) -> dict:
+def complete_task(
+    task_id: str,
+    result: dict,
+    *,
+    provenance_context: dict | None = None,
+    agent_run_id: str | None = None,
+) -> dict:
     task = get_task(task_id)
     if task["status"] == "completed":
         raise ValidationError("任务已完成；不得覆盖原结果，请新增用户校正")
-    validate_result(task["type"], result)
+    from .personalization import require_generation
+
+    policy = require_generation(task["type"])
+    context = provenance_context or task_context(task_id)
+    validate_result(task["type"], result, fact_only=policy["fact_only"])
+    from .planning import enrich_task_result
+
+    result = enrich_task_result(result, context)
     with connect() as conn:
         updated = conn.execute(
             """UPDATE tasks SET status='completed', result_json=?, result_version=1,
-               completed_at=? WHERE id=? AND status='pending'""",
-            (json.dumps(result, ensure_ascii=False), now(), task_id),
+               schema_version=2,policy_version=?,validator_version=?,source_manifest_json=?,
+               context_hash=?,agent_run_id=?,completed_at=? WHERE id=? AND status='pending'""",
+            (
+                json.dumps(result, ensure_ascii=False),
+                policy["policy_version"],
+                VALIDATOR_VERSION,
+                json.dumps(_source_manifest_for_commit(context, agent_run_id), ensure_ascii=False, sort_keys=True),
+                context.get("context_hash") or "",
+                agent_run_id,
+                now(),
+                task_id,
+            ),
         )
         if updated.rowcount != 1:
             raise ValidationError("任务状态已变化，请重新读取")
+    from .adaptive import linked_dates
+
+    for observed_date in linked_dates(task_id):
+        queue_review_for_external_change(observed_date, "task_evidence_completed")
     return get_task(task_id)
 
 
 def generate_task_result(task_id: str, client=None) -> dict:
     from .ai import generate_json
+    from .personalization import require_generation
 
     task = get_task(task_id)
     if task["status"] == "completed":
         raise ValidationError("任务已完成；不得覆盖原结果，请新增用户校正")
-    result = generate_json(task_context(task_id), task["type"], client)
-    return complete_task(task_id, result)
+    require_generation(task["type"])
+    context = task_context(task_id)
+    run_id = _start_agent_run(task["type"], context, client)
+    try:
+        result = generate_json(context, task["type"], client)
+        completed = complete_task(
+            task_id,
+            result,
+            provenance_context=context,
+            agent_run_id=run_id,
+        )
+    except Exception as exc:
+        _finish_agent_run(run_id, error=exc)
+        raise
+    _finish_agent_run(run_id, result=result)
+    return completed
+
+
+def submit_task_result(task_id: str, result: dict) -> dict:
+    task = get_task(task_id)
+    context = task_context(task_id)
+    run_id = _start_agent_run(
+        task["type"], context, identity=("external_agent", "structured_json_submission")
+    )
+    try:
+        completed = complete_task(task_id, result, provenance_context=context, agent_run_id=run_id)
+    except Exception as exc:
+        _finish_agent_run(run_id, error=exc)
+        raise
+    _finish_agent_run(run_id, result=result)
+    return completed
 
 
 def add_correction(task_id: str, correction: dict) -> dict:
@@ -195,6 +337,10 @@ def add_correction(task_id: str, correction: dict) -> dict:
             "INSERT INTO task_corrections(id,task_id,correction_json,created_at) VALUES(?,?,?,?)",
             (correction_id, task_id, json.dumps(payload, ensure_ascii=False), now()),
         )
+    from .adaptive import linked_dates
+
+    for observed_date in linked_dates(task_id):
+        queue_review_for_external_change(observed_date, "task_evidence_corrected")
     return get_task(task_id)
 
 
@@ -347,6 +493,20 @@ def _checkin_versions_for_date(conn, record_date: str) -> dict[str, int]:
     return {row["module_key"]: row["version"] for row in rows}
 
 
+def _evidence_link_ids_for_date(conn, record_date: str) -> list[str]:
+    return [row["id"] for row in conn.execute(
+        "SELECT id FROM task_evidence_links WHERE observed_date=? ORDER BY created_at,id", (record_date,)
+    ).fetchall()]
+
+
+def _has_daily_source(conn, record_date: str) -> bool:
+    return bool(
+        _record_ids_for_date(conn, record_date)
+        or _checkin_versions_for_date(conn, record_date)
+        or _evidence_link_ids_for_date(conn, record_date)
+    )
+
+
 def _queue_daily_review(conn, record_date: str, archive_reason: str = "new_daily_record") -> None:
     timestamp = now()
     source_ids = _record_ids_for_date(conn, record_date)
@@ -366,19 +526,41 @@ def _queue_daily_review(conn, record_date: str, archive_reason: str = "new_daily
         conn.execute(
             """INSERT INTO daily_review_history(
                 id,review_id,version,source_record_ids_json,source_checkin_versions_json,
-                result_json,completed_at,archived_at,archive_reason
-            ) VALUES(?,?,?,?,?,?,?,?,?)""",
+                result_json,completed_at,archived_at,archive_reason,schema_version,review_mode,
+                source_manifest_json,context_hash,agent_run_id,policy_version,validator_version,plan_version_id
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 new_id("review_history"), review["id"], review["result_version"],
                 review["source_record_ids_json"], review["source_checkin_versions_json"],
                 review["result_json"], review["completed_at"], timestamp, archive_reason,
+                review["schema_version"], review["review_mode"], review["source_manifest_json"], review["context_hash"],
+                review["agent_run_id"], review["policy_version"], review["validator_version"],
+                review["plan_version_id"],
             ),
         )
     conn.execute(
-        """UPDATE daily_reviews SET status='pending',source_record_ids_json=?,source_checkin_versions_json=?,result_json=NULL,
-           updated_at=?,completed_at=NULL WHERE review_date=?""",
+        """UPDATE daily_reviews SET status='pending',source_record_ids_json=?,source_checkin_versions_json=?,
+           result_json=NULL,source_manifest_json='{}',context_hash='',agent_run_id=NULL,
+           policy_version='',validator_version='',plan_version_id=NULL,updated_at=?,completed_at=NULL
+           WHERE review_date=?""",
         (source_json, checkin_versions_json, timestamp, record_date),
     )
+
+
+def queue_review_for_external_change(record_date: str, reason: str) -> dict:
+    try:
+        date.fromisoformat(record_date)
+    except ValueError as exc:
+        raise ValidationError("日期必须是 YYYY-MM-DD") from exc
+    reason = reason.strip()
+    if not reason:
+        raise ValidationError("重新排队必须说明原因")
+    init_db()
+    with connect() as conn:
+        if not _has_daily_source(conn, record_date):
+            raise ValidationError("该日期没有可用记录、状态或任务证据")
+        _queue_daily_review(conn, record_date, reason)
+    return get_daily_review(record_date)
 
 
 def _validate_checkin_date(value: str) -> str:
@@ -639,8 +821,8 @@ def ensure_daily_review(review_date: str) -> dict:
         raise ValidationError("日期必须是 YYYY-MM-DD") from exc
     init_db()
     with connect() as conn:
-        if not _record_ids_for_date(conn, review_date) and not _checkin_versions_for_date(conn, review_date):
-            raise ValidationError("该日期没有每日记录或已发布状态")
+        if not _has_daily_source(conn, review_date):
+            raise ValidationError("该日期没有每日记录、已发布状态或任务证据")
         existing = conn.execute("SELECT id FROM daily_reviews WHERE review_date=?", (review_date,)).fetchone()
         if existing is None:
             _queue_daily_review(conn, review_date)
@@ -660,16 +842,22 @@ def requeue_daily_review(review_date: str, reason: str) -> dict:
         conn.execute(
             """INSERT INTO daily_review_history(
                 id,review_id,version,source_record_ids_json,source_checkin_versions_json,
-                result_json,completed_at,archived_at,archive_reason
-            ) VALUES(?,?,?,?,?,?,?,?,?)""",
+                result_json,completed_at,archived_at,archive_reason,schema_version,review_mode,
+                source_manifest_json,context_hash,agent_run_id,policy_version,validator_version,plan_version_id
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 new_id("review_history"), current["id"], current["result_version"],
                 current["source_record_ids_json"], current["source_checkin_versions_json"],
                 current["result_json"], current["completed_at"], timestamp, reason,
+                current["schema_version"], current["review_mode"], current["source_manifest_json"], current["context_hash"],
+                current["agent_run_id"], current["policy_version"], current["validator_version"],
+                current["plan_version_id"],
             ),
         )
         conn.execute(
-            """UPDATE daily_reviews SET status='pending',result_json=NULL,updated_at=?,completed_at=NULL
+            """UPDATE daily_reviews SET status='pending',result_json=NULL,source_manifest_json='{}',context_hash='',
+                   agent_run_id=NULL,policy_version='',validator_version='',plan_version_id=NULL,
+                   updated_at=?,completed_at=NULL
                WHERE review_date=?""", (timestamp, review_date)
         )
     return get_daily_review(review_date)
@@ -700,7 +888,7 @@ def list_daily_reviews(status: str | None = None) -> list[dict]:
 
 
 def daily_review_schema(settings: dict | None = None) -> dict:
-    settings = settings or load_settings()
+    settings = settings or load_resolved_settings()
     schema = {
         "system_status": "stable|observe|adjust|risk",
         "facts": ["string"],
@@ -724,6 +912,7 @@ def daily_review_schema(settings: dict | None = None) -> dict:
         "one_line_review": "string",
     }
     home = settings.get("home_cooking") or {"enabled": False}
+    meal_modes = settings.get("meal_modes") or legacy_home_meal_modes(home)
     if home.get("enabled"):
         meal_shape = schema["tomorrow_menu"]["meals"][0]
         recipe_card = {
@@ -735,11 +924,19 @@ def daily_review_schema(settings: dict | None = None) -> dict:
             "steps": [{"instruction": "string", "minutes": 1, "heat": "string", "done_signal": "string"}],
             "failure_rescue": ["string"], "cleanup": "string", "gut_fallback": "string",
         }
-        schema["tomorrow_menu"]["meals"] = [
-            {**meal_shape, "name": "早餐", "mode": "quick_assembly"},
-            {**meal_shape, "name": "午餐", "mode": "eat_out"},
-            {**meal_shape, "name": "晚餐", "mode": "home_cook", "recipe_card": recipe_card},
-        ]
+        rotation_card = {
+            "dish_key": "stable_string", "primary_protein": "string",
+            "primary_vegetable": "string", "flavor_profile": "stable_string",
+            "technique": "stable_string",
+            "repeat_reason": "omit unless health_recovery|ingredient_expiry|shopping_constraint",
+        }
+        schema["tomorrow_menu"]["meals"] = []
+        for key in MEAL_KEYS:
+            name, mode = MEAL_NAMES[key], meal_modes[key]
+            meal_spec = {**meal_shape, "name": name, "mode": mode}
+            if mode == "home_cook":
+                meal_spec.update({"recipe_card": recipe_card, "rotation": rotation_card})
+            schema["tomorrow_menu"]["meals"].append(meal_spec)
         schema["tomorrow_menu"].update({
             "shopping_list": [{
                 "name": "string", "amount": "string", "purpose": "string", "required": True,
@@ -753,41 +950,43 @@ def daily_review_schema(settings: dict | None = None) -> dict:
                 "ingredient": "string", "tomorrow_use": "string",
                 "later_uses": [{"date": "YYYY-MM-DD", "use": "string"}], "storage": "string",
             }]},
-            "rotation": {
-                "dish_key": "stable_string", "primary_protein": "string",
-                "primary_vegetable": "string", "flavor_profile": "stable_string",
-                "technique": "stable_string",
-                "repeat_reason": "omit unless health_recovery|ingredient_expiry|shopping_constraint",
-            },
         })
         schema["ingredient_carryover_decisions"] = [{
             "carryover_id": "string", "ingredient": "string", "decision": "use|skip|discard",
             "reason": "string", "planned_use": "string",
         }]
+    elif settings.get("meal_modes"):
+        meal_shape = schema["tomorrow_menu"]["meals"][0]
+        schema["tomorrow_menu"]["meals"] = [
+            {**meal_shape, "name": MEAL_NAMES[key], "mode": meal_modes[key]}
+            for key in MEAL_KEYS
+        ]
     return schema
 
 
 def _home_menu_history(rows: list) -> tuple[list[dict], list[str]]:
-    dinners, online_categories = [], []
+    meals, online_categories = [], []
     for row in rows:
         item = row_dict(row)
         result = item.get("result_json") or {}
         menu = result.get("tomorrow_menu") or {}
-        dinner = next((meal for meal in menu.get("meals", []) if meal.get("name") == "晚餐"), None)
-        if not dinner:
-            continue
-        recipe = dinner.get("recipe_card") or {}
-        dinners.append({
-            "review_date": item["review_date"],
-            "menu_date": menu.get("date"),
-            "title": recipe.get("title") or " / ".join(dinner.get("foods", [])),
-            "rotation": menu.get("rotation"),
-        })
+        for meal in menu.get("meals", []):
+            if meal.get("mode") != "home_cook" and not meal.get("recipe_card"):
+                continue
+            recipe = meal.get("recipe_card") or {}
+            meals.append({
+                "review_date": item["review_date"],
+                "menu_date": menu.get("date"),
+                "meal_name": meal.get("name"),
+                "meal_slot": MEAL_KEYS_BY_NAME.get(meal.get("name"), "unknown"),
+                "title": recipe.get("title") or " / ".join(meal.get("foods", [])),
+                "rotation": meal_rotation(menu, meal),
+            })
         for option in menu.get("online_options", []):
             category = option.get("category")
             if category and category not in online_categories:
                 online_categories.append(category)
-    return dinners, online_categories
+    return meals, online_categories
 
 
 def _carryover_id(source_key: str, menu_date: str, index: int, ingredient: str) -> str:
@@ -904,11 +1103,15 @@ def _recent_review_rows_for_carryover(review_date: str, days: int = 14) -> list:
 
 
 def daily_review_context(review_date: str, days: int = 14) -> dict:
+    from .personalization import require_generation
+    from .planning import PLANNING_POLICY_VERSION
+
+    generation_policy = require_generation("daily")
     review = ensure_daily_review(review_date)
     end = date.fromisoformat(review_date)
     cutoff = (end - timedelta(days=days - 1)).isoformat()
     doctrine = load_doctrine()
-    settings = load_settings()
+    settings = load_resolved_settings()
     with connect() as conn:
         records = [row_dict(row) for row in conn.execute(
             """SELECT * FROM daily_records WHERE record_date BETWEEN ? AND ?
@@ -940,7 +1143,8 @@ def daily_review_context(review_date: str, days: int = 14) -> dict:
         item["summary"] = checkins.summarize(item["module_key"], answers, item["status"])
         recent_checkins.append(item)
     target_state = get_checkin_state(review_date)
-    recent_home_dinners, recent_online_categories = _home_menu_history(recent_review_rows)
+    recent_home_meals, recent_online_categories = _home_menu_history(recent_review_rows)
+    recent_home_dinners = [item for item in recent_home_meals if item.get("meal_name") == "晚餐"]
     home_cooking = settings.get("home_cooking") or {"enabled": False}
     carryover_obligations = (
         _ingredient_carryover_obligations(review_date, recent_review_rows)
@@ -954,7 +1158,66 @@ def daily_review_context(review_date: str, days: int = 14) -> dict:
         }
         for item in target_state["modules"] if item["version"] > 0
     ]
-    return {
+    from . import adaptive
+    from .personalization import active_personalization
+
+    personalization = active_personalization()
+    evidence = [item for item in adaptive.meal_evidence(cutoff, review_date) if item["status"] == "completed"]
+    execution_feedback = adaptive.list_plan_feedback(cutoff, review_date)
+    adaptations = adaptive.active_adaptations(review_date)
+    inventory = adaptive.list_inventory()
+    experiment = adaptive.active_experiment()
+    planning_answers = adaptive.question_events_for_date(review_date, include_pending=False)
+    source_manifest = {
+        "records": [item["id"] for item in records],
+        "memories": [{"id": item["id"], "updated_at": item["updated_at"]} for item in memories],
+        "adjustments": [{"id": item["id"], "updated_at": item["updated_at"]} for item in adjustments],
+        "priority_foods": [{"id": item["id"], "updated_at": item["updated_at"]} for item in list_priority_foods()],
+        "checkins": [{"date": item["checkin_date"], "module": item["module_key"], "version": item["version"]} for item in recent_checkins],
+        "meal_evidence": [{
+            "link_id": item["id"], "task_id": item["task_id"], "result_version": item["result_version"],
+            "correction_ids": [correction["id"] for correction in item["corrections"]],
+        } for item in evidence],
+        "profile": ({
+            "id": personalization["profile"]["id"],
+            "version": personalization["profile"]["version"],
+            "safety_mode": personalization["safety"]["mode"],
+        } if personalization.get("profile") else None),
+        "goals": [{"id": item["id"], "version": item["version"]} for item in personalization.get("goals") or []],
+        "strategy": ({"id": personalization["strategy"]["id"], "version": personalization["strategy"]["version"]} if personalization.get("strategy") else None),
+        "targets": [{
+            "id": item["id"], "key": item["target_key"], "version": item["version"],
+            "policy_version": item["policy_version"], "source_kind": item["source_kind"],
+        } for item in personalization.get("targets") or []],
+        "feedback": [{"id": item["id"], "version": item["version"]} for item in execution_feedback],
+        "questions": [{
+            "id": item["id"], "key": item["question_key"], "version": item["version"], "status": item["status"],
+        } for item in planning_answers],
+        "rules": [{
+            "id": item["id"], "version": item["version"], "updated_at": item["updated_at"],
+            "scope_policy_version": item.get("scope_policy_version") or "",
+            "strategy_version_id": item.get("strategy_version_id"),
+        } for item in adaptations["confirmed_rules"]],
+        "inventory": [{"id": item["id"], "version": item["version"]} for item in inventory],
+        "experiment": ({
+            "id": experiment["id"], "version": experiment["version"], "updated_at": experiment["updated_at"],
+            "scope_policy_version": experiment.get("scope_policy_version") or "",
+        } if experiment else None),
+        "doctrine": {
+            "mode": doctrine["mode"],
+            "sha256": hashlib.sha256(doctrine["content"].encode("utf-8")).hexdigest(),
+        },
+        "policy_version": generation_policy["policy_version"],
+        "context_schema_version": 2,
+        "result_schema_version": 2,
+        "validator_version": VALIDATOR_VERSION,
+        "planning_policy_version": PLANNING_POLICY_VERSION,
+        "agent_run_id": None,
+    }
+    context = {
+        "context_schema_version": 2,
+        "result_schema_version": 2,
+        "generation_policy": generation_policy,
         "daily_review": review,
         "doctrine": doctrine,
         "recent_days": days,
@@ -971,30 +1234,58 @@ def daily_review_context(review_date: str, days: int = 14) -> dict:
         "priority_foods": list_priority_foods(),
         "settings": settings,
         "home_cooking_preferences": home_cooking,
+        "meal_modes": settings.get("meal_modes") or legacy_home_meal_modes(home_cooking),
+        "recent_home_meals": recent_home_meals,
         "recent_home_dinners": recent_home_dinners,
         "recent_online_categories": recent_online_categories,
         "ingredient_carryover_obligations": carryover_obligations,
+        "safety": personalization["safety"],
+        "active_profile": personalization.get("profile"),
+        "current_goals": personalization.get("goals") or [],
+        "active_strategy": personalization.get("strategy"),
+        "meal_evidence": evidence,
+        "recent_execution_feedback": execution_feedback,
+        "confirmed_rules": adaptations["confirmed_rules"],
+        "transient_adaptations": adaptations["transient"],
+        "inventory": inventory,
+        "active_experiment": experiment,
+        "planning_answers": planning_answers,
+        "source_manifest": source_manifest,
         "home_cooking_generation_protocol": [
-            "早餐使用低摩擦组装，午餐给外食规则，只有晚餐生成新手菜谱。",
-            "优先复用食材但轮换菜式；连续晚餐不重复 dish_key 或 flavor_profile。",
+            "逐餐严格读取 meal_modes；每个 home_cook 餐次分别生成一人份新手执行卡，quick_assembly 使用低摩擦组装，eat_out 给外食选择规则。",
+            "优先复用食材但按餐次轮换菜式；同一餐次连续两天不重复 dish_key 或 flavor_profile。",
             "生成明日菜单前必须逐项评估 ingredient_carryover_obligations；未过期且适合当前状态的食材优先组装进明日午餐或晚餐。",
             "临近过期的食材优先明日用完；已超过保存窗口、今日记录否定库存或与肠胃状态冲突时可跳过或丢弃，但必须说明原因。",
             "新采购清单不得在可用剩余食材能完成同等功能时重复购买。",
-            "总时间不得超过配置上限，最多两件主要炊具，每晚最多引入一个新技巧。",
+            "每个自炊餐次总时间不得超过配置上限，最多两件主要炊具，每餐最多引入一个新技巧。",
             "正常肠胃可用番茄、小米椒、醋和蒜香建立酸辣风味；异常时保留香鲜并降低辣、酸、油。",
             "网购仅给规格、筛选标准和搜索关键词，不提供商品链接、价格或库存断言；近14天已推荐品类默认不重复。",
         ] if home_cooking.get("enabled") else [],
         "result_schema": daily_review_schema(settings),
     }
+    context["context_hash"] = hashlib.sha256(
+        json.dumps(context, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()
+    return context
 
 
-def complete_daily_review(review_date: str, result: dict) -> dict:
+def complete_daily_review(
+    review_date: str,
+    result: dict,
+    *,
+    provenance_context: dict | None = None,
+    agent_run_id: str | None = None,
+) -> dict:
+    from .personalization import require_generation
+
+    policy = require_generation("daily")
     review = ensure_daily_review(review_date)
     if review["status"] == "completed":
         raise ValidationError("该日期复盘已完成；新增每日记录后才可重新复盘")
-    settings = load_settings()
+    context = provenance_context or daily_review_context(review_date)
+    settings = context["settings"]
     validate_daily_review_result(result, settings)
-    _validate_dinner_rotation(review_date, result, settings)
+    _validate_home_meal_rotation(review_date, result, settings)
     expected_priority_ids = {food["id"] for food in list_priority_foods()}
     submitted_priority_ids = {item["food_id"] for item in result["priority_food_decisions"]}
     if submitted_priority_ids != expected_priority_ids:
@@ -1010,26 +1301,247 @@ def complete_daily_review(review_date: str, result: dict) -> dict:
             review_date, _recent_review_rows_for_carryover(review_date)
         )
         _validate_ingredient_carryover_decisions(result, obligations)
+    from .planning import validate_and_enrich_daily_result
+
+    result = validate_and_enrich_daily_result(result, context)
     timestamp = now()
+    next_version = review["result_version"] + 1
+    menu = result.get("tomorrow_menu") or {}
+    for meal in menu.get("meals") or []:
+        if not meal.get("plan_item_id"):
+            meal["plan_item_id"] = "plan_" + hashlib.sha256(
+                f"{review['id']}|{next_version}|{meal.get('name','meal')}".encode("utf-8")
+            ).hexdigest()[:12]
+        if not meal.get("strategy_key"):
+            rotation = meal_rotation(menu, meal) or {}
+            if rotation.get("dish_key"):
+                meal["strategy_key"] = rotation["dish_key"]
+            else:
+                normalized = "|".join(sorted(str(item).strip().lower() for item in meal.get("foods") or []))
+                meal["strategy_key"] = "meal_" + hashlib.sha256(
+                    f"{meal.get('name','meal')}|{normalized}".encode("utf-8")
+                ).hexdigest()[:12]
+    safety_mode = (context.get("safety") or {}).get("mode") or "setup_required"
+    from .planning import MEAL_SLOTS
+
+    plan_version_id = new_id("plan_version")
+    plan_date = menu["date"]
+    committed_manifest = _source_manifest_for_commit(context, agent_run_id)
     with connect() as conn:
         updated = conn.execute(
             """UPDATE daily_reviews SET status='completed',result_json=?,result_version=result_version+1,
-               updated_at=?,completed_at=? WHERE review_date=? AND status='pending'""",
-            (json.dumps(result, ensure_ascii=False), timestamp, timestamp, review_date),
+               schema_version=2,review_mode=?,source_manifest_json=?,context_hash=?,agent_run_id=?,
+               policy_version=?,validator_version=?,plan_version_id=?,updated_at=?,completed_at=?
+               WHERE review_date=? AND status='pending'""",
+            (
+                json.dumps(result, ensure_ascii=False), safety_mode,
+                json.dumps(_source_manifest_for_commit(context, agent_run_id), ensure_ascii=False, sort_keys=True), context["context_hash"],
+                agent_run_id, policy["policy_version"], VALIDATOR_VERSION,
+                plan_version_id, timestamp, timestamp, review_date,
+            ),
         )
         if updated.rowcount != 1:
             raise ValidationError("复盘状态已变化，请重新读取")
+        conn.execute(
+            "UPDATE plan_versions SET status='superseded' WHERE plan_date=? AND status='published'",
+            (plan_date,),
+        )
+        conn.execute(
+            """INSERT INTO plan_versions(
+                   id,review_id,result_version,plan_date,status,schema_version,menu_json,
+                   source_manifest_json,context_hash,policy_version,validator_version,agent_run_id,created_at
+               ) VALUES(?,?,?,?,'published',2,?,?,?,?,?,?,?)""",
+            (
+                plan_version_id,
+                review["id"],
+                next_version,
+                plan_date,
+                json.dumps(menu, ensure_ascii=False),
+                json.dumps(committed_manifest, ensure_ascii=False, sort_keys=True),
+                context["context_hash"],
+                policy["policy_version"],
+                VALIDATOR_VERSION,
+                agent_run_id,
+                timestamp,
+            ),
+        )
+        for sort_order, meal in enumerate(menu.get("meals") or []):
+            conn.execute(
+                """INSERT INTO plan_items(
+                       id,plan_version_id,meal_slot,name,strategy_key,item_json,sort_order,created_at
+                   ) VALUES(?,?,?,?,?,?,?,?)""",
+                (
+                    meal["plan_item_id"],
+                    plan_version_id,
+                    MEAL_SLOTS.get(meal.get("name"), "other"),
+                    meal.get("name") or "未命名餐次",
+                    meal.get("strategy_key") or "",
+                    json.dumps(meal, ensure_ascii=False),
+                    sort_order,
+                    timestamp,
+                ),
+            )
     return get_daily_review(review_date)
 
 
 def generate_daily_review(review_date: str, client=None) -> dict:
     from .ai import generate_json
+    from .personalization import require_generation
 
     review = ensure_daily_review(review_date)
     if review["status"] == "completed":
         raise ValidationError("该日期复盘已完成；新增每日记录后才可重新复盘")
-    result = generate_json(daily_review_context(review_date), "daily", client)
-    return complete_daily_review(review_date, result)
+    require_generation("daily")
+    context = daily_review_context(review_date)
+    run_id = _start_agent_run("daily", context, client)
+    try:
+        result = generate_json(context, "daily", client)
+        completed = complete_daily_review(
+            review_date,
+            result,
+            provenance_context=context,
+            agent_run_id=run_id,
+        )
+    except Exception as exc:
+        _finish_agent_run(run_id, error=exc)
+        raise
+    _finish_agent_run(run_id, result=result)
+    return completed
+
+
+def submit_daily_review(review_date: str, result: dict) -> dict:
+    context = daily_review_context(review_date)
+    run_id = _start_agent_run(
+        "daily", context, identity=("external_agent", "structured_json_submission")
+    )
+    try:
+        completed = complete_daily_review(
+            review_date, result, provenance_context=context, agent_run_id=run_id
+        )
+    except Exception as exc:
+        _finish_agent_run(run_id, error=exc)
+        raise
+    _finish_agent_run(run_id, result=result)
+    return completed
+
+
+def rescue_context(rescue_id: str) -> dict:
+    from . import adaptive
+    from .personalization import active_personalization, require_generation
+    from .planning import PLANNING_POLICY_VERSION, compile_constraints
+
+    policy = require_generation("rescue")
+    session = adaptive.get_rescue_session(rescue_id)
+    plan = adaptive.get_plan_for_date(session["plan_date"])
+    if not plan:
+        raise ValidationError("救场对应的正式计划不存在")
+    plan_item = next(
+        (item for item in plan["menu"]["meals"] if item["plan_item_id"] == session["plan_item_id"]),
+        None,
+    )
+    if not plan_item:
+        raise ValidationError("救场对应的计划项目不存在")
+    personalization = active_personalization()
+    adaptations = adaptive.active_adaptations(session["plan_date"])
+    inventory = adaptive.list_inventory()
+    doctrine = load_doctrine()
+    context = {
+        "context_schema_version": 2,
+        "result_schema_version": 2,
+        "generation_policy": policy,
+        "doctrine": doctrine,
+        "rescue_session": session,
+        "plan": plan,
+        "plan_item": plan_item,
+        "settings": load_resolved_settings(),
+        "safety": personalization["safety"],
+        "active_profile": personalization.get("profile"),
+        "current_goals": personalization.get("goals") or [],
+        "active_strategy": personalization.get("strategy"),
+        "active_targets": personalization.get("targets") or [],
+        "confirmed_rules": adaptations["confirmed_rules"],
+        "inventory": inventory,
+        "result_schema": {
+            "reason": "string",
+            "steps": ["string"],
+            "replacement_foods": ["string"],
+            "portion_change": "string",
+            "safety_notes": ["string"],
+        },
+    }
+    context["compiled_constraints"] = compile_constraints(context)
+    context["source_manifest"] = {
+        "rescue_session": {"id": session["id"], "plan_item_id": session["plan_item_id"]},
+        "plan": {
+            "plan_version_id": plan.get("plan_version_id"),
+            "review_id": plan["review_id"],
+            "result_version": plan["result_version"],
+            "context_hash": plan.get("context_hash") or "",
+        },
+        "profile": ({
+            "id": personalization["profile"]["id"],
+            "version": personalization["profile"]["version"],
+            "safety_mode": personalization["safety"]["mode"],
+        } if personalization.get("profile") else None),
+        "goals": [{"id": item["id"], "version": item["version"]} for item in personalization.get("goals") or []],
+        "strategy": ({"id": personalization["strategy"]["id"], "version": personalization["strategy"]["version"]} if personalization.get("strategy") else None),
+        "targets": [{"id": item["id"], "key": item["target_key"], "version": item["version"]} for item in personalization.get("targets") or []],
+        "rules": [{"id": item["id"], "version": item["version"], "updated_at": item["updated_at"]} for item in adaptations["confirmed_rules"]],
+        "inventory": [{"id": item["id"], "version": item["version"]} for item in inventory],
+        "doctrine": {
+            "mode": doctrine["mode"],
+            "sha256": hashlib.sha256(doctrine["content"].encode("utf-8")).hexdigest(),
+        },
+        "policy_version": policy["policy_version"],
+        "planning_policy_version": PLANNING_POLICY_VERSION,
+        "context_schema_version": 2,
+        "result_schema_version": 2,
+        "validator_version": VALIDATOR_VERSION,
+        "agent_run_id": None,
+    }
+    context["context_hash"] = hashlib.sha256(
+        json.dumps(context, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()
+    return context
+
+
+def generate_rescue(rescue_id: str, client=None) -> dict:
+    from . import adaptive
+    from .ai import generate_json
+
+    context = rescue_context(rescue_id)
+    run_id = _start_agent_run("rescue", context, client)
+    try:
+        result = generate_json(context, "rescue", client)
+        completed = adaptive.complete_rescue_session(
+            rescue_id,
+            result,
+            provenance_context=context,
+            agent_run_id=run_id,
+        )
+    except Exception as exc:
+        _finish_agent_run(run_id, error=exc)
+        raise
+    _finish_agent_run(run_id, result=result)
+    return completed
+
+
+def submit_rescue_result(rescue_id: str, result: dict) -> dict:
+    from . import adaptive
+
+    context = rescue_context(rescue_id)
+    run_id = _start_agent_run(
+        "rescue", context, identity=("external_agent", "structured_json_submission")
+    )
+    try:
+        completed = adaptive.complete_rescue_session(
+            rescue_id, result, provenance_context=context, agent_run_id=run_id
+        )
+    except Exception as exc:
+        _finish_agent_run(run_id, error=exc)
+        raise
+    _finish_agent_run(run_id, result=result)
+    return completed
 
 
 def _non_empty_text(value: object, name: str) -> str:
@@ -1075,12 +1587,11 @@ def _validate_ingredient_carryover_decisions(result: dict, obligations: list[dic
         raise ValidationError(f"食材承接裁决不完整；缺少={missing}，未知={unknown}")
 
 
-def _validate_dinner_rotation(review_date: str, result: dict, settings: dict) -> None:
+def _validate_home_meal_rotation(review_date: str, result: dict, settings: dict) -> None:
     home = settings.get("home_cooking") or {"enabled": False}
     if not home.get("enabled"):
         return
     current_menu = result["tomorrow_menu"]
-    current = current_menu["rotation"]
     with connect() as conn:
         previous_row = conn.execute(
             """SELECT review_date,result_json FROM daily_reviews
@@ -1091,9 +1602,6 @@ def _validate_dinner_rotation(review_date: str, result: dict, settings: dict) ->
         return
     previous_result = row_dict(previous_row).get("result_json") or {}
     previous_menu = previous_result.get("tomorrow_menu") or {}
-    previous = previous_menu.get("rotation")
-    if not previous:
-        return
     current_date = date.fromisoformat(current_menu["date"])
     try:
         previous_date = date.fromisoformat(previous_menu["date"])
@@ -1101,12 +1609,21 @@ def _validate_dinner_rotation(review_date: str, result: dict, settings: dict) ->
         return
     if previous_date != current_date - timedelta(days=1):
         return
-    repeated = (
-        previous.get("dish_key") == current.get("dish_key")
-        or previous.get("flavor_profile") == current.get("flavor_profile")
-    )
-    if repeated and not current.get("repeat_reason"):
-        raise ValidationError("连续晚餐不得重复菜品或主风味；确需重复时必须提供 repeat_reason")
+    current_meals = {meal.get("name"): meal for meal in current_menu.get("meals", [])}
+    previous_meals = {meal.get("name"): meal for meal in previous_menu.get("meals", [])}
+    for meal_name in home_cooked_meal_names(settings):
+        current_meal = current_meals.get(meal_name) or {}
+        previous_meal = previous_meals.get(meal_name) or {}
+        current = meal_rotation(current_menu, current_meal)
+        previous = meal_rotation(previous_menu, previous_meal)
+        if not current or not previous:
+            continue
+        repeated = (
+            previous.get("dish_key") == current.get("dish_key")
+            or previous.get("flavor_profile") == current.get("flavor_profile")
+        )
+        if repeated and not current.get("repeat_reason"):
+            raise ValidationError(f"连续{meal_name}不得重复菜品或主风味；确需重复时必须提供 repeat_reason")
 
 
 def pending_work() -> dict:
@@ -1256,8 +1773,15 @@ def overview() -> dict:
 
 def task_context(task_id: str, days: int = 14) -> dict:
     task = get_task(task_id)
-    cutoff = (date.today() - timedelta(days=days - 1)).isoformat()
+    from .adaptive import active_adaptations, list_inventory, task_evidence_links
+    from .personalization import active_personalization, require_generation
+
+    generation_policy = require_generation(task["type"])
+    evidence_links = task_evidence_links(task_id)
+    anchor = max((date.fromisoformat(item["observed_date"]) for item in evidence_links), default=date.today())
+    cutoff = (anchor - timedelta(days=days - 1)).isoformat()
     doctrine = load_doctrine()
+    personalization = active_personalization()
     with connect() as conn:
         records = [row_dict(r) for r in conn.execute(
             "SELECT * FROM daily_records WHERE record_date>=? ORDER BY record_date,created_at", (cutoff,)
@@ -1272,27 +1796,76 @@ def task_context(task_id: str, days: int = 14) -> dict:
         matches = all_foods
     if task.get("image_path"):
         task["image_path"] = str(resolve_data_path(task["image_path"]))
-    return {
+    adaptations = active_adaptations(anchor.isoformat())
+    inventory = list_inventory()
+    source_manifest = {
+        "task": {"id": task["id"], "input_version": task.get("input_version", 1)},
+        "records": [item["id"] for item in records],
+        "evidence_links": [item["id"] for item in evidence_links],
+        "foods": [{"id": item["id"], "updated_at": item["updated_at"]} for item in matches],
+        "memories": [{"id": item["id"], "updated_at": item["updated_at"]} for item in memories],
+        "adjustments": [{"id": item["id"], "updated_at": item["updated_at"]} for item in adjustments],
+        "profile": ({"id": personalization["profile"]["id"], "version": personalization["profile"]["version"]} if personalization.get("profile") else None),
+        "goals": [{"id": item["id"], "version": item["version"]} for item in personalization.get("goals") or []],
+        "strategy": ({"id": personalization["strategy"]["id"], "version": personalization["strategy"]["version"]} if personalization.get("strategy") else None),
+        "targets": [{"id": item["id"], "key": item["target_key"], "version": item["version"]} for item in personalization.get("targets") or []],
+        "rules": [{"id": item["id"], "version": item["version"], "updated_at": item["updated_at"]} for item in adaptations["confirmed_rules"]],
+        "inventory": [{"id": item["id"], "version": item["version"]} for item in inventory],
+        "doctrine": {
+            "mode": doctrine["mode"],
+            "sha256": hashlib.sha256(doctrine["content"].encode("utf-8")).hexdigest(),
+        },
+        "policy_version": generation_policy["policy_version"],
+        "context_schema_version": 2,
+        "result_schema_version": 2,
+        "validator_version": VALIDATOR_VERSION,
+        "agent_run_id": None,
+    }
+    context = {
         "task": task,
+        "context_schema_version": 2,
+        "result_schema_version": 2,
+        "generation_policy": generation_policy,
         "doctrine": doctrine,
         "recent_days": days,
         "recent_records": records,
         "food_library_matches": matches,
         "long_term_memories": memories,
         "current_adjustments": adjustments,
-        "result_schema": result_schema(task["type"]),
+        "evidence_links": evidence_links,
+        "safety": personalization["safety"],
+        "active_profile": personalization.get("profile"),
+        "current_goals": personalization.get("goals") or [],
+        "active_strategy": personalization.get("strategy"),
+        "active_targets": personalization.get("targets") or [],
+        "confirmed_rules": adaptations["confirmed_rules"],
+        "inventory": inventory,
+        "source_manifest": source_manifest,
+        "result_schema": result_schema(task["type"], fact_only=generation_policy["fact_only"]),
         "analysis_boundary": "照片与数量只能区间估算；不可伪造不可见油、酱汁、重量或品牌。",
     }
+    context["context_hash"] = hashlib.sha256(
+        json.dumps(context, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()
+    return context
 
 
-def result_schema(task_type: str) -> dict:
+def result_schema(task_type: str, *, fact_only: bool = False) -> dict:
     nutrition = {"energy_kcal": [0, 0], "protein_g": [0, 0], "carbs_g": [0, 0], "fat_g": [0, 0]}
     if task_type == "photo":
-        return {
+        schema = {
             "summary": "string",
             "candidates": [{"name": "string", "portion_range": "string", "nutrition": nutrition, "confidence": 0.0}],
             "unknowns": ["string"],
-            "advice": ["string"],
+        }
+        if not fact_only:
+            schema["advice"] = ["string"]
+        return schema
+    if fact_only:
+        return {
+            "summary": "string", "observed_items": ["string"], "batch_nutrition": nutrition,
+            "per_serving_nutrition": nutrition, "gaps": ["string"], "risks": ["string"],
+            "unknowns": ["string"],
         }
     return {
         "summary": "string", "combinations": ["string"], "batch_nutrition": nutrition,

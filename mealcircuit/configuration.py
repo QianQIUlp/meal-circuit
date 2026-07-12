@@ -4,6 +4,7 @@ import json
 import shutil
 from pathlib import Path
 
+from .meal_modes import legacy_home_meal_modes, meal_modes_are_valid
 from .storage import (
     ROOT,
     app_home,
@@ -42,20 +43,23 @@ HOME_COOKING_FIELDS = {
 HOME_COOKING_EQUIPMENT = {"rice_cooker", "stovetop_pan", "stovetop_pot", "refrigerator"}
 
 
-def validate_settings(value: object) -> dict:
+def validate_settings(value: object, *, allow_missing_protein: bool = False) -> dict:
     if not isinstance(value, dict):
         raise ValidationError("settings.json 顶层必须是对象")
     settings = {key: value.get(key) for key in SETTING_FIELDS}
     settings["home_cooking"] = _validate_home_cooking(value.get("home_cooking"))
     target = settings["protein_target_g"]
-    if (
+    if target is None and allow_missing_protein:
+        settings["protein_target_g"] = None
+    elif (
         not isinstance(target, list)
         or len(target) != 2
         or any(not isinstance(item, (int, float)) or isinstance(item, bool) or item <= 0 for item in target)
         or target[0] > target[1]
     ):
         raise ValidationError("protein_target_g 必须是两个递增正数")
-    settings["protein_target_g"] = [float(item) if isinstance(item, float) else item for item in target]
+    else:
+        settings["protein_target_g"] = [float(item) if isinstance(item, float) else item for item in target]
     for key in SETTING_FIELDS:
         if key in {"protein_target_g", "home_cooking"}:
             continue
@@ -72,13 +76,18 @@ def _validate_home_cooking(value: object) -> dict:
         raise ValidationError("home_cooking.enabled 必须是布尔值")
     if not value["enabled"]:
         return dict(HOME_COOKING_DEFAULT)
-    missing = sorted(HOME_COOKING_FIELDS - value.keys())
+    missing = sorted((HOME_COOKING_FIELDS - {"meal_scope"}) - value.keys())
     if missing:
         raise ValidationError(f"home_cooking 缺少字段：{missing}")
     if value["region"] != "china":
         raise ValidationError("home_cooking.region 首版仅支持 china")
-    if value["meal_scope"] != "dinner" or value["servings"] != 1:
-        raise ValidationError("home_cooking 首版仅支持一人份晚餐")
+    if value.get("meal_scope") not in {None, "dinner", "lunch_and_dinner", "custom"}:
+        raise ValidationError("home_cooking.meal_scope 无效")
+    meal_modes = value.get("meal_modes") or legacy_home_meal_modes(value)
+    if not meal_modes_are_valid(meal_modes):
+        raise ValidationError("home_cooking.meal_modes 必须逐项指定早餐、午餐和晚餐的准备方式")
+    if value["servings"] != 1:
+        raise ValidationError("home_cooking 目前仅支持一人份")
     if value["recipe_detail"] != "beginner_card":
         raise ValidationError("home_cooking.recipe_detail 必须是 beginner_card")
     if value["reuse_policy"] != "reuse_ingredients_rotate_dishes":
@@ -100,14 +109,15 @@ def _validate_home_cooking(value: object) -> dict:
             raise ValidationError(f"home_cooking.{field} 必须是文本数组")
     return {
         "enabled": True,
-        **{key: value[key] for key in HOME_COOKING_FIELDS},
+        **{key: value[key] for key in HOME_COOKING_FIELDS if key in value},
+        "meal_modes": meal_modes,
         "equipment": list(dict.fromkeys(value["equipment"])),
         "flavor_preferences": list(dict.fromkeys(item.strip() for item in value["flavor_preferences"])),
         "food_exclusions": list(dict.fromkeys(item.strip() for item in value["food_exclusions"])),
     }
 
 
-def load_settings() -> dict:
+def load_settings(*, allow_missing_protein: bool = False) -> dict:
     path = settings_path()
     if not path.is_file():
         raise ValidationError(f"缺少私人设置：{path}；请先运行 python -m mealcircuit.agent_cli init 并填写配置")
@@ -115,7 +125,15 @@ def load_settings() -> dict:
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise ValidationError(f"无法读取私人设置：{exc}") from exc
-    return validate_settings(value)
+    return validate_settings(value, allow_missing_protein=allow_missing_protein)
+
+
+def load_resolved_settings() -> dict:
+    """Overlay an explicitly confirmed strategy on legacy private settings."""
+    settings = load_settings(allow_missing_protein=True)
+    from .personalization import resolved_settings
+
+    return resolved_settings(settings)
 
 
 def load_doctrine() -> dict:
@@ -186,6 +204,12 @@ def configuration_status() -> dict:
     except ValidationError as exc:
         ai = None
         ai_error = str(exc)
+    try:
+        from .personalization import onboarding_status
+
+        onboarding = onboarding_status()
+    except (ValidationError, OSError):
+        onboarding = {"status": "unavailable", "safety_mode": "setup_required"}
     return {
         "home": str(app_home()),
         "database": str(db_path()),
@@ -195,4 +219,5 @@ def configuration_status() -> dict:
         "doctrine_mode": doctrine_mode,
         "ai": ai,
         "ai_error": ai_error,
+        "onboarding": onboarding,
     }

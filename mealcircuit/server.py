@@ -7,6 +7,7 @@ import ipaddress
 import json
 import mimetypes
 import os
+import re
 import sys
 import urllib.parse
 from datetime import date
@@ -16,9 +17,10 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from . import ai, checkins, service
+from . import adaptive, ai, checkins, personalization, portability, service
+from .configuration import initialize_private_home
 from .db import init_db
-from .storage import port_value, upload_root
+from .storage import exports_root, port_value, upload_root
 from .validation import ValidationError, nutrition_number
 
 
@@ -77,22 +79,388 @@ def icon(name: str) -> str:
     return f'<span class="icon icon-{esc(name)}" aria-hidden="true"></span>'
 
 
+def _selected(value: object, expected: object) -> str:
+    return " selected" if value == expected else ""
+
+
+def _checked(values: object, expected: object) -> str:
+    return " checked" if expected in (values or []) else ""
+
+
+GOAL_LABELS = {
+    "fat_loss": "减脂",
+    "muscle_gain": "增肌",
+    "body_recomposition": "减脂增肌 / 身体重组",
+    "performance": "训练表现",
+    "maintenance": "维持当前状态",
+    "eating_consistency": "建立稳定饮食",
+    "general_wellbeing": "一般健康与精力",
+    "custom": "其他自定义目标",
+}
+METRIC_LABELS = {
+    "execution_rate": "计划执行率",
+    "weight_trend": "体重趋势",
+    "waist_trend": "腰围趋势",
+    "training_performance": "训练表现",
+    "energy_state": "精力与恢复",
+    "gut_comfort": "肠胃舒适度",
+}
+MEAL_PREPARATION_LABELS = {
+    "home_cook": "在家下厨（生成执行卡）",
+    "quick_assembly": "在家快速组装",
+    "eat_out": "食堂 / 外食",
+}
+
+FEEDBACK_LABELS = {
+    "followed": "按计划完成",
+    "modified": "调整后完成",
+    "skipped": "没有执行",
+    "not_applicable": "今天不适用",
+}
+REASON_LABELS = {
+    "missing_ingredient": "缺少食材", "not_enough_time": "时间不足", "too_complex": "步骤太复杂",
+    "ate_out": "临时外食", "did_not_want_it": "当时不想吃", "hunger_mismatch": "饥饿或份量不匹配",
+    "gut_change": "肠胃状态变化", "schedule_change": "日程变化", "other": "其他",
+}
+RESCUE_LABELS = {
+    "ingredient_missing": "缺少食材", "not_enough_time": "时间不足", "too_complex": "做起来太复杂",
+    "gut_change": "肠胃状态变化", "schedule_change": "日程变化", "other": "其他临时情况",
+}
+
+
+def _csv(value: str) -> list[str]:
+    return [item.strip() for item in value.replace("，", ",").split(",") if item.strip()]
+
+
+def _number_or_none(value: str) -> float | None:
+    return float(value) if value.strip() else None
+
+
+def render_setup_start(status: dict) -> str:
+    session = status.get("session")
+    if session:
+        action = f'<a class="button" href="/setup/{esc(session["current_step"])}">继续初始化</a>'
+    else:
+        action = '<form method="post" action="/setup/start"><button type="submit">开始建立目标契约</button></form>'
+    return f'''<section class="setup-shell panel"><p class="eyebrow">Local adaptive workspace</p><h1>先让 MealCircuit 真正理解你的目标</h1>
+    <p class="lede">初始化会确认你想达成什么、安全边界、训练与生活约束。答案逐步保存在本机，可随时退出继续；没有确认前不会生成处方型计划。</p>
+    <div class="setup-principles"><p><strong>目标可修改</strong><br><span class="muted">历史计划仍按当时版本解释。</span></p><p><strong>未知保持未知</strong><br><span class="muted">不知道或暂不回答不会被当成否定。</span></p><p><strong>安全许可先于生成</strong><br><span class="muted">专业指导模式只执行有来源的约束。</span></p></div>{action}
+    <p class="muted small">原有记录、照片和库存入口始终可用；初始化只限制生成和提交。</p></section>'''
+
+
+def render_setup_step(session: dict, step: str, *, error: str = "", override: dict | None = None) -> str:
+    answers = session.get("answers_json") or {}
+    value = override if override is not None else (answers.get(step) or {})
+    order = list(personalization.ONBOARDING_STEPS)
+    index = order.index(step)
+    progress = round((index + 1) / len(order) * 100)
+    error_html = f'<div class="form-error" role="alert" tabindex="-1"><strong>请检查这一页</strong><p>{esc(error)}</p></div>' if error else ""
+    hidden = f'<input type="hidden" name="session_id" value="{esc(session["id"])}"><input type="hidden" name="version" value="{esc(session["version"])}">'
+    if step == "welcome":
+        fields = '''<p>你的结构化档案、真实执行数据和照片路径保存在本机。只有你显式配置模型和 API Key 并点击生成时，当前上下文才会发送给所选服务。</p>
+        <label class="choice-row"><input type="checkbox" name="privacy_ack" value="yes" required><span>我理解本地保存与模型发送边界</span></label>'''
+    elif step == "goals":
+        primary = value.get("primary_goal", "body_recomposition")
+        primary_options = "".join(f'<option value="{key}"{_selected(primary, key)}>{esc(label)}</option>' for key, label in GOAL_LABELS.items())
+        secondary = value.get("secondary_goals") or []
+        secondary_html = "".join(
+            f'<label class="choice-row"><input type="checkbox" name="secondary_goals" value="{key}"{_checked(secondary, key)}><span>{esc(label)}</span></label>'
+            for key, label in GOAL_LABELS.items()
+        )
+        metrics = value.get("success_metrics") or ["execution_rate"]
+        metrics_html = "".join(
+            f'<label class="choice-row"><input type="checkbox" name="success_metrics" value="{key}"{_checked(metrics, key)}><span>{esc(label)}</span></label>'
+            for key, label in METRIC_LABELS.items()
+        )
+        fields = f'''<label for="primary-goal">当前最重要的目标</label><select id="primary-goal" name="primary_goal">{primary_options}</select>
+        <label for="custom-goal">如果选择“其他”，请写下真正想达成的状态</label><input id="custom-goal" name="custom_goal_text" value="{esc(value.get('custom_goal_text',''))}" placeholder="例如：在轮班生活中保持稳定进食与精力">
+        <fieldset class="form-section"><legend>次要目标（可选）</legend><div class="option-grid">{secondary_html}</div></fieldset>
+        <label for="motivation">为什么现在想做这件事？</label><textarea id="motivation" name="motivation">{esc(value.get("motivation", ""))}</textarea>
+        <fieldset class="form-section"><legend>怎样算有进展？</legend><div class="option-grid">{metrics_html}</div></fieldset>
+        <div class="row"><div><label for="target-weight">目标体重 kg（可选，不会直接变成热量处方）</label><input id="target-weight" type="number" step="0.1" name="target_weight_kg" value="{esc(value.get("target_weight_kg", ""))}"></div><div><label for="horizon">期望周期（可选）</label><input id="horizon" name="horizon" value="{esc(value.get("horizon", ""))}" placeholder="例如：先观察 8 周"></div></div>'''
+    elif step == "baseline":
+        physiological = value.get("physiological_input", "unspecified")
+        activity = value.get("activity_level", "moderate")
+        fields = f'''<p class="muted">身高和体重可以稍后补充；缺失时系统使用份量法，不猜测数值目标。</p><div class="row"><div><label for="age">年龄 *</label><input id="age" type="number" name="age_years" min="13" max="120" required value="{esc(value.get("age_years", ""))}"></div><div><label for="height">身高 cm（可选）</label><input id="height" type="number" step="0.1" name="height_cm" value="{esc(value.get("height_cm", ""))}"></div><div><label for="weight">当前体重 kg（可选）</label><input id="weight" type="number" step="0.1" name="weight_kg" value="{esc(value.get("weight_kg", ""))}"></div><div><label for="physiological">仅用于能量估算的生理参数</label><select id="physiological" name="physiological_input"><option value="unspecified"{_selected(physiological,"unspecified")}>不提供</option><option value="male"{_selected(physiological,"male")}>男性公式参数</option><option value="female"{_selected(physiological,"female")}>女性公式参数</option></select></div></div><label for="activity">日常活动水平</label><select id="activity" name="activity_level"><option value="low"{_selected(activity,"low")}>较低</option><option value="moderate"{_selected(activity,"moderate")}>中等</option><option value="high"{_selected(activity,"high")}>较高</option><option value="very_high"{_selected(activity,"very_high")}>极高 / 不使用通用系数</option></select>'''
+    elif step == "safety":
+        life = value.get("life_stage", "adult")
+        flag_labels = {
+            "therapeutic_diet": "正在执行治疗性饮食",
+            "medication_affects_nutrition": "药物可能影响食欲、体重或营养",
+            "eating_disorder_risk": "当前存在高风险限制、暴食、清除或补偿行为",
+            "rapid_unexplained_change": "近期有快速且原因不明的体重变化",
+            "severe_persistent_symptoms": "存在严重或持续的身体症状",
+            "severe_allergy_management": "需要严格管理严重食物过敏",
+        }
+        flag_html = "".join(
+            f'<div><label for="safe-{key}">{esc(label)}</label><select id="safe-{key}" name="{key}"><option value="no"{_selected(bool(value.get(key)),False)}>否</option><option value="yes"{_selected(bool(value.get(key)),True)}>是</option></select></div>'
+            for key, label in flag_labels.items()
+        )
+        guidance = value.get("professional_guidance") or {}
+        fields = f'''<div class="notice panel"><strong>这不是诊断问卷。</strong><p>回答只用于确定 MealCircuit 可以做什么；严重症状和高风险进食行为会停止营养优化并建议寻求专业帮助。</p></div><label for="life-stage">生命阶段</label><select id="life-stage" name="life_stage"><option value="adult"{_selected(life,"adult")}>成年人</option><option value="pregnant"{_selected(life,"pregnant")}>孕期</option><option value="breastfeeding"{_selected(life,"breastfeeding")}>哺乳期</option><option value="minor"{_selected(life,"minor")}>未成年人</option><option value="other"{_selected(life,"other")}>其他</option></select><div class="row">{flag_html}</div><details><summary>录入已确认的专业指导（可选）</summary><label class="choice-row"><input type="checkbox" name="guidance_confirmed" value="yes"{' checked' if guidance.get('confirmed') else ''}><span>我有仍有效的专业指导</span></label><label for="guidance-source">来源</label><input id="guidance-source" name="guidance_source" value="{esc(guidance.get('source',''))}" placeholder="例如：注册营养师书面计划"><label for="guidance-summary">必须遵守的摘要</label><textarea id="guidance-summary" name="guidance_summary">{esc(guidance.get('summary',''))}</textarea><div class="row"><div><label for="guidance-on">确认日期</label><input id="guidance-on" type="date" name="guidance_confirmed_on" value="{esc(guidance.get('confirmed_on',''))}"></div><div><label for="guidance-until">有效期</label><input id="guidance-until" type="date" name="guidance_valid_until" value="{esc(guidance.get('valid_until',''))}"></div></div></details>'''
+    elif step == "training":
+        types = value.get("types") or []
+        options = {"strength": "力量训练", "cardio": "耐力训练", "sport": "专项运动", "mobility": "灵活性 / 恢复", "other": "其他"}
+        checks = "".join(f'<label class="choice-row"><input type="checkbox" name="types" value="{key}"{_checked(types,key)}><span>{label}</span></label>' for key,label in options.items())
+        fields = f'''<fieldset class="form-section"><legend>训练类型（可多选）</legend><div class="option-grid">{checks}</div></fieldset><label for="frequency">每周训练次数</label><input id="frequency" type="number" min="0" max="14" name="frequency_per_week" value="{esc(value.get('frequency_per_week',0))}">'''
+    elif step == "constraints":
+        meal_modes = value.get("meal_modes") or personalization.LEGACY_DEFAULT_MEAL_MODES
+        mode_fields = "".join(
+            f'<div><label for="meal-mode-{key}">{name}通常怎样准备？</label><select id="meal-mode-{key}" name="meal_mode_{key}">'
+            + "".join(
+                f'<option value="{mode}"{_selected(meal_modes.get(key), mode)}>{label}</option>'
+                for mode, label in MEAL_PREPARATION_LABELS.items()
+            )
+            + "</select></div>"
+            for key, name in (("breakfast", "早餐"), ("lunch", "午餐"), ("dinner", "晚餐"))
+        )
+        fields = f'''<fieldset class="form-section"><legend>逐餐准备标准</legend><p class="muted">这是个人策略，会随档案版本保存；选择在家下厨的餐次会分别生成一人份执行卡。</p><div class="row">{mode_fields}</div></fieldset><label for="meal-environment">典型用餐环境</label><input id="meal-environment" name="meal_environment" required value="{esc(value.get('meal_environment',''))}" placeholder="例如：午餐和晚餐在家做"><label for="portion-method">希望怎样表达份量</label><input id="portion-method" name="portion_method" required value="{esc(value.get('portion_method','手掌与拳头份量法'))}"><div class="row"><div><label for="cooking-time">每个自炊餐次可用时间（分钟）</label><input id="cooking-time" type="number" min="10" max="60" name="cooking_time_minutes" value="{esc(value.get('cooking_time_minutes',25))}"></div><div><label for="question-budget">每天最多主动问几题</label><input id="question-budget" type="number" min="0" max="5" name="question_budget" value="{esc(value.get('question_budget',2))}"></div></div><label for="equipment">可用厨具（逗号分隔）</label><input id="equipment" name="equipment" value="{esc(', '.join(value.get('equipment') or []))}" placeholder="例如：炒锅, 电饭煲"><label for="exclusions">排除食品（逗号分隔）</label><input id="exclusions" name="food_exclusions" value="{esc(', '.join(value.get('food_exclusions') or []))}"><label for="preferences">偏好（逗号分隔）</label><input id="preferences" name="preferences" value="{esc(', '.join(value.get('preferences') or []))}">'''
+    else:
+        preview = personalization.onboarding_preview(session["id"])
+        safety = preview["safety"]
+        assessment = preview["target_assessment"]
+        primary_goal = preview["goals"][0]
+        primary_goal_label = primary_goal.get("custom_label") or GOAL_LABELS.get(primary_goal["type"], primary_goal["type"])
+        selected_modes = preview["profile"]["constraints"]["meal_modes"]
+        meal_mode_summary = " · ".join(
+            f'{name}：{MEAL_PREPARATION_LABELS[selected_modes[key]]}'
+            for key, name in (("breakfast", "早餐"), ("lunch", "午餐"), ("dinner", "晚餐"))
+        )
+        target_options = "".join(
+            f'<label class="choice-row"><input type="radio" name="protein_candidate_id" value="{esc(item["candidate_id"])}"{ " checked" if len(assessment["protein_candidates"]) == 1 else ""}><span>{esc(item["target_g"])} g/天 · {esc(item["basis"])}</span></label>'
+            for item in assessment["protein_candidates"]
+        ) or '<p class="muted">当前不建立蛋白目标；继续使用份量与执行策略。</p>'
+        professional_target_fields = ""
+        if safety["mode"] == "clinician_guided" and safety["professional_guidance_current"]:
+            professional_target_fields = '''<fieldset class="form-section"><legend>专业指导中的蛋白范围（可选）</legend><p class="muted">只录入指导中明确给出的范围；来源和有效期沿用上一页的专业指导，不做系统推算。</p><div class="row"><label>下界 g/天<input type="number" step="0.1" name="professional_protein_low"></label><label>上界 g/天<input type="number" step="0.1" name="professional_protein_high"></label></div></fieldset>'''
+        strategy_ack = '' if safety["mode"] in {"observation", "halt_and_refer"} or (safety["mode"] == "clinician_guided" and not safety["professional_guidance_current"]) else '<label class="choice-row"><input type="checkbox" name="accept_strategy" value="yes" required><span>我确认采用这份初始策略</span></label>'
+        fields = f'''<div class="contract-summary"><p><span class="status">安全模式</span><strong>{esc(safety["mode"])}</strong></p><p><span class="status">主目标</span><strong>{esc(primary_goal_label)}</strong></p><p><span class="status">规划模式</span><strong>{esc(assessment["planning_default"])}</strong></p><p><span class="status">逐餐标准</span><strong>{esc(meal_mode_summary)}</strong></p></div><h2>蛋白目标候选</h2><div class="option-list">{target_options}</div>{professional_target_fields}<input type="hidden" name="planning_mode" value="portion_guided"><label class="choice-row"><input type="checkbox" name="accept_profile" value="yes" required><span>我确认系统对目标与安全边界的理解</span></label>{strategy_ack}<div class="notice panel"><strong>仍然未知</strong><ul>{''.join(f'<li>{esc(note)}</li>' for note in assessment['notes']) or '<li>没有额外提示</li>'}</ul></div>'''
+    action = "/setup/complete" if step == "review" else f"/setup/save/{step}"
+    submit = "确认并进入工作台" if step == "review" else "保存并继续"
+    return f'''<section class="setup-shell"><div class="setup-progress"><p class="eyebrow">步骤 {index + 1} / {len(order)}</p><div class="progress-track" role="progressbar" aria-valuemin="1" aria-valuemax="{len(order)}" aria-valuenow="{index + 1}"><span class="progress-fill" style="width:{progress}%"></span></div></div>{error_html}<form class="panel setup-form" method="post" action="{action}">{hidden}<h1>{esc({"welcome":"隐私与边界","goals":"目标契约","baseline":"当前基线","safety":"安全边界","training":"训练需求","constraints":"现实约束","review":"确认理解"}[step])}</h1>{fields}<div class="form-actions"><button type="submit">{submit}</button></div></form></section>'''
+
+
+def render_today_workspace(work_date: str) -> str:
+    current = personalization.active_personalization()
+    if current["status"] == "setup_required":
+        return render_setup_start(personalization.onboarding_status())
+    plan = adaptive.get_plan_for_date(work_date)
+    questions = adaptive.schedule_questions(work_date)
+    safety = current["safety"]
+    goal = (current.get("goals") or [{}])[0].get("goal_json") or {}
+    goal_label = goal.get("custom_label") or GOAL_LABELS.get(goal.get("type"), goal.get("type") or "未设定")
+    if plan:
+        completed = len(plan["feedback"])
+        plan_block = (
+            f'<section class="panel today-plan"><div class="section-header"><div><p class="eyebrow">Today plan</p><h2>今天按这份计划走</h2>'
+            f'<p class="muted">{completed} / {len(plan["menu"]["meals"])} 项已有回执</p></div><a class="button" href="/plans/{esc(work_date)}">打开计划</a></div></section>'
+        ) if plan.get("scope_current") else (
+            '<section class="panel today-plan"><p class="eyebrow">Stale plan</p><h2>旧目标版本的计划不再作为今天指令</h2>'
+            '<p>可以保留历史执行回执，但需要按当前目标与边界重新生成计划。</p><a class="button" href="/daily">重新生成</a></section>'
+        )
+    else:
+        policy = personalization.generation_policy("daily")
+        plan_block = (
+            '<section class="panel today-plan"><p class="eyebrow">Next action</p><h2>先记录今天，再生成下一份正式计划</h2>'
+            f'<p>{esc(policy["reason"] or "记录会进入证据层；只有正式发布的计划才会进入执行学习。")}</p>'
+            f'<div class="actions"><a class="button" href="/capture">记录真实情况</a><a class="button secondary" href="/daily">查看建议状态</a></div></section>'
+        )
+    question_block = (
+        f'<section class="panel"><div class="section-header"><div><p class="eyebrow">Low-friction check</p><h2>只问最有用的问题</h2><p class="muted">今天还有 {len(questions)} 个问题</p></div>'
+        f'<a class="button secondary" href="/questions/{esc(work_date)}">回答</a></div></section>' if questions else
+        '<section class="panel quiet-success"><h2>今天不需要再回答问题</h2><p class="muted">MealCircuit 会继续从执行回执中积累证据。</p></section>'
+    )
+    return (
+        f'<section class="today-hero"><div><p class="eyebrow">Adaptive workspace · {esc(work_date)}</p><h1>今天只处理下一步</h1>'
+        f'<p class="lede">当前目标：{esc(goal_label)}。安全模式：{esc(safety["mode"])}。</p></div><a class="button secondary" href="/profile">目标与边界</a></section>'
+        f'<div class="today-grid">{plan_block}{question_block}</div>'
+        '<section class="quick-actions" aria-label="快速操作"><a class="quick-card" href="/capture"><strong>记录事实</strong><span>饮食、照片、原材料和状态</span></a>'
+        f'<a class="quick-card" href="/plans/{esc(work_date)}"><strong>执行计划</strong><span>查看步骤、反馈或临时救场</span></a>'
+        '<a class="quick-card" href="/inventory"><strong>管理库存</strong><span>临期、用完和未购买都保留事件</span></a>'
+        '<a class="quick-card" href="/learning"><strong>确认学习</strong><span>候选规则不会静默生效</span></a></section>'
+    )
+
+
+def _plan_step_text(item: str | dict) -> str:
+    if isinstance(item, str):
+        return item
+    minutes = f"{item.get('minutes')} 分钟" if item.get("minutes") else None
+    return " · ".join(str(value) for value in (
+        item.get("instruction") or item.get("text"),
+        minutes,
+        item.get("heat"),
+        item.get("done_signal"),
+    ) if value)
+
+
+def render_plan_page(plan_date: str) -> str:
+    plan = adaptive.get_plan_for_date(plan_date)
+    if not plan:
+        policy = personalization.generation_policy("daily")
+        return f'<section class="panel"><h1>{esc(plan_date)} 没有可执行计划</h1><p>{esc(policy["reason"] or "先记录真实情况并完成每日复盘；草稿不会进入执行学习。")}</p><a class="button" href="/capture">去记录</a></section>'
+    cards = []
+    for meal in plan["menu"]["meals"]:
+        feedback = plan["feedback"].get(meal["plan_item_id"])
+        recipe = meal.get("recipe_card") or {}
+        ingredients = meal.get("ingredients") or recipe.get("ingredients") or meal.get("foods") or []
+        steps = meal.get("steps") or recipe.get("steps") or []
+        detail = "".join(
+            f'<li>{esc(item if isinstance(item, str) else " · ".join(str(value) for value in (item.get("name"), item.get("amount"), item.get("prep")) if value))}</li>'
+            for item in ingredients
+        )
+        step_html = "".join(f'<li>{esc(_plan_step_text(item))}</li>' for item in steps)
+        execution = meal.get("execution") or {}
+        execution_bits = [
+            f'主动 {execution["active_minutes"]} 分钟' if execution.get("active_minutes") is not None else "",
+            f'总计 {execution["total_minutes"]} 分钟' if execution.get("total_minutes") is not None else "",
+            f'炊具：{"、".join(execution.get("cookware") or [])}' if execution.get("cookware") else "",
+        ]
+        execution_html = " · ".join(item for item in execution_bits if item)
+        current_status = feedback.get("status") if feedback else ""
+        status_options = "".join(f'<option value="{key}"{_selected(current_status,key)}>{label}</option>' for key,label in FEEDBACK_LABELS.items())
+        reason_checks = "".join(f'<label class="choice-row compact"><input type="checkbox" name="reason_codes" value="{key}"><span>{label}</span></label>' for key,label in REASON_LABELS.items())
+        version = feedback.get("version", 0) if feedback else 0
+        cards.append(f'''<article class="plan-card"><div class="section-header"><div><p class="eyebrow">{esc(meal.get('slot') or meal.get('meal_type') or '')}</p><h2>{esc(meal.get('name') or '未命名餐次')}</h2></div>{f'<span class="status completed">{esc(FEEDBACK_LABELS.get(current_status,current_status))}</span>' if feedback else '<span class="status pending">待回执</span>'}</div>
+        {f'<p><strong>份量：</strong>{esc(meal.get("portion_guidance"))}</p>' if meal.get('portion_guidance') else ''}{f'<p class="muted">{esc(execution_html)}</p>' if execution_html else ''}{f'<h3>食材</h3><ul>{detail}</ul>' if detail else ''}{f'<h3>执行步骤</h3><ol>{step_html}</ol>' if step_html else ''}
+        <details class="feedback-box"{' open' if not feedback else ''}><summary>{'修订执行回执' if feedback else '记录实际执行结果'}</summary><form method="post" action="/plans/{esc(plan_date)}/{esc(meal['plan_item_id'])}/feedback"><input type="hidden" name="expected_version" value="{version}"><label>执行状态<select name="status" required><option value="">请选择</option>{status_options}</select></label><fieldset><legend>偏离原因（调整或未执行时必选）</legend><div class="option-grid">{reason_checks}</div></fieldset><label>实际怎么做的（可选）<textarea name="actual_text">{esc(feedback.get('actual_text','') if feedback else '')}</textarea></label><button type="submit">保存回执</button></form></details>
+        {f'<form class="rescue-form" method="post" action="/rescue/start"><input type="hidden" name="plan_date" value="{esc(plan_date)}"><input type="hidden" name="plan_item_id" value="{esc(meal["plan_item_id"])}"><label>计划临时做不了怎么办？<select name="issue_code">{"".join(f"<option value={key!r}>{label}</option>" for key,label in RESCUE_LABELS.items())}</select></label><input name="input_text" aria-label="救场补充" placeholder="可补充当前手边条件"><button class="secondary" type="submit">生成救场任务</button></form>' if plan.get('scope_current') else ''}</article>''')
+    stale = '' if plan.get('scope_current') else '<div class="form-error" role="alert"><strong>这是旧目标或策略版本的历史计划</strong><p>仍可补录实际执行结果，但不能据此生成新的救场建议。</p></div>'
+    return f'<section class="section-header"><div><p class="eyebrow">Published plan · v{esc(plan["result_version"])}</p><h1>{esc(plan_date)} 执行计划</h1><p class="muted">每次修改回执都会追加事件；反馈绑定这份正式计划的目标与安全版本。</p></div><a class="button secondary" href="/questions/{esc(plan_date)}">最少提问</a></section>{stale}<div class="plan-list">{"".join(cards)}</div>'
+
+
+def render_questions_page(question_date: str) -> str:
+    pending = adaptive.schedule_questions(question_date)
+    if not pending:
+        return f'<section class="panel quiet-success"><h1>{esc(question_date)} 没有待回答问题</h1><p>问题预算已用完，或当前没有会实质改变计划的未知项。</p><a class="button secondary" href="/">返回今天</a></section>'
+    cards = []
+    choice_labels = {"yes":"是", "no":"否", "unknown":"暂不确定", "home":"在家", "away":"外食", "mixed":"混合"}
+    for item in pending:
+        schema = item.get("question_schema_json") or {}
+        if schema.get("kind") == "action":
+            control = f'<a class="button" href="{esc(schema.get("href","/setup"))}">完成此操作</a>'
+        elif schema.get("kind") == "plan_feedback":
+            statuses = "".join(f'<option value="{key}">{FEEDBACK_LABELS.get(key,key)}</option>' for key in schema.get("statuses", []))
+            reasons = "".join(f'<label class="choice-row compact"><input type="checkbox" name="reason_codes" value="{key}"><span>{REASON_LABELS.get(key,key)}</span></label>' for key in schema.get("reason_codes", []))
+            control = f'<label>执行状态<select name="feedback_status" required><option value="">请选择</option>{statuses}</select></label><fieldset><legend>偏离原因</legend><div class="option-grid">{reasons}</div></fieldset><label>补充<textarea name="actual_text"></textarea></label><button>保存答案</button>'
+        else:
+            options = "".join(f'<label class="choice-row"><input type="radio" name="answer" value="{esc(value)}" required><span>{esc(choice_labels.get(value,value))}</span></label>' for value in schema.get("options", []))
+            control = f'<div class="option-list">{options}</div><button>保存答案</button>'
+        cards.append(f'''<article class="panel question-card"><p class="eyebrow">{esc(item['category'])}</p><h2>{esc(item.get('prompt') or item['reason'])}</h2><p>{esc(item['reason'])}</p><p class="muted">会影响：{esc(item['expected_impact'])}</p><form method="post" action="/questions/{esc(item['id'])}/answer"><input type="hidden" name="version" value="{esc(item['version'])}">{control}</form><form method="post" action="/questions/{esc(item['id'])}/skip"><input type="hidden" name="version" value="{esc(item['version'])}"><button class="link-button" type="submit">暂时跳过</button></form></article>''')
+    return f'<section class="section-header"><div><p class="eyebrow">Question budget</p><h1>只补齐会改变行动的信息</h1><p class="muted">跳过会明确记录为未知，不会被推断成“否”。</p></div><span class="history-count">{len(cards)} 题</span></section><div class="question-list">{"".join(cards)}</div>'
+
+
+def render_learning_page() -> str:
+    candidates = adaptive.list_candidates("pending")
+    rules = adaptive.list_rules(active_only=False)
+    experiments = adaptive.list_experiments()
+    candidate_html = "".join(
+        f'''<article class="learning-card panel"><p class="eyebrow">{esc(item['kind'])} · {esc(item['confidence'])}</p><h2>{esc(item['statement'])}</h2><p class="muted">支持证据 {len([e for e in item['evidence'] if e['stance']=='support'])} · 反例 {len([e for e in item['evidence'] if e['stance']=='counterexample'])}</p><form method="post" action="/learning/{esc(item['id'])}/decide"><label>确认后的规则文字<textarea name="statement">{esc(item['statement'])}</textarea></label><div class="actions"><button name="decision" value="accept">接受规则</button><button class="secondary" name="decision" value="snooze">稍后再看</button><button class="danger" name="decision" value="reject">拒绝</button></div></form></article>'''
+        for item in candidates
+    ) or '<section class="panel quiet-success"><h2>没有待确认的学习候选</h2><p>系统需要重复证据才会提出规则，也不会自动应用候选。</p></section>'
+    rule_html = "".join(
+        f'<li><div><strong>{esc(item["statement"])}</strong><br><span class="muted small">{esc(item["origin"])} · {esc(item["status"])}</span></div><form method="post" action="/learning/rules/{esc(item["id"])}/status"><input type="hidden" name="status" value="{"inactive" if item["status"]=="active" else "active"}"><button class="secondary">{"停用" if item["status"]=="active" else "启用"}</button></form></li>'
+        for item in rules
+    ) or '<li class="muted">暂无正式规则</li>'
+    experiment_cards = []
+    for item in experiments:
+        plan = item.get("plan_json") or {}
+        if item["status"] == "proposed":
+            action = f'''<form method="post" action="/learning/experiments/{esc(item['id'])}/start"><label>开始日期<input type="date" name="starts_on" value="{date.today().isoformat()}" required></label><label>观察天数（3–7）<input type="number" name="days" min="3" max="7" value="5" required></label><button>确认开始</button></form>'''
+        elif item["status"] == "active":
+            action = f'''<form method="post" action="/learning/experiments/{esc(item['id'])}/finish"><label>观察结果<textarea name="summary" required></textarea></label><div class="actions"><button name="decision" value="complete">完成实验</button><button class="danger" name="decision" value="cancel">取消实验</button></div></form>'''
+        else:
+            result = item.get("result_json") or {}
+            action = f'<p class="muted">结果：{esc(result.get("summary") or "未填写")}</p>'
+        experiment_cards.append(f'<article class="panel"><p class="eyebrow">{esc(item["status"])} · v{esc(item["version"])}</p><h3>{esc(plan.get("action") or item["variable_key"])}</h3><p>成功信号：{esc(plan.get("success_signal") or "未设置")}</p>{action}</article>')
+    experiment_policy = personalization.generation_policy("adaptation")
+    propose_form = (
+        '''<form method="post" action="/learning/experiments"><label>只改变一个变量<input name="variable_key" required placeholder="例如：dinner_active_minutes"></label><label>具体动作<textarea name="action" required placeholder="例如：晚餐主动准备时间控制在 15 分钟"></textarea></label><label>怎样算有效<input name="success_signal" required placeholder="例如：连续 3 次完成且主观负担可接受"></label><button>提出可撤销实验</button></form>'''
+        if experiment_policy["allowed"] else f'<p class="muted">{esc(experiment_policy["reason"])}</p>'
+    )
+    experiment_html = "".join(experiment_cards) or '<section class="panel"><p class="muted">暂无实验历史</p></section>'
+    return f'<section class="section-header"><div><p class="eyebrow">Deterministic learning</p><h1>由你确认，系统才学习</h1><p class="muted">候选、正式规则和实验均绑定当前目标、策略与安全模式。</p></div></section><div class="learning-grid"><div>{candidate_html}</div><section class="panel"><h2>正式规则</h2><ul class="rule-list">{rule_html}</ul></section></div><section class="section-header"><div><p class="eyebrow">One variable at a time</p><h2>可撤销实验</h2><p class="muted">同时最多一个待确认或进行中的实验；实验不会自动修改营养目标。</p></div></section><div class="learning-grid"><section class="panel"><h3>提出实验</h3>{propose_form}</section><div>{experiment_html}</div></div>'
+
+
+def render_inventory_page() -> str:
+    items = adaptive.list_inventory(active_only=False)
+    rows = "".join(
+        f'''<tr><td><strong>{esc(item['name'])}</strong><br><span class="muted small">{esc(item.get('amount_text') or '数量未知')}</span></td><td>{esc(item.get('expires_on') or '未设期限')}</td><td>{esc(item['status'])}</td><td><form class="inline-form" method="post" action="/inventory/{esc(item['id'])}"><input type="hidden" name="version" value="{esc(item['version'])}"><input name="amount_text" value="{esc(item.get('amount_text') or '')}" aria-label="更新数量"><select name="status" aria-label="更新状态">{''.join(f'<option value="{state}"{_selected(item["status"],state)}>{state}</option>' for state in sorted(adaptive.INVENTORY_STATUSES))}</select><button>更新</button></form></td></tr>'''
+        for item in items
+    ) or '<tr><td colspan="4" class="muted">还没有库存记录</td></tr>'
+    return f'''<section class="section-header"><div><p class="eyebrow">Inventory events</p><h1>食材库存与临期状态</h1><p class="muted">每次状态变化都有事件记录，不把“没买到”误当成“吃完”。</p></div></section><section class="panel"><form class="inventory-add" method="post" action="/inventory"><label>食材名称<input name="name" required></label><label>大概数量<input name="amount_text"></label><label>期限<input type="date" name="expires_on"></label><button>加入库存</button></form><div class="table-scroll"><table><thead><tr><th>食材</th><th>期限</th><th>状态</th><th>更新</th></tr></thead><tbody>{rows}</tbody></table></div></section>'''
+
+
+def render_profile_page() -> str:
+    current = personalization.active_personalization()
+    if current["status"] == "setup_required":
+        return render_setup_start(personalization.onboarding_status())
+    profile = current["profile"]
+    goals = "".join(f'<li>{esc(item["goal_json"].get("custom_label") or GOAL_LABELS.get(item["goal_json"].get("type"), item["goal_json"].get("type")))}</li>' for item in current["goals"])
+    targets = "".join(f'<li><strong>{esc(item["target_key"])}</strong> {esc(item["value_json"])}<br><span class="muted small">{esc(item["source_kind"])} · {esc(item["method"])} · policy {esc(item["policy_version"])}</span></li>' for item in current["targets"]) or '<li class="muted">当前没有数值营养目标</li>'
+    return f'''<section class="section-header"><div><p class="eyebrow">Versioned contract</p><h1>目标、边界与来源</h1><p class="muted">当前档案 v{esc(profile['version'])}；修改会创建新版本，旧计划仍能按原版本解释。</p></div><div class="actions"><form method="post" action="/setup/start"><button>修订档案</button></form><a class="button secondary" href="/data">备份与迁移</a></div></section><div class="grid"><section class="panel"><h2>目标</h2><ol>{goals}</ol></section><section class="panel"><h2>安全模式</h2><p class="status">{esc(current['safety']['mode'])}</p><p>{esc(', '.join(current['safety'].get('flags') or []) or '无额外安全标志')}</p></section><section class="panel"><h2>营养目标与 provenance</h2><ul>{targets}</ul></section></div>'''
+
+
+def render_insights_page() -> str:
+    snapshot = adaptive.calibration_snapshot()
+    observations = personalization.list_metrics(limit=20)
+    observation_rows = "".join(
+        f'<tr><td>{esc(item["observed_date"])}</td><td>{esc(METRIC_LABELS.get(item["metric_key"], item["metric_key"]))}</td><td>{esc(item["value_json"])}</td><td>{esc(item["source"])}</td></tr>'
+        for item in observations
+    ) or '<tr><td colspan="4" class="muted">暂无独立指标记录</td></tr>'
+    return f'''<section class="section-header"><div><p class="eyebrow">Calibration</p><h1>证据覆盖与校准资格</h1><p class="muted">证据不足时只解释执行摩擦，不擅自修改营养目标。</p></div></section><div class="metric-grid"><article class="metric-card"><span>反馈天数</span><strong>{esc(snapshot['feedback_days'])}</strong></article><article class="metric-card"><span>执行事件</span><strong>{esc(snapshot['feedback_events'])}</strong></article><article class="metric-card"><span>可比体重记录</span><strong>{esc(snapshot['comparable_weight_events'])}</strong></article></div><div class="grid"><section class="panel"><h2>当前判断</h2><p>{esc(snapshot['rule'])}</p><p><strong>策略复盘：</strong>{'证据已达到最低门槛' if snapshot['eligible_for_strategy_review'] else '继续收集真实执行回执'}</p><p><strong>体重校准：</strong>{'具备分析资格，仍需用户确认任何目标变化' if snapshot['eligible_for_weight_calibration'] else '数据不足，不调整目标'}</p></section><section class="panel"><h2>记录可比指标</h2><form method="post" action="/metrics"><label>日期<input type="date" name="observed_date" value="{date.today().isoformat()}" required></label><label>指标<select name="metric_key"><option value="weight_kg">体重 kg</option><option value="waist_cm">腰围 cm</option><option value="execution_rate">计划执行率 %</option><option value="energy_state">精力（文字）</option><option value="training_performance">训练表现（文字）</option></select></label><label>观测值<input name="value" required></label><button>追加观测</button></form></section></div><section class="panel"><h2>最近指标历史</h2><div class="table-scroll"><table><thead><tr><th>日期</th><th>指标</th><th>值</th><th>来源</th></tr></thead><tbody>{observation_rows}</tbody></table></div></section>'''
+
+
+def render_data_page(message: str = "") -> str:
+    message_html = f'<div class="quiet-success panel" role="status">{esc(message)}</div>' if message else ""
+    return f'''<section class="section-header"><div><p class="eyebrow">Portable local data</p><h1>备份、恢复与设备迁移</h1><p class="muted">导出包包含数据库快照、配置与本地媒体，并用 manifest 和 SHA-256 校验。</p></div></section>{message_html}<div class="grid"><section class="panel"><h2>导出完整工作台</h2><p>生成可验证 ZIP；API Key 从不写入数据库或导出包。</p><a class="button" href="/data/export">生成并下载</a></section><section class="panel"><h2>恢复完整工作台</h2><p>上传后先验证路径、哈希、格式、schema 和数据库完整性。应用前会自动创建当前数据库备份。</p><form method="post" enctype="multipart/form-data" action="/data/import"><label>MealCircuit ZIP<input type="file" name="bundle" accept="application/zip,.zip" required></label><label class="choice-row"><input type="checkbox" name="confirm_restore" value="yes" required><span>我理解恢复会替换当前数据库，并确认应用</span></label><button class="danger" type="submit">验证并恢复</button></form></section></div>'''
+
+
+def render_capture_page() -> str:
+    today = date.today().isoformat()
+    return f'''<section class="section-header"><div><p class="eyebrow">Evidence first</p><h1>记录发生了什么</h1><p class="muted">记录是事实层，不等于计划已执行；照片与原材料在安全受限模式下自动使用事实型 schema。</p></div></section><div class="capture-grid"><section class="panel"><h2>自然语言记录</h2><form method="post" action="/records"><input type="hidden" name="record_date" value="{today}"><label>今天吃了什么、身体或日程怎样<textarea name="raw_input" required placeholder="例如：午餐临时外食，晚饭时间只有 10 分钟；训练完成但食欲一般"></textarea></label><button>保存事实</button></form></section><section class="panel"><h2>每日状态</h2><p>用结构化问答记录睡眠、训练、肠胃等；跳过保持未知。</p><a class="button secondary" href="/check-ins/{today}">记录状态</a></section><section class="panel"><h2>照片证据</h2><p>看不见的油、重量、酱汁和品牌保持未知。</p><a class="button secondary" href="/tasks/photo">上传照片</a></section><section class="panel"><h2>原材料 / 库存</h2><p>分析已有食材，或直接更新可用库存。</p><div class="actions"><a class="button secondary" href="/tasks/material">分析原材料</a><a class="button secondary" href="/inventory">库存</a></div></section></div>'''
+
+
+def render_rescue_page(rescue_id: str) -> str:
+    session = adaptive.get_rescue_session(rescue_id)
+    if session["status"] == "completed":
+        result = session.get("result_json") or {}
+        steps = "".join(f'<li>{esc(item)}</li>' for item in result.get("steps") or [])
+        replacements = "、".join(result.get("replacement_foods") or [])
+        safety_notes = "".join(f'<li>{esc(item)}</li>' for item in result.get("safety_notes") or [])
+        replacements_html = f'<p><strong>替代食材：</strong>{esc(replacements)}</p>' if replacements else ""
+        portion_html = f'<p><strong>份量变化：</strong>{esc(result.get("portion_change"))}</p>' if result.get("portion_change") else ""
+        safety_html = f'<h2>安全提示</h2><ul>{safety_notes}</ul>' if safety_notes else ""
+        plan_url = f'/plans/{esc(session["plan_date"])}'
+        return f'<section class="panel"><p class="eyebrow">Rescue completed</p><h1>当前这一步的救场方案</h1><p>{esc(result.get("reason") or "")}</p>{replacements_html}{portion_html}<h2>现在这样做</h2><ol>{steps}</ol>{safety_html}<p class="muted">此结果已通过当前计划硬约束校验，并绑定原计划与来源清单。</p><a class="button" href="{plan_url}">回到正式计划</a></section>'
+    policy = personalization.generation_policy("rescue")
+    control = (
+        f'<form method="post" action="/rescue/{esc(rescue_id)}/generate"><button>用当前模型生成救场方案</button></form>'
+        if policy["allowed"] else f'<div class="form-error" role="alert"><strong>当前不能生成救场建议</strong><p>{esc(policy["reason"])}</p></div>'
+    )
+    return f'''<section class="panel"><p class="eyebrow">Bound rescue session</p><h1>修复当前这一步，不重写整份计划</h1><p>问题：{esc(RESCUE_LABELS.get(session['issue_code'],session['issue_code']))}</p><p class="muted">{esc(session.get('input_text') or '没有额外补充')}</p>{control}<p class="muted small">救场结果会绑定原计划版本、上下文哈希、policy 与 validator，并自动追加执行回执事件。</p><a class="button secondary" href="/plans/{esc(session['plan_date'])}">返回计划</a></section>'''
+
+
 def layout(title: str, body: str) -> bytes:
     today = date.today()
     checkin_path = f"/check-ins/{today.isoformat()}"
     nav_groups = (
-        ("日常", (
-            ("/", "今日总览", "dashboard", title == "首页"),
-            ("/daily", "今日建议", "advice", title in {"今日建议与明日菜单", "每日复盘"}),
-            (checkin_path, "今日状态", "checkin", title in {"今日状态", "状态问答", "状态设置"}),
+        ("工作台", (
+            ("/", "今天", "dashboard", title == "今天"),
+            (f"/plans/{today.isoformat()}", "计划", "advice", title == "执行计划"),
+            ("/capture", "记录", "checkin", title in {"记录", "今日状态", "状态问答", "状态设置"}),
+            ("/insights", "洞察", "history", title == "洞察"),
         )),
-        ("处理", (
+        ("自适应", (
+            ("/learning", "学习确认", "memory", title == "学习确认"),
+            ("/inventory", "库存", "foods", title == "库存"),
+            ("/profile", "目标与边界", "settings", title in {"目标与边界", "初始化"}),
+        )),
+        ("高级工具", (
+            ("/daily", "建议生成", "advice", title in {"今日建议与明日菜单", "每日复盘"}),
             ("/tasks/photo", "照片任务", "photo", title in {"上传食物照片", "任务详情"}),
             ("/tasks/material", "原材料", "material", title == "原材料分析"),
             ("/tasks", "全部任务", "tasks", title == "任务列表"),
             ("/ai", "API 接入", "settings", title == "API 接入"),
-        )),
-        ("资料", (
             ("/foods", "食品营养库", "foods", title in {"食品营养库", "新增食品", "编辑食品"}),
             ("/history", "历史建议", "history", title == "历史建议"),
             ("/overview", "记录与记忆", "memory", title == "记录与记忆"),
@@ -111,18 +479,20 @@ def layout(title: str, body: str) -> bytes:
             f'<section class="nav-group" aria-label="{esc(label)}"><p class="nav-group-label">{esc(label)}</p>{"".join(links)}</section>'
         )
     page_titles = {
-        "首页": "今日总览", "今日建议与明日菜单": "今日建议", "每日复盘": "每日复盘",
+        "今天": "今天", "执行计划": "执行计划", "记录": "记录", "洞察": "洞察",
+        "学习确认": "学习确认", "库存": "库存", "目标与边界": "目标与边界", "初始化": "初始化",
+        "今日建议与明日菜单": "今日建议", "每日复盘": "每日复盘",
         "今日状态": "今日状态", "状态问答": "状态问答", "状态设置": "状态设置",
         "上传食物照片": "照片任务", "原材料分析": "原材料分析", "任务列表": "全部任务",
         "任务详情": "任务详情", "API 接入": "API 接入", "食品营养库": "食品营养库", "新增食品": "新增食品",
         "编辑食品": "编辑食品", "历史建议": "历史建议", "记录与记忆": "记录与记忆",
         "操作失败": "操作失败", "未找到": "未找到",
     }
-    top_action = "" if title in {"今日状态", "状态问答", "状态设置"} else (
-        f'<a class="button" href="{checkin_path}" aria-label="记录状态" title="记录状态">{icon("checkin")}记录状态</a>'
+    top_action = "" if title in {"记录", "今日状态", "状态问答", "状态设置", "初始化"} else (
+        f'<a class="button" href="/capture" aria-label="记录真实情况" title="记录真实情况">{icon("checkin")}记录</a>'
     )
     date_label = f"{today.month}月{today.day}日 周{'一二三四五六日'[today.weekday()]}"
-    page = f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{esc(title)} · MealCircuit</title><link rel="icon" href="/assets/ui/favicon.svg" type="image/svg+xml"><script src="/assets/ui/theme-init.js?v=20260708b"></script><link rel="stylesheet" href="/assets/ui/app.css?v=20260708b"><script src="/assets/ui/app.js?v=20260708b" defer></script></head><body>
+    page = f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{esc(title)} · MealCircuit</title><link rel="icon" href="/assets/ui/favicon.svg" type="image/svg+xml"><script src="/assets/ui/theme-init.js?v=20260711a"></script><link rel="stylesheet" href="/assets/ui/app.css?v=20260711a"><script src="/assets/ui/app.js?v=20260711a" defer></script></head><body>
     <a class="skip-link" href="#main-content">跳到主要内容</a>
     <div class="app-shell"><aside class="app-sidebar" id="app-sidebar" aria-label="主导航"><a class="sidebar-brand" href="/">MealCircuit</a><nav class="sidebar-nav">{"".join(nav_sections)}</nav><div class="sidebar-footer"><button class="icon-button" type="button" data-nav-collapse aria-label="收起侧栏" title="收起侧栏">{icon("collapse")}</button></div></aside>
     <button class="nav-scrim" type="button" data-nav-close aria-label="关闭导航"></button>
@@ -635,23 +1005,37 @@ MEAL_MODE_LABELS = {"quick_assembly": "快速组装", "eat_out": "食堂 / 外�
 
 
 def render_home_cooking_menu(menu: dict) -> str:
-    dinner = next((meal for meal in menu.get("meals", []) if meal.get("name") == "晚餐"), {})
-    recipe = dinner.get("recipe_card")
-    if not recipe:
+    home_meals = [meal for meal in menu.get("meals", []) if meal.get("recipe_card")]
+    if not home_meals:
         return ""
-    cookware = "、".join(EQUIPMENT_LABELS.get(item, item) for item in recipe["cookware"])
-    ingredients = render_list([
-        f'{item["name"]}：{item["amount"]}；{item["prep"]}' for item in recipe["ingredients"]
-    ])
-    seasonings = render_list([
-        f'{item["name"]}：{item["amount"]}；{item["timing"]}' for item in recipe["seasonings"]
-    ])
-    steps = "".join(
-        f'<li><strong>{esc(item["instruction"])}</strong>'
-        f'<span class="step-meta">{esc(item["heat"])} · {esc(item["minutes"])} 分钟 · '
-        f'完成标志：{esc(item["done_signal"])}</span></li>'
-        for item in recipe["steps"]
-    )
+    recipe_sections = []
+    for meal in home_meals:
+        recipe = meal["recipe_card"]
+        cookware = "、".join(EQUIPMENT_LABELS.get(item, item) for item in recipe["cookware"])
+        ingredients = render_list([
+            f'{item["name"]}：{item["amount"]}；{item["prep"]}' for item in recipe["ingredients"]
+        ])
+        seasonings = render_list([
+            f'{item["name"]}：{item["amount"]}；{item["timing"]}' for item in recipe["seasonings"]
+        ])
+        steps = "".join(
+            f'<li><strong>{esc(item["instruction"])}</strong>'
+            f'<span class="step-meta">{esc(item["heat"])} · {esc(item["minutes"])} 分钟 · '
+            f'完成标志：{esc(item["done_signal"])}</span></li>'
+            for item in recipe["steps"]
+        )
+        meal_key = {"早餐": "BREAKFAST", "午餐": "LUNCH", "晚餐": "DINNER"}.get(meal.get("name"), "MEAL")
+        recipe_sections.append(
+            f'<section class="menu-section"><p class="eyebrow">BEGINNER {meal_key}</p>'
+            f'<h2>{esc(recipe["title"])}</h2><div class="recipe-meta">'
+            f'<span>1 人份</span><span>主动 {esc(recipe["active_minutes"])} 分钟</span>'
+            f'<span>总计 {esc(recipe["total_minutes"])} 分钟</span><span>{esc(cookware)}</span></div>'
+            '<div class="recipe-columns"><div><h3>食材</h3>' + ingredients
+            + '<h3>调味</h3>' + seasonings + '</div><div><h3>按顺序操作</h3><ol class="recipe-steps">'
+            + steps + '</ol></div></div><h3>失败补救</h3>' + render_list(recipe["failure_rescue"])
+            + f'<p><strong>清洁成本：</strong>{esc(recipe["cleanup"])}</p>'
+            + f'<p><strong>肠胃降级：</strong>{esc(recipe["gut_fallback"])}</p></section>'
+        )
     shopping = "".join(
         f'<div class="menu-fact"><p><strong>{esc(item["name"])}</strong> · {esc(item["amount"])}'
         f'{" · 必买" if item["required"] else " · 缺少时再买"}</p>'
@@ -678,15 +1062,7 @@ def render_home_cooking_menu(menu: dict) -> str:
         if online else ""
     )
     return (
-        '<section class="menu-section"><p class="eyebrow">BEGINNER DINNER</p>'
-        f'<h2>{esc(recipe["title"])}</h2><div class="recipe-meta">'
-        f'<span>1 人份</span><span>主动 {esc(recipe["active_minutes"])} 分钟</span>'
-        f'<span>总计 {esc(recipe["total_minutes"])} 分钟</span><span>{esc(cookware)}</span></div>'
-        '<div class="recipe-columns"><div><h3>食材</h3>' + ingredients
-        + '<h3>调味</h3>' + seasonings + '</div><div><h3>按顺序操作</h3><ol class="recipe-steps">'
-        + steps + '</ol></div></div><h3>失败补救</h3>' + render_list(recipe["failure_rescue"])
-        + f'<p><strong>清洁成本：</strong>{esc(recipe["cleanup"])}</p>'
-        + f'<p><strong>肠胃降级：</strong>{esc(recipe["gut_fallback"])}</p></section>'
+        "".join(recipe_sections)
         + '<section class="menu-section"><h3>明日采购清单</h3><div class="menu-facts">' + shopping + "</div></section>"
         + online_section
         + f'<section class="menu-section"><h3>{esc(menu["reuse_plan"]["horizon_days"])} 日食材复用方向</h3>'
@@ -834,12 +1210,12 @@ class Handler(BaseHTTPRequestHandler):
         raw = self.rfile.read(length).decode("utf-8")
         return urllib.parse.parse_qs(raw, keep_blank_values=True)
 
-    def read_multipart(self) -> tuple[dict[str, str], dict[str, tuple[str, bytes]]]:
+    def read_multipart(self, max_bytes: int | None = None) -> tuple[dict[str, str], dict[str, tuple[str, bytes]]]:
         content_type = self.headers.get("Content-Type", "")
         if not content_type.startswith("multipart/form-data"):
             raise ValidationError("上传必须使用 multipart/form-data")
         length = int(self.headers.get("Content-Length", "0"))
-        if length > service.MAX_UPLOAD_BYTES + 1024 * 1024:
+        if length > (max_bytes or service.MAX_UPLOAD_BYTES + 1024 * 1024):
             raise ValidationError("上传内容过大")
         raw = self.rfile.read(length)
         message = BytesParser(policy=default).parsebytes(
@@ -860,14 +1236,112 @@ class Handler(BaseHTTPRequestHandler):
     def render_error(self, error: Exception, status: int = 400) -> None:
         self.send_html("操作失败", f'<section class="card error"><h1>操作失败</h1><p>{esc(error)}</p><a class="button secondary" href="/">返回总览</a></section>', status)
 
+    @staticmethod
+    def setup_step_payload(step: str, values: dict[str, list[str]]) -> dict:
+        last = lambda key, default="": (values.get(key) or [default])[-1].strip()
+        if step == "welcome":
+            return {"privacy_ack": last("privacy_ack") == "yes"}
+        if step == "goals":
+            return {
+                "primary_goal": last("primary_goal"),
+                "custom_goal_text": last("custom_goal_text"),
+                "secondary_goals": values.get("secondary_goals") or [],
+                "motivation": last("motivation"),
+                "success_metrics": values.get("success_metrics") or [],
+                "target_weight_kg": _number_or_none(last("target_weight_kg")),
+                "horizon": last("horizon"),
+            }
+        if step == "baseline":
+            return {
+                "age_years": int(last("age_years")),
+                "height_cm": _number_or_none(last("height_cm")),
+                "weight_kg": _number_or_none(last("weight_kg")),
+                "physiological_input": last("physiological_input", "unspecified"),
+                "activity_level": last("activity_level", "moderate"),
+            }
+        if step == "safety":
+            guidance = {
+                "confirmed": last("guidance_confirmed") == "yes",
+                "source": last("guidance_source"), "summary": last("guidance_summary"),
+                "confirmed_on": last("guidance_confirmed_on"), "valid_until": last("guidance_valid_until"),
+            }
+            return {
+                "life_stage": last("life_stage", "adult"),
+                **{key: last(key) == "yes" for key in personalization.OBSERVATION_FLAGS},
+                "professional_guidance": guidance if guidance["confirmed"] else None,
+            }
+        if step == "training":
+            return {"types": values.get("types") or [], "frequency_per_week": int(last("frequency_per_week", "0"))}
+        if step == "constraints":
+            return {
+                "meal_environment": last("meal_environment"), "portion_method": last("portion_method"),
+                "meal_modes": {
+                    key: last(f"meal_mode_{key}", personalization.LEGACY_DEFAULT_MEAL_MODES[key])
+                    for key in personalization.MEAL_KEYS
+                },
+                "cooking_time_minutes": int(last("cooking_time_minutes", "25")),
+                "question_budget": int(last("question_budget", "2")),
+                "equipment": _csv(last("equipment")), "food_exclusions": _csv(last("food_exclusions")),
+                "preferences": _csv(last("preferences")),
+            }
+        raise ValidationError("未知的初始化步骤")
+
     def do_GET(self) -> None:
         parsed = urllib.parse.urlparse(self.path)
         path, query = parsed.path.rstrip("/") or "/", urllib.parse.parse_qs(parsed.query)
         try:
             if path.startswith("/assets/ui/"):
                 self.send_static(path.removeprefix("/assets/ui/"))
+            elif path == "/setup":
+                self.send_html("初始化", render_setup_start(personalization.onboarding_status()))
+            elif path.startswith("/setup/"):
+                step = path.split("/")[2]
+                if step not in personalization.ONBOARDING_STEPS:
+                    raise KeyError(step)
+                status = personalization.onboarding_status()
+                session = status.get("session")
+                if not session:
+                    self.redirect("/setup")
+                    return
+                self.send_html("初始化", render_setup_step(session, step))
             elif path == "/":
-                self.send_html("首页", render_dashboard(service.dashboard_snapshot()))
+                legacy_snapshot = re.sub(
+                    r"<h1(\b[^>]*)>", r"<h2\1>", render_dashboard(service.dashboard_snapshot())
+                ).replace("</h1>", "</h2>")
+                self.send_html(
+                    "今天",
+                    render_today_workspace(date.today().isoformat())
+                    + f'<details class="legacy-dashboard"><summary>查看原有今日总览</summary>{legacy_snapshot}</details>',
+                )
+            elif path == "/capture":
+                self.send_html("记录", render_capture_page())
+            elif path.startswith("/plans/"):
+                self.send_html("执行计划", render_plan_page(path.split("/")[2]))
+            elif path.startswith("/questions/"):
+                self.send_html("今天", render_questions_page(path.split("/")[2]))
+            elif path == "/learning":
+                self.send_html("学习确认", render_learning_page())
+            elif path == "/inventory":
+                self.send_html("库存", render_inventory_page())
+            elif path == "/profile":
+                self.send_html("目标与边界", render_profile_page())
+            elif path == "/insights":
+                self.send_html("洞察", render_insights_page())
+            elif path == "/data":
+                self.send_html("目标与边界", render_data_page())
+            elif path == "/data/export":
+                exported = portability.export_bundle()
+                target = Path(exported["path"])
+                data = target.read_bytes()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/zip")
+                self.send_header("Content-Disposition", f'attachment; filename="{target.name}"')
+                self.send_header("Content-Length", str(len(data)))
+                self.send_security_headers()
+                self.end_headers()
+                self.wfile.write(data)
+            elif path.startswith("/rescue/"):
+                self.send_html("执行计划", render_rescue_page(path.split("/")[2]))
             elif path == "/daily":
                 daily = service.daily_state()
                 if daily["status"] == "completed":
@@ -1017,7 +1491,158 @@ class Handler(BaseHTTPRequestHandler):
         path = urllib.parse.urlparse(self.path).path.rstrip("/") or "/"
         try:
             self.validate_origin()
-            if path == "/check-ins/settings":
+            if path == "/setup/start":
+                session = personalization.start_onboarding()
+                self.redirect(f'/setup/{session["current_step"]}')
+            elif path.startswith("/setup/save/"):
+                step = path.split("/")[3]
+                values = self.read_urlencoded_values()
+                session_id = (values.get("session_id") or [""])[-1]
+                version = int((values.get("version") or ["-1"])[-1])
+                payload = self.setup_step_payload(step, values)
+                try:
+                    updated = personalization.save_onboarding_step(session_id, step, payload, version)
+                except (ValidationError, ValueError) as exc:
+                    session = personalization.get_onboarding(session_id)
+                    self.send_html("初始化", render_setup_step(session, step, error=str(exc), override=payload), 400)
+                    return
+                order = list(personalization.ONBOARDING_STEPS)
+                next_step = order[min(order.index(step) + 1, len(order) - 1)]
+                self.redirect(f"/setup/{next_step}")
+            elif path == "/setup/complete":
+                values = self.read_urlencoded_values()
+                session_id = (values.get("session_id") or [""])[-1]
+                version = int((values.get("version") or ["-1"])[-1])
+                confirmation = {
+                    "accept_profile": "accept_profile" in values,
+                    "accept_strategy": "accept_strategy" in values,
+                    "planning_mode": (values.get("planning_mode") or ["portion_guided"])[-1],
+                    "protein_candidate_id": (values.get("protein_candidate_id") or [None])[-1],
+                }
+                professional_low = (values.get("professional_protein_low") or [""])[-1].strip()
+                professional_high = (values.get("professional_protein_high") or [""])[-1].strip()
+                if professional_low or professional_high:
+                    if not professional_low or not professional_high:
+                        raise ValidationError("专业蛋白范围必须同时填写下界和上界")
+                    confirmation["professional_targets"] = {
+                        "protein_g": [float(professional_low), float(professional_high)]
+                    }
+                try:
+                    personalization.complete_onboarding(session_id, version, confirmation)
+                except (ValidationError, ValueError) as exc:
+                    session = personalization.get_onboarding(session_id)
+                    self.send_html("初始化", render_setup_step(session, "review", error=str(exc)), 400)
+                    return
+                self.redirect("/")
+            elif path.startswith("/plans/") and path.endswith("/feedback"):
+                parts = path.strip("/").split("/")
+                plan_date, plan_item_id = parts[1], parts[2]
+                values = self.read_urlencoded_values()
+                expected = int((values.get("expected_version") or ["0"])[-1])
+                adaptive.save_plan_feedback(
+                    plan_date, plan_item_id, (values.get("status") or [""])[-1],
+                    reason_codes=values.get("reason_codes") or [],
+                    actual_text=(values.get("actual_text") or [""])[-1],
+                    expected_version=expected or None, actor_source="web",
+                )
+                self.redirect(f"/plans/{plan_date}")
+            elif path.startswith("/questions/") and path.endswith("/answer"):
+                question_id = path.split("/")[2]
+                values = self.read_urlencoded_values()
+                version = int((values.get("version") or ["-1"])[-1])
+                question = adaptive.get_question_event(question_id)
+                schema = question.get("question_schema_json") or {}
+                if schema.get("kind") == "plan_feedback":
+                    answer: object = {
+                        "status": (values.get("feedback_status") or [""])[-1],
+                        "reason_codes": values.get("reason_codes") or [],
+                        "actual_text": (values.get("actual_text") or [""])[-1],
+                    }
+                else:
+                    answer = (values.get("answer") or [""])[-1]
+                adaptive.answer_question(question_id, answer, version)
+                self.redirect(f'/questions/{question["question_date"]}')
+            elif path.startswith("/questions/") and path.endswith("/skip"):
+                question_id = path.split("/")[2]
+                values = self.read_urlencoded_values()
+                version = int((values.get("version") or ["-1"])[-1])
+                question_date = adaptive.get_question_event(question_id)["question_date"]
+                adaptive.answer_question(question_id, None, version, skip=True)
+                self.redirect(f"/questions/{question_date}")
+            elif path.startswith("/learning/") and path.endswith("/decide"):
+                candidate_id = path.split("/")[2]
+                form = self.read_urlencoded()
+                adaptive.decide_candidate(candidate_id, form.get("decision", ""), statement=form.get("statement") or None)
+                self.redirect("/learning")
+            elif path.startswith("/learning/rules/") and path.endswith("/status"):
+                rule_id = path.split("/")[3]
+                adaptive.set_rule_status(rule_id, self.read_urlencoded().get("status", ""))
+                self.redirect("/learning")
+            elif path == "/learning/experiments":
+                form = self.read_urlencoded()
+                adaptive.propose_experiment(form.get("variable_key", ""), {
+                    "action": form.get("action", ""), "success_signal": form.get("success_signal", ""),
+                })
+                self.redirect("/learning")
+            elif path.startswith("/learning/experiments/") and path.endswith("/start"):
+                experiment_id = path.split("/")[3]
+                form = self.read_urlencoded()
+                adaptive.activate_experiment(
+                    experiment_id, form.get("starts_on", ""), int(form.get("days", "0"))
+                )
+                self.redirect("/learning")
+            elif path.startswith("/learning/experiments/") and path.endswith("/finish"):
+                experiment_id = path.split("/")[3]
+                form = self.read_urlencoded()
+                adaptive.finish_experiment(
+                    experiment_id, {"summary": form.get("summary", "")},
+                    cancel=form.get("decision") == "cancel",
+                )
+                self.redirect("/learning")
+            elif path == "/inventory":
+                form = self.read_urlencoded()
+                adaptive.create_inventory_item(form.get("name", ""), form.get("amount_text", ""), expires_on=form.get("expires_on") or None)
+                self.redirect("/inventory")
+            elif path == "/metrics":
+                form = self.read_urlencoded()
+                metric_key = form.get("metric_key", "")
+                raw_value = form.get("value", "").strip()
+                value: object = (
+                    float(raw_value)
+                    if metric_key in {"weight_kg", "waist_cm", "execution_rate"}
+                    else raw_value
+                )
+                personalization.record_metric(
+                    metric_key, form.get("observed_date", ""), value, source="user"
+                )
+                self.redirect("/insights")
+            elif path.startswith("/inventory/"):
+                inventory_id = path.split("/")[2]
+                form = self.read_urlencoded()
+                adaptive.update_inventory_status(inventory_id, form.get("status", ""), int(form.get("version", "-1")), form.get("amount_text"))
+                self.redirect("/inventory")
+            elif path == "/rescue/start":
+                form = self.read_urlencoded()
+                rescue = adaptive.create_rescue_session(form.get("plan_date", ""), form.get("plan_item_id", ""), form.get("issue_code", ""), form.get("input_text", ""))
+                self.redirect(f'/rescue/{rescue["id"]}')
+            elif path == "/data/import":
+                fields, files = self.read_multipart(max_bytes=256 * 1024 * 1024)
+                if fields.get("confirm_restore") != "yes" or "bundle" not in files:
+                    raise ValidationError("必须选择导入包并明确确认恢复")
+                _, data = files["bundle"]
+                exports_root().mkdir(parents=True, exist_ok=True)
+                target = exports_root() / f"pending-web-import-{os.urandom(8).hex()}.zip"
+                target.write_bytes(data)
+                try:
+                    restored = portability.restore_bundle(target, confirm=True)
+                finally:
+                    target.unlink(missing_ok=True)
+                self.send_html("目标与边界", render_data_page(f'恢复完成；恢复前备份：{restored.get("pre_restore_backup") or "无"}'))
+            elif path.startswith("/rescue/") and path.endswith("/generate"):
+                rescue_id = path.split("/")[2]
+                service.generate_rescue(rescue_id)
+                self.redirect(f"/rescue/{rescue_id}")
+            elif path == "/check-ins/settings":
                 values = self.read_urlencoded_values()
                 current = service.checkin_module_settings()
                 ordered_keys = [item["module_key"] for item in current]
@@ -1168,6 +1793,7 @@ def main() -> None:
         parser.error("非回环地址必须显式传入 --allow-remote；该模式无认证、无 TLS")
     if not is_loopback:
         print("警告：远程监听模式没有认证和 TLS，请只在受信任网络中使用。", file=sys.stderr)
+    initialize_private_home()
     init_db()
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     server.allow_remote = args.allow_remote

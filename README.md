@@ -61,20 +61,26 @@ All analysis results must pass JSON Schema-level structural validation before th
 
 | Entry | Problem it solves |
 | :--- | :--- |
-| **Today Overview** | Summarize today's state and review the core advice, risk signals, and next-day three-meal plan |
+| **Today** | Show the highest-value next action, published-plan progress, and low-frequency questions |
+| **Plan** | Execute a published plan, append revisable feedback, and start a constrained rescue when conditions change |
+| **Learning Review** | Confirm or reject evidence-backed candidate rules; candidates never become hard constraints silently |
+| **Inventory** | Track available, used, not-bought, discarded, and unknown states as events |
+| **Goals & Safety** | Revise versioned goals, safety mode, and target provenance; export or restore the workbench |
 | **Today Status** | Record weight, training, hunger/satiety, sleep, and gut response one question at a time, with drafts, skips, and version history |
 | **Meal Photos** | Upload real meals so an agent can estimate nutrition ranges from visible evidence and list unknowns |
 | **Ingredient Analysis** | Combine raw ingredients with user food-library data to judge usage, portions, and risks |
 | **Food Nutrition Library** | Manage brand labels, default portions, priorities, usage conditions, and version history |
 | **Records & Memory** | Store daily eating, long-term trends, current adjustments, and daily-review history |
 
-The daily menu always covers breakfast, lunch, dinner, a conditional snack, training-day adjustments, and gut-symptom adjustments. When `home_cooking` is enabled in private settings, breakfast becomes low-friction assembly, lunch adapts to cafeteria or eating out, and dinner becomes a beginner-friendly single-serving execution card, together with a shopping list, online filtering keywords, and a three-day ingredient reuse direction. The system reads the last 14 completed dinners plus likely carryover ingredients from previous reuse plans, and rotates dishes and flavor profiles by default; if repetition is necessary because of recovery, expiring ingredients, or shopping constraints, the reason must be stated explicitly. High-priority foods still require an item-by-item `use` or `skip` decision instead of being mechanically forced into the menu.
+The daily menu always covers breakfast, lunch, dinner, a conditional snack, training-day adjustments, and gut-symptom adjustments. During onboarding, each person chooses `home_cook`, `quick_assembly`, or `eat_out` separately for breakfast, lunch, and dinner; this is stored in their versioned personal strategy rather than fixed by repository defaults. Every home-cooked meal gets its own beginner-friendly single-serving execution card, while shopping, online filtering, and three-day ingredient reuse remain coordinated across the day. The system reads recent completed home meals by meal slot plus likely carryover ingredients and rotates dishes and flavor profiles independently for each slot.
 
 “Today Status” shows five daily modules by default. You answer one question at a time, and single-question drafts are preserved automatically; only after a full module is completed do its answers enter the agent context and re-queue the daily review. Modules can be hidden, reordered, or switched to on-demand recording in “Adjust Modules”. An explicit skip only means the user did not provide the information; the system does not infer “no training” or “no symptoms” from that.
 
 ## Agent Workflow
 
 Pending work is read from the CLI. Photos and raw ingredients use task context; daily reviews use date context.
+
+The adaptive loop is available in both Web and CLI. First use creates a resumable, versioned goal and safety contract. Published plan items receive stable IDs; actual execution is appended as versioned feedback. Repeated evidence can propose a rule scoped to the current goal, strategy, and safety mode, but only explicit user confirmation activates it. Restricted modes keep recording and fact-only analysis available while blocking prescriptive planning.
 
 ```powershell
 # 1. List pending photo, ingredient, and daily review work
@@ -98,6 +104,18 @@ python -m mealcircuit.agent_cli day-generate 2026-01-01
 
 # 3. Append a user-confirmed correction without overwriting the original result
 python -m mealcircuit.agent_cli correct <TASK_ID> --text "User-confirmed correction"
+
+# Adaptive loop and portable backup
+python -m mealcircuit.agent_cli setup status
+python -m mealcircuit.agent_cli plan 2026-01-02
+python -m mealcircuit.agent_cli questions list 2026-01-02
+python -m mealcircuit.agent_cli learning list
+python -m mealcircuit.agent_cli inventory list
+python -m mealcircuit.agent_cli calibration
+# Experiment JSON: {"action":"...","success_signal":"..."}
+python -m mealcircuit.agent_cli learning experiment-propose dinner_active_minutes --file experiment.json
+python -m mealcircuit.agent_cli export-bundle --output mealcircuit-backup.zip
+python -m mealcircuit.agent_cli import-bundle mealcircuit-backup.zip
 ```
 
 Agents should strictly follow `doctrine.content` and `result_schema` in the exported context. Daily reviews must also read `target_checkin`, `checkin_coverage`, and `recent_checkins`; drafts are not exported, and skips or missing answers remain unknown. Photo analysis uses nutrition ranges; any range that cannot be judged is `null`, and invisible details go into `unknowns`.
@@ -110,7 +128,7 @@ DeepSeek uses its OpenAI-compatible Chat API path. As of the current official De
 
 When you click “用 API Key 生成” in the Web UI or run `generate` / `day-generate`, MealCircuit sends the assembled context, and for photo tasks the uploaded image, to the selected model provider. The returned JSON is still validated by the same local schema and business rules before anything is persisted.
 
-In solo-cooking mode, `day-context` also includes `home_cooking_preferences`, `recent_home_dinners`, `recent_online_categories`, `ingredient_carryover_obligations`, and the generation protocol. `ingredient_carryover_obligations` is derived from previous three-day reuse plans where required ingredients may have been bought and are still inside the reuse window; agent results must cover each item in `ingredient_carryover_decisions` as `use`, `skip`, or `discard`. Online shopping advice only describes specs, ingredient filters, and search keywords; it does not perform external lookups or claim real product prices or inventory.
+When any meal is home-cooked, `day-context` also includes versioned `meal_modes`, `home_cooking_preferences`, `recent_home_meals` (plus the legacy dinner alias), `recent_online_categories`, `ingredient_carryover_obligations`, and the generation protocol. `ingredient_carryover_obligations` is derived from previous three-day reuse plans where required ingredients may have been bought and are still inside the reuse window; agent results must cover each item in `ingredient_carryover_decisions` as `use`, `skip`, or `discard`. Online shopping advice only describes specs, ingredient filters, and search keywords; it does not perform external lookups or claim real product prices or inventory.
 
 ## Data & Boundaries
 
@@ -195,7 +213,7 @@ python -m mealcircuit.agent_cli doctor
 .\start.ps1
 ```
 
-打开 [http://127.0.0.1:8765](http://127.0.0.1:8765)。首次初始化后，按 `doctor` 显示的位置填写私人 `profile.md` 与 `settings.json`；停止服务使用 `Ctrl+C`。
+打开 [http://127.0.0.1:8765](http://127.0.0.1:8765)。首次使用会进入可恢复的目标与安全初始化；原有记录入口不会因初始化门禁消失。`doctor` 仍可查看私人数据位置；停止服务使用 `Ctrl+C`。
 
 ## 它如何工作
 
@@ -215,20 +233,26 @@ flowchart LR
 
 | 入口 | 解决的问题 |
 | :--- | :--- |
-| **今日总览** | 汇总当天状态，查看核心建议、风险信号与次日三餐菜单 |
+| **今天** | 只显示当前最有价值的下一步、正式计划进度和低频问题 |
+| **计划** | 执行已发布计划、追加可修订回执，并在现实条件变化时进入救场 |
+| **学习确认** | 查看重复证据提出的候选规则；未确认候选不会进入硬约束 |
+| **库存** | 保存可用、用完、未购买、丢弃和未知状态及其事件历史 |
+| **目标与边界** | 修订带版本的目标、安全模式和营养目标来源，并导出或恢复完整工作台 |
 | **今日状态** | 通过逐题卡片记录体重、训练、饥饿饱腹、睡眠和肠胃反应；支持草稿、跳过和版本历史 |
 | **食物照片** | 上传真实餐食，由 Agent 按可见证据估算营养区间并列出未知项 |
 | **原材料分析** | 结合食品库中的用户数据，判断食材用途、份量与风险 |
 | **食品营养库** | 管理品牌标签、默认份量、优先级、使用条件及历史版本 |
 | **记录与记忆** | 保存每日饮食、长期趋势、当前调整和复盘版本历史 |
 
-每日菜单固定覆盖早餐、午餐、晚餐、条件加餐、训练日调整和肠胃异常调整。启用私人设置中的 `home_cooking` 后，早餐转为低摩擦组装、午餐适配食堂或外食、晚餐提供一人份新手执行卡，并同时给出采购清单、网购筛选关键词和三日食材复用方向。系统读取近 14 天已完成晚餐和上一轮可能剩余食材，默认轮换菜式和主风味；确因恢复、临期食材或采购限制重复时必须说明原因。高优先级食品仍须逐项给出 `use` 或 `skip`，不会因为“优先”二字机械塞进菜单。
+每日菜单固定覆盖早餐、午餐、晚餐、条件加餐、训练日调整和肠胃异常调整。初始化时，用户分别为早餐、午餐和晚餐选择“在家下厨”“快速组装”或“外食”；这些选择保存在版本化个人策略中，而不是写死在仓库默认配置里。每个在家下厨餐次都有独立的一人份新手执行卡，同时共享采购清单、网购筛选关键词和三日食材复用方向。系统按餐次读取近期已完成菜单并独立轮换菜式和主风味。
 
 “今日状态”默认显示五个每日模块。每次只回答一个问题，单题草稿会自动保留；完成整个模块后，答案才会进入 Agent 上下文并重新排队当日复盘。模块可以在“调整模块”中隐藏、排序或改为按需记录。明确跳过只表示用户不提供，系统不会据此推断“未训练”或“没有症状”。
 
 ## Agent 工作流
 
 待办统一从 CLI 读取。照片与原材料使用任务上下文；每日复盘使用日期上下文。
+
+自适应闭环同时提供 Web 与 CLI。首次使用建立可恢复、带版本的目标与安全契约；正式计划中的餐次具有稳定 ID，真实执行以可追溯事件追加。重复证据只会产生绑定当前目标、策略和安全模式的候选规则，必须由用户确认后才成为正式约束。受限安全模式继续允许记录和事实型分析，但禁止泄漏或继续执行旧处方计划。
 
 ```powershell
 # 1. 查看照片、原材料与每日复盘待办
@@ -252,6 +276,18 @@ python -m mealcircuit.agent_cli day-generate 2026-01-01
 
 # 3. 追加用户确认的更正，不覆盖原始结果
 python -m mealcircuit.agent_cli correct <任务ID> --text "用户确认的更正"
+
+# 自适应回路与可迁移备份
+python -m mealcircuit.agent_cli setup status
+python -m mealcircuit.agent_cli plan 2026-01-02
+python -m mealcircuit.agent_cli questions list 2026-01-02
+python -m mealcircuit.agent_cli learning list
+python -m mealcircuit.agent_cli inventory list
+python -m mealcircuit.agent_cli calibration
+# 实验 JSON：{"action":"...","success_signal":"..."}
+python -m mealcircuit.agent_cli learning experiment-propose dinner_active_minutes --file experiment.json
+python -m mealcircuit.agent_cli export-bundle --output mealcircuit-backup.zip
+python -m mealcircuit.agent_cli import-bundle mealcircuit-backup.zip
 ```
 
 Agent 应严格遵循上下文中的 `doctrine.content` 与 `result_schema`。每日复盘还必须读取 `target_checkin`、`checkin_coverage` 和 `recent_checkins`；草稿不会被导出，跳过与缺失保持未知。照片分析使用营养区间；无法判断的区间为 `null`，不可见信息进入 `unknowns`。
@@ -264,7 +300,7 @@ DeepSeek 走其 OpenAI-compatible Chat API。按当前官方 DeepSeek API 文档
 
 当你在 Web UI 点击“用 API Key 生成”或运行 `generate` / `day-generate` 时，MealCircuit 会把组装好的上下文发送给所选模型供应商；照片任务还会发送上传图片。模型返回的 JSON 仍必须通过本地结构校验和业务规则后才会保存。
 
-独居模式还会在 `day-context` 中提供 `home_cooking_preferences`、`recent_home_dinners`、`recent_online_categories`、`ingredient_carryover_obligations` 和生成协议。`ingredient_carryover_obligations` 来自上一轮三日复用计划中可能已买且仍在复用窗口内的食材；Agent 必须在结果中用 `ingredient_carryover_decisions` 逐项说明使用、跳过或丢弃。网购建议只描述规格、配料筛选标准与搜索关键词，不执行外部查询，也不声称具体商品的价格或库存。
+存在在家下厨餐次时，`day-context` 会提供版本化 `meal_modes`、`home_cooking_preferences`、`recent_home_meals`（并保留旧晚餐别名）、`recent_online_categories`、`ingredient_carryover_obligations` 和生成协议。`ingredient_carryover_obligations` 来自上一轮三日复用计划中可能已买且仍在复用窗口内的食材；Agent 必须在结果中用 `ingredient_carryover_decisions` 逐项说明使用、跳过或丢弃。网购建议只描述规格、配料筛选标准与搜索关键词，不执行外部查询，也不声称具体商品的价格或库存。
 
 ## 数据与边界
 

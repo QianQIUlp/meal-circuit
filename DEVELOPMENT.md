@@ -2,6 +2,16 @@
 
 > 项目于 2026-07-02 从 DietOS 更名为 MealCircuit（食回路）。以下旧名称保留为真实历史记录。
 
+## 2026-07-12：逐餐个人准备方式与双下厨菜单
+
+- 目标：早餐、午餐、晚餐分别由用户在初始化时决定在家下厨、快速组装或外食；支持午餐和晚餐均自己做且分别获得完整菜单执行卡。
+- 改动文件：新增逐餐模式领域模块，扩展版本化初始化、设置解析、上下文、结果结构、确定性校验、计划投影、模型工具结构、Web 初始化与菜单展示，并补充规则、说明和测试。
+- 核心功能：逐餐方式保存到个人策略版本，不再由仓库模板固定；每个在家下厨餐次独立执行时间/厨具限制、菜式轮换和历史追踪，共享采购、网购筛选与三日食材复用；旧用户仍按原“早餐组装、午餐外食、晚餐下厨”兼容读取，重新确认后才迁移到新个人策略。
+- 验证：69 项测试在 Python 3.12.13 和 3.13 均通过，覆盖版本化保存、午晚餐双执行卡、逐餐硬约束、计划投影、历史与 Web 展示；隔离数据目录的真实浏览器验证初始化选择和双执行卡，320/1440px 均无横向溢出、仅一个 `h1`，控制台无警告或错误。GitHub CI 待推送后复验。
+- 仍未实现：无自动猜测用户三餐方式；未重新确认的老用户继续采用旧兼容语义。
+- 下一最小任务：推送当前原子提交并确认 Draft PR 的双 Python 版本 CI 绿色。
+- 用户用法：进入“目标与边界”重新确认或首次初始化，在“现实限制”中分别选择三餐准备方式；午餐和晚餐都选“在家下厨”后，次日菜单会输出两张独立执行卡。
+
 ## 2026-07-09：CI 拒绝请求测试稳定性
 
 - 目标：修复 GitHub Actions Windows / Python 3.13 上 origin-policy 拒绝请求测试偶发 `ConnectionAbortedError` 的 CI 红灯。
@@ -193,3 +203,38 @@
 - 仍未实现：Skill 不会自动合并或替用户审批 PR；没有 Git remote 的本地目录只执行本地修改与验证，并明确跳过发布步骤。
 - 下一最小任务：重启 Codex 后，在下一次仓库修改任务中验证隐式触发、原子提交和草稿 PR 交付链路。
 - 用户用法：正常提出任何仓库修改需求即可；也可显式说“使用 `$ship-changes-via-draft-pr` 完成这次改动”。
+
+## 2026-07-11：自适应闭环 P0 安全与可追溯基础
+
+- 目标：保留已实现的闭环领域代码，同时把审计发现的安全门、目标来源、受限模式泄漏、反馈历史、规则作用域、迁移兼容和生成 provenance 问题纳入正式实现。
+- 改动文件：`mealcircuit/db.py`、`personalization.py`、`adaptive.py`、`service.py`、`ai.py`、`validation.py`、`configuration.py`、`storage.py`、测试与 `docs/adaptive-closed-loop-verification.md`。
+- 核心功能：引入带校验和的 v1/v2 迁移账本与升级前备份；新增独立营养目标版本及来源、方法、适用范围、确认与有效期；区分 standard、clinician-guided 与 halt-and-refer 安全资格；统一 context/generate/complete 安全门；受限模式使用不含建议字段的 fact-only Schema；执行回执修订写入追加事件；候选、规则、实验和反馈绑定档案、目标、策略、安全模式及 Policy；任务、复盘和 Agent run 保存 doctrine hash、Policy/Schema/Validator 版本、source manifest、context/result hash，且不保存 API Key。
+- 验证：`.\test.ps1` 58 项测试全部通过；`python -m compileall -q mealcircuit tests\test_adaptive.py tests\test_mealcircuit.py` 通过；`git diff --check` 通过。新增覆盖未初始化门禁、孕期无专业指导的受限行为、专业目标 provenance、fact-only 字段拒绝、反馈历史和 Agent run 审计。
+- 仍未实现：计划投影与硬约束编译、救场生成、完整 Web/CLI 闭环、数据导入导出、周期校准 UI、浏览器与无障碍验收尚未完成；本检查点不是交付终点。
+- 下一任务：建立 plan versions/items 投影和确定性约束编译器，将确认规则、库存、目标和安全模式真正约束下一份计划及救场结果。
+- 用户用法：现有记录入口保持可用；生成和提交现在要求先完成目标/安全初始化，clinician-guided 模式还要求已确认且仍有效的专业指导。
+
+## 2026-07-11：自适应闭环纵向工作台
+
+- 目标：把初始化、目标策略、事实记录、受约束计划、执行回执、救场、确定性学习、用户确认规则/实验、周期校准和数据迁移连成同一个可运行闭环，而不是互不相连的原型。
+- 改动文件：新增 `mealcircuit/planning.py` 与 `mealcircuit/portability.py`；扩展数据库迁移、个性化、安全策略、Agent run、服务、CLI、Web、样式、测试、README 和验收矩阵；保持 Python 标准库方案。
+- 核心功能：可恢复七步初始化创建带版本的档案、目标、策略和有来源/方法/适用范围/确认时间/有效期的营养目标；自定义目标保留用户原话；没有体重或数值目标时使用份量策略并保持数值未知。正式计划投影为不可变 plan/version/item，确认规则成为提交前硬约束；库存、低频问题和单变量实验进入同一上下文。
+- 学习闭环：计划回执使用当前投影加追加事件历史；重复支持与反例由确定性阈值生成候选，候选不会直接进入硬上下文；接受、拒绝、暂停、规则启停和 3–7 日单变量实验均绑定目标、档案、策略、安全模式和 Policy 版本。救场绑定原计划版本并通过同一约束编译器，完成后自动追加执行事件。
+- 安全与 provenance：统一 `require_generation()` 覆盖 Web、CLI、context、generate、complete、rescue 和 adaptation；clinician-guided / halt-and-refer 隐藏旧处方计划和已过期目标，仅保留记录及事实型照片/原材料 Schema。Source manifest 保存 doctrine hash、档案/目标/策略/目标值、规则/实验版本、Policy/Context/Result/Validator 版本和 Agent run ID；模型调用与外部 Agent JSON 提交都记录成功或失败 run，不保存 API Key。
+- 迁移与兼容：v1–v4 迁移带校验和、拒绝未来版本并在升级前备份；旧设置可在初始化中重新确认，初始化只限制生成，不移除记录入口或旧总览。首次直接启动 Web 会创建私人目录模板。可移植 ZIP 使用安全路径、SHA-256 清单、Schema/SQLite 完整性预览、全量恢复前 ZIP 备份、原子数据库/配置替换和精确媒体恢复。
+- Web/CLI：Web 主流程为“今天 / 计划 / 记录 / 洞察 / 学习确认 / 库存 / 目标与边界”，并提供初始化、回执修订、救场、指标、实验和备份恢复；CLI 覆盖 setup、plan、feedback、questions、learning/rules/experiments、inventory、evidence、rescue、metric、calibration、export/import。
+- 无障碍：表单错误使用 `role=alert`；移动抽屉设置 `aria-hidden`、背景 inert、焦点进入/返回与 Tab 循环；页面保持单一 h1、原生标签控件、键盘路径、减少动画和 320px 单列响应式布局。
+- 验证：领域专项 22 项通过；最近一次全量 67 项、`compileall`、`git diff --check` 和 `tools/release_check.py` 零命中。隔离数据库真实浏览器已完成七步初始化、实验提出/启动/完成、指标历史、正式计划救场及回执回写；320/720/1440 有效视口均无横向溢出，移动导航通过焦点进入/返回、Escape 与背景 inert 验证，页面保持单一 h1、控件标签完整且无控制台警告或错误。此前还验证了记录、问题、候选规则、数据页和受限模式无旧目标泄漏。
+- 仍未实现：无自动后台模型、账户、云同步、诊断、治疗建议或自动接受学习规则；这些是明确产品边界，不是本闭环缺口。
+- 下一任务：Draft PR #14 已创建并保持 Draft；等待 GitHub Actions 后由 reviewer 审阅，不自动合并或标记 Ready。
+- 用户用法：运行 `.\start.ps1` 后按 Web 初始化进入“今天”；先记录真实情况，打开正式计划执行并回执，重复阻力会出现在“学习确认”；“目标与边界 → 备份与迁移”可导出完整 ZIP。也可用 `python -m mealcircuit.agent_cli --help` 查看同等 CLI 流程。
+
+## 2026-07-12：CI 跨版本兼容修正
+
+- 目标：修复 Draft PR #14 在 GitHub Windows runner 暴露的 Python 3.11 语法、CLI 编码和 Windows 短路径兼容问题，不改变领域行为。
+- 改动文件：`mealcircuit/server.py`、`mealcircuit/agent_cli.py`、`tests/test_adaptive.py`。
+- 核心功能：把计划步骤、学习页和救场完成态中的 Python 3.12+ 嵌套 f-string 拆为兼容 3.11 的预计算片段；CLI 明确使用 UTF-8 标准输出；可移植包与初始化路径断言按文件身份/规范路径比较，兼容 runner 的 `RUNNER~1` 与长路径别名。
+- 验证：自适应专项 23 项通过；本机 Python 3.13 与临时非安装式 Python 3.11.9 均完成全量 67 项；两版 `compileall`、`git diff --check` 和 `tools/release_check.py` 通过。
+- 仍未实现：无新增产品缺口。
+- 下一任务：Draft PR #14 保持 Draft，等待 reviewer 审阅；不自动合并或标记 Ready。
+- 用户用法：无变化；CLI 在 Windows 重定向或子进程调用时也稳定输出 UTF-8 JSON。
