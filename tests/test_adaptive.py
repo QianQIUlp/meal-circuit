@@ -313,6 +313,24 @@ class AdaptiveDomainTest(unittest.TestCase):
         context = service.daily_review_context(review_date)
         self.assertEqual({}, context["meal_mode_resolution"]["overrides"])
 
+    def test_first_meal_override_answer_requeues_an_already_completed_review(self):
+        self._complete_standard_profile()
+        review_date = (date.today() - timedelta(days=1)).isoformat()
+        question = next(
+            item for item in adaptive.schedule_questions(review_date)
+            if item["question_key"] == "tomorrow_meal_modes"
+        )
+        with (
+            patch("mealcircuit.service.get_daily_review", return_value={"status": "completed"}),
+            patch("mealcircuit.adaptive._queue_changed_date") as requeue,
+        ):
+            adaptive.answer_question(
+                question["id"],
+                {"breakfast": "inherit", "lunch": "eat_out", "dinner": "inherit"},
+                question["version"],
+            )
+        requeue.assert_called_once_with(review_date, "明日逐餐准备方式已修订")
+
     def test_web_first_run_template_becomes_valid_after_onboarding(self):
         (self.home / "settings.json").unlink()
         initialized = initialize_private_home()

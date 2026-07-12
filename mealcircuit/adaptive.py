@@ -1052,7 +1052,14 @@ def answer_question(question_id: str, answer: object, expected_version: int, *, 
         )
         updated = conn.execute("SELECT * FROM question_events WHERE id=?", (question_id,)).fetchone()
     result = row_dict(updated)
-    if revising_meal_modes:
+    requeue_meal_modes = revising_meal_modes
+    if schema.get("kind") == "meal_mode_overrides" and not requeue_meal_modes:
+        from . import service
+        try:
+            requeue_meal_modes = service.get_daily_review(item["question_date"])["status"] == "completed"
+        except KeyError:
+            requeue_meal_modes = False
+    if requeue_meal_modes:
         _queue_changed_date(item["question_date"], "明日逐餐准备方式已修订")
     return result
 
