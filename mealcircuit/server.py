@@ -357,7 +357,8 @@ def render_learning_page() -> str:
         '''<form method="post" action="/learning/experiments"><label>只改变一个变量<input name="variable_key" required placeholder="例如：dinner_active_minutes"></label><label>具体动作<textarea name="action" required placeholder="例如：晚餐主动准备时间控制在 15 分钟"></textarea></label><label>怎样算有效<input name="success_signal" required placeholder="例如：连续 3 次完成且主观负担可接受"></label><button>提出可撤销实验</button></form>'''
         if experiment_policy["allowed"] else f'<p class="muted">{esc(experiment_policy["reason"])}</p>'
     )
-    return f'<section class="section-header"><div><p class="eyebrow">Deterministic learning</p><h1>由你确认，系统才学习</h1><p class="muted">候选、正式规则和实验均绑定当前目标、策略与安全模式。</p></div></section><div class="learning-grid"><div>{candidate_html}</div><section class="panel"><h2>正式规则</h2><ul class="rule-list">{rule_html}</ul></section></div><section class="section-header"><div><p class="eyebrow">One variable at a time</p><h2>可撤销实验</h2><p class="muted">同时最多一个待确认或进行中的实验；实验不会自动修改营养目标。</p></div></section><div class="learning-grid"><section class="panel"><h3>提出实验</h3>{propose_form}</section><div>{"".join(experiment_cards) or '<section class="panel"><p class="muted">暂无实验历史</p></section>'}</div></div>'
+    experiment_html = "".join(experiment_cards) or '<section class="panel"><p class="muted">暂无实验历史</p></section>'
+    return f'<section class="section-header"><div><p class="eyebrow">Deterministic learning</p><h1>由你确认，系统才学习</h1><p class="muted">候选、正式规则和实验均绑定当前目标、策略与安全模式。</p></div></section><div class="learning-grid"><div>{candidate_html}</div><section class="panel"><h2>正式规则</h2><ul class="rule-list">{rule_html}</ul></section></div><section class="section-header"><div><p class="eyebrow">One variable at a time</p><h2>可撤销实验</h2><p class="muted">同时最多一个待确认或进行中的实验；实验不会自动修改营养目标。</p></div></section><div class="learning-grid"><section class="panel"><h3>提出实验</h3>{propose_form}</section><div>{experiment_html}</div></div>'
 
 
 def render_inventory_page() -> str:
@@ -406,7 +407,11 @@ def render_rescue_page(rescue_id: str) -> str:
         steps = "".join(f'<li>{esc(item)}</li>' for item in result.get("steps") or [])
         replacements = "、".join(result.get("replacement_foods") or [])
         safety_notes = "".join(f'<li>{esc(item)}</li>' for item in result.get("safety_notes") or [])
-        return f'<section class="panel"><p class="eyebrow">Rescue completed</p><h1>当前这一步的救场方案</h1><p>{esc(result.get("reason") or "")}</p>{f"<p><strong>替代食材：</strong>{esc(replacements)}</p>" if replacements else ""}{f"<p><strong>份量变化：</strong>{esc(result.get('portion_change'))}</p>" if result.get('portion_change') else ""}<h2>现在这样做</h2><ol>{steps}</ol>{f"<h2>安全提示</h2><ul>{safety_notes}</ul>" if safety_notes else ""}<p class="muted">此结果已通过当前计划硬约束校验，并绑定原计划与来源清单。</p><a class="button" href="/plans/{esc(session["plan_date"])}">回到正式计划</a></section>'
+        replacements_html = f'<p><strong>替代食材：</strong>{esc(replacements)}</p>' if replacements else ""
+        portion_html = f'<p><strong>份量变化：</strong>{esc(result.get("portion_change"))}</p>' if result.get("portion_change") else ""
+        safety_html = f'<h2>安全提示</h2><ul>{safety_notes}</ul>' if safety_notes else ""
+        plan_url = f'/plans/{esc(session["plan_date"])}'
+        return f'<section class="panel"><p class="eyebrow">Rescue completed</p><h1>当前这一步的救场方案</h1><p>{esc(result.get("reason") or "")}</p>{replacements_html}{portion_html}<h2>现在这样做</h2><ol>{steps}</ol>{safety_html}<p class="muted">此结果已通过当前计划硬约束校验，并绑定原计划与来源清单。</p><a class="button" href="{plan_url}">回到正式计划</a></section>'
     policy = personalization.generation_policy("rescue")
     control = (
         f'<form method="post" action="/rescue/{esc(rescue_id)}/generate"><button>用当前模型生成救场方案</button></form>'
