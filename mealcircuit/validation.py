@@ -166,8 +166,19 @@ def validate_daily_review_result(value: Any, expected_settings: dict | None = No
         meals_by_name = {meal["name"]: meal for meal in meals}
         for key in MEAL_KEYS:
             name, expected_mode = MEAL_NAMES[key], meal_modes[key]
-            if meals_by_name[name].get("mode") != expected_mode:
+            meal = meals_by_name[name]
+            if meal.get("mode") != expected_mode:
                 raise ValidationError(f"{name}.mode 必须是 {expected_mode}")
+            if expected_mode != "home_cook" and meal.get("recipe_card") is not None:
+                raise ValidationError(f"{name}不是在家下厨时不得包含 recipe_card")
+            if expected_mode != "home_cook" and meal.get("rotation") is not None:
+                raise ValidationError(f"{name}不是在家下厨时不得包含 rotation")
+            if expected_mode == "eat_out":
+                guidance = _required_object(meal.get("eat_out_guidance"), f"{name}.eat_out_guidance")
+                for field in ("protein_anchor", "staple", "vegetables", "sauce_rule", "fallback"):
+                    _required_text(guidance.get(field), f"{name}.eat_out_guidance.{field}")
+            elif meal.get("eat_out_guidance") is not None:
+                raise ValidationError(f"{name}不是外食时不得包含 eat_out_guidance")
     if home_cooking.get("enabled"):
         _validate_home_cooking_menu(menu, meals, home_cooking, menu_date)
 

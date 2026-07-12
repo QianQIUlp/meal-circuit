@@ -399,6 +399,15 @@ def _daily_json_schema(nutrition: dict, home_cooking: bool, meal_modes: dict | N
             "protein_g": _range_schema(),
             "substitutions": _string_array(),
             "mode": {"type": "string", "enum": ["home_cook", "quick_assembly", "eat_out"]},
+            "eat_out_guidance": {
+                "type": "object", "additionalProperties": False,
+                "required": ["protein_anchor", "staple", "vegetables", "sauce_rule", "fallback"],
+                "properties": {
+                    "protein_anchor": {"type": "string"}, "staple": {"type": "string"},
+                    "vegetables": {"type": "string"}, "sauce_rule": {"type": "string"},
+                    "fallback": {"type": "string"},
+                },
+            },
         },
     }
     menu_properties = {

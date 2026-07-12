@@ -66,6 +66,18 @@ QUESTION_CATALOG = {
         "schema": {"kind": "choice", "options": ["home", "away", "mixed", "unknown"]},
         "cooldown_days": 1,
     },
+    "tomorrow_meal_modes": {
+        "category": "planning",
+        "prompt": "明天每一餐准备方式有变化吗？",
+        "reason": "明确到餐次的临时安排会覆盖长期默认，但只影响明天。",
+        "expected_impact": "早餐、午餐和晚餐的实际菜单形态",
+        "priority": 56,
+        "schema": {
+            "kind": "meal_mode_overrides",
+            "options": ["inherit", "home_cook", "quick_assembly", "eat_out"],
+        },
+        "cooldown_days": 1,
+    },
 }
 
 
@@ -953,6 +965,14 @@ def schedule_questions(question_date: str | None = None) -> list[dict]:
                             },
                         })
             proposals.extend({"key": key, "subject": {}, **value} for key, value in QUESTION_CATALOG.items())
+    with connect() as conn:
+        handled_keys = {
+            row["question_key"] for row in conn.execute(
+                "SELECT question_key FROM question_events WHERE question_date=? AND status IN ('answered','skipped')",
+                (target,),
+            ).fetchall()
+        }
+    proposals = [item for item in proposals if item["key"] not in handled_keys]
     proposals.sort(key=lambda item: (-item["priority"], item["key"]))
     feedback_proposals = [item for item in proposals if item["category"] == "feedback"]
     other_proposals = [item for item in proposals if item["category"] != "feedback"]
@@ -990,14 +1010,21 @@ def answer_question(question_id: str, answer: object, expected_version: int, *, 
         row = conn.execute("SELECT * FROM question_events WHERE id=?", (question_id,)).fetchone()
         if not row:
             raise KeyError(question_id)
-        if row["status"] != "pending" or row["version"] != expected_version:
-            raise ValidationError("问题状态已变化，请刷新后重试")
         item = row_dict(row)
-    if not skip:
         schema = item.get("question_schema_json") or {}
+        revising_meal_modes = row["status"] == "answered" and schema.get("kind") == "meal_mode_overrides"
+        if (row["status"] != "pending" and not revising_meal_modes) or row["version"] != expected_version:
+            raise ValidationError("问题状态已变化，请刷新后重试")
+    if not skip:
         if schema.get("kind") == "choice":
             if not isinstance(answer, str) or answer not in schema.get("options", []):
                 raise ValidationError("问题答案不在允许选项中")
+        elif schema.get("kind") == "meal_mode_overrides":
+            if not isinstance(answer, dict) or set(answer) != {"breakfast", "lunch", "dinner"}:
+                raise ValidationError("必须分别提交早餐、午餐和晚餐的临时准备方式")
+            allowed = set(schema.get("options") or [])
+            if any(answer[key] not in allowed for key in ("breakfast", "lunch", "dinner")):
+                raise ValidationError("逐餐准备方式包含无效值")
         elif schema.get("kind") == "plan_feedback":
             if not isinstance(answer, dict):
                 raise ValidationError("计划回执答案必须是对象")
@@ -1024,7 +1051,10 @@ def answer_question(question_id: str, answer: object, expected_version: int, *, 
             (status, answer_json, timestamp, question_id, expected_version),
         )
         updated = conn.execute("SELECT * FROM question_events WHERE id=?", (question_id,)).fetchone()
-    return row_dict(updated)
+    result = row_dict(updated)
+    if revising_meal_modes:
+        _queue_changed_date(item["question_date"], "明日逐餐准备方式已修订")
+    return result
 
 
 def question_events_for_date(question_date: str, *, include_pending: bool = True) -> list[dict]:

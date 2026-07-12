@@ -10,6 +10,7 @@ import unittest
 from contextlib import closing
 from datetime import date, timedelta
 from pathlib import Path
+from unittest.mock import patch
 
 from mealcircuit import adaptive, personalization, portability, service
 from mealcircuit.configuration import initialize_private_home, load_resolved_settings
@@ -244,6 +245,73 @@ class AdaptiveDomainTest(unittest.TestCase):
 
         revision = personalization.start_onboarding()
         self.assertEqual(modes, revision["answers_json"]["constraints"]["meal_modes"])
+
+    def test_single_day_meal_modes_override_personal_defaults_without_changing_strategy(self):
+        defaults = {"breakfast": "quick_assembly", "lunch": "home_cook", "dinner": "home_cook"}
+        session = self._fill_session(constraint_overrides={"meal_modes": defaults})
+        personalization.complete_onboarding(
+            session["id"], session["version"],
+            {"accept_profile": True, "accept_strategy": True, "planning_mode": "portion_guided"},
+        )
+        review_date = (date.today() - timedelta(days=1)).isoformat()
+        questions = adaptive.schedule_questions(review_date)
+        meal_question = next(item for item in questions if item["question_key"] == "tomorrow_meal_modes")
+        adaptive.answer_question(
+            meal_question["id"],
+            {"breakfast": "inherit", "lunch": "eat_out", "dinner": "inherit"},
+            meal_question["version"],
+        )
+
+        service.add_daily_record(review_date, "明天午餐外食，晚餐自己做。")
+        context = service.daily_review_context(review_date)
+        self.assertEqual(
+            {"breakfast": "quick_assembly", "lunch": "eat_out", "dinner": "home_cook"},
+            context["meal_mode_resolution"]["effective_meal_modes"],
+        )
+        self.assertEqual({"lunch": "eat_out"}, context["meal_mode_resolution"]["overrides"])
+        self.assertEqual(date.today().isoformat(), context["meal_mode_resolution"]["target_date"])
+        schema_meals = {item["name"]: item for item in context["result_schema"]["tomorrow_menu"]["meals"]}
+        self.assertEqual("eat_out", schema_meals["午餐"]["mode"])
+        self.assertIn("eat_out_guidance", schema_meals["午餐"])
+        self.assertNotIn("recipe_card", schema_meals["午餐"])
+        self.assertIn("recipe_card", schema_meals["晚餐"])
+        self.assertEqual(defaults, personalization.active_personalization()["strategy"]["strategy_json"]["meal_modes"])
+
+        answered = adaptive.get_question_event(meal_question["id"])
+        with patch("mealcircuit.adaptive._queue_changed_date") as requeue:
+            revised = adaptive.answer_question(
+                answered["id"],
+                {"breakfast": "inherit", "lunch": "home_cook", "dinner": "inherit"},
+                answered["version"],
+            )
+        self.assertEqual("home_cook", revised["answer_json"]["lunch"])
+        self.assertEqual(answered["version"] + 1, revised["version"])
+        requeue.assert_called_once_with(review_date, "明日逐餐准备方式已修订")
+        self.assertEqual(defaults, personalization.active_personalization()["strategy"]["strategy_json"]["meal_modes"])
+
+        service.add_daily_record(date.today().isoformat(), "下一天没有逐餐临时覆盖。")
+        next_context = service.daily_review_context(date.today().isoformat())
+        self.assertEqual(defaults, next_context["meal_mode_resolution"]["effective_meal_modes"])
+
+    def test_legacy_mixed_environment_answer_does_not_guess_meal_overrides(self):
+        self._complete_standard_profile()
+        review_date = (date.today() - timedelta(days=1)).isoformat()
+        questions = adaptive.schedule_questions(review_date)
+        for item in questions:
+            if item["question_key"] == "tomorrow_training":
+                adaptive.answer_question(item["id"], "unknown", item["version"])
+            elif item["question_key"] == "tomorrow_meal_modes":
+                adaptive.answer_question(
+                    item["id"],
+                    {"breakfast": "inherit", "lunch": "inherit", "dinner": "inherit"},
+                    item["version"],
+                )
+        questions = adaptive.schedule_questions(review_date)
+        environment = next(item for item in questions if item["question_key"] == "tomorrow_environment")
+        adaptive.answer_question(environment["id"], "mixed", environment["version"])
+        service.add_daily_record(review_date, "明天用餐地点混合，但没有说明具体餐次。")
+        context = service.daily_review_context(review_date)
+        self.assertEqual({}, context["meal_mode_resolution"]["overrides"])
 
     def test_web_first_run_template_becomes_valid_after_onboarding(self):
         (self.home / "settings.json").unlink()

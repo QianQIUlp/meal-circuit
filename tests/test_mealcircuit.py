@@ -23,7 +23,7 @@ from mealcircuit.db import init_db
 from mealcircuit.migration import apply_migration, migration_preview
 from mealcircuit.server import Handler, ThreadingHTTPServer, origin_matches_host, parse_host_endpoint
 from mealcircuit.storage import db_path, resolve_data_path, upload_root
-from mealcircuit.validation import ValidationError
+from mealcircuit.validation import ValidationError, validate_daily_review_result
 from tools.release_check import scan as release_scan
 
 
@@ -173,6 +173,13 @@ def home_cooking_review_result(review_date: str, dish_key="tomato_chicken", flav
     meals = result["tomorrow_menu"]["meals"]
     meals[0]["mode"] = "quick_assembly"
     meals[1]["mode"] = "eat_out"
+    meals[1]["eat_out_guidance"] = {
+        "protein_anchor": "选择可见的瘦肉、鱼虾、鸡蛋或豆制品",
+        "staple": "保留约1拳主食",
+        "vegetables": "至少1–2拳蔬菜",
+        "sauce_rule": "酱汁分开，不喝油汤",
+        "fallback": "蛋白明显不足时再用一份便捷蛋白补位",
+    }
     meals[2]["mode"] = "home_cook"
     meals[2]["recipe_card"] = {
         "title": "番茄小米椒鸡肉",
@@ -232,6 +239,7 @@ def lunch_dinner_home_cooking_result(review_date: str) -> dict:
     dinner = next(meal for meal in menu["meals"] if meal["name"] == "晚餐")
     dinner["rotation"] = menu.pop("rotation")
     lunch["mode"] = "home_cook"
+    lunch.pop("eat_out_guidance", None)
     lunch["foods"] = ["番茄鸡蛋", "米饭", "蔬菜"]
     lunch["recipe_card"] = copy.deepcopy(dinner["recipe_card"])
     lunch["recipe_card"].update({
@@ -253,6 +261,26 @@ def lunch_dinner_home_cooking_result(review_date: str) -> dict:
         "primary_vegetable": "tomato",
         "flavor_profile": "tomato_savory",
         "technique": "stir_fry",
+    }
+    return result
+
+
+def lunch_eat_out_dinner_home_result(review_date: str) -> dict:
+    result = lunch_dinner_home_cooking_result(review_date)
+    menu = result["tomorrow_menu"]
+    menu["environment"] = "早餐快速组装、午餐外食、晚餐独居下厨"
+    lunch = next(meal for meal in menu["meals"] if meal["name"] == "午餐")
+    lunch["mode"] = "eat_out"
+    lunch.pop("recipe_card", None)
+    lunch.pop("rotation", None)
+    lunch["foods"] = ["外食选择一份可见主蛋白", "正常份主食", "至少一份蔬菜"]
+    lunch["portion_guidance"] = "1–1.5掌蛋白、1拳主食、1–2拳蔬菜；酱汁分开。"
+    lunch["eat_out_guidance"] = {
+        "protein_anchor": "瘦肉、鱼虾、鸡蛋或豆制品",
+        "staple": "约1拳米饭或等量主食",
+        "vegetables": "至少1–2拳",
+        "sauce_rule": "酱汁分开，不喝油汤",
+        "fallback": "蛋白明显不足时再使用1包即食鸡胸",
     }
     return result
 
@@ -816,6 +844,7 @@ class MealCircuitTest(unittest.TestCase):
 
         missing_lunch_card = home_cooking_review_result(today)
         missing_lunch_card["tomorrow_menu"]["meals"][1]["mode"] = "home_cook"
+        missing_lunch_card["tomorrow_menu"]["meals"][1].pop("eat_out_guidance", None)
         with self.assertRaisesRegex(ValidationError, "午餐.recipe_card"):
             service.complete_daily_review(today, missing_lunch_card)
 
@@ -837,6 +866,33 @@ class MealCircuitTest(unittest.TestCase):
         recent = {(item["meal_name"], item["rotation"]["dish_key"]) for item in next_context["recent_home_meals"]}
         self.assertIn(("午餐", "tomato_egg_lunch"), recent)
         self.assertIn(("晚餐", "tomato_chicken"), recent)
+
+    def test_eat_out_override_requires_guidance_and_forbids_home_recipe(self):
+        settings = {
+            **TEST_SETTINGS,
+            "meal_environment": "早餐快速组装、午餐外食、晚餐独居下厨",
+            "meal_modes": {"breakfast": "quick_assembly", "lunch": "eat_out", "dinner": "home_cook"},
+            "home_cooking": {
+                **HOME_COOKING_LUNCH_DINNER,
+                "meal_scope": "custom",
+                "meal_modes": {"breakfast": "quick_assembly", "lunch": "eat_out", "dinner": "home_cook"},
+            },
+        }
+        review_date = date.today().isoformat()
+        result = lunch_eat_out_dinner_home_result(review_date)
+        self.assertIs(result, validate_daily_review_result(result, settings))
+
+        missing_guidance = copy.deepcopy(result)
+        missing_guidance["tomorrow_menu"]["meals"][1].pop("eat_out_guidance")
+        with self.assertRaisesRegex(ValidationError, "午餐.eat_out_guidance"):
+            validate_daily_review_result(missing_guidance, settings)
+
+        leaked_recipe = copy.deepcopy(result)
+        leaked_recipe["tomorrow_menu"]["meals"][1]["recipe_card"] = copy.deepcopy(
+            leaked_recipe["tomorrow_menu"]["meals"][2]["recipe_card"]
+        )
+        with self.assertRaisesRegex(ValidationError, "不得包含 recipe_card"):
+            validate_daily_review_result(leaked_recipe, settings)
 
     def test_home_cooking_history_rotation_and_repeat_reason(self):
         settings_path = Path(self.temp.name) / "settings.json"
@@ -1461,6 +1517,35 @@ class WebAppTest(unittest.TestCase):
             self.assertIn(label, decoded)
         self.assertIn("番茄&lt;script&gt;鸡肉&lt;/script&gt;", decoded)
         self.assertNotIn("番茄<script>鸡肉</script>", decoded)
+
+    def test_review_and_plan_pages_show_effective_lunch_eat_out(self):
+        modes = {"breakfast": "quick_assembly", "lunch": "eat_out", "dinner": "home_cook"}
+        settings_path = Path(self.temp.name) / "settings.json"
+        settings_path.write_text(json.dumps({
+            **TEST_SETTINGS,
+            "meal_environment": "早餐快速组装、午餐外食、晚餐独居下厨",
+            "home_cooking": {**HOME_COOKING_LUNCH_DINNER, "meal_scope": "custom", "meal_modes": modes},
+        }, ensure_ascii=False), encoding="utf-8")
+        review_date = date.today().isoformat()
+        service.add_daily_record(review_date, "明天午餐外食，晚餐自己做")
+        service.complete_daily_review(review_date, lunch_eat_out_dinner_home_result(review_date))
+
+        status, _, review_body = self.request("GET", f"/reviews/{review_date}")
+        review_html = review_body.decode("utf-8")
+        self.assertEqual(200, status)
+        self.assertIn("午餐</span><span class=\"meal-time\">食堂 / 外食", review_html)
+        self.assertIn("外食提醒", review_html)
+        self.assertIn("酱汁分开，不喝油汤", review_html)
+        self.assertNotIn("BEGINNER LUNCH", review_html)
+        self.assertIn("BEGINNER DINNER", review_html)
+
+        plan_date = (date.today() + timedelta(days=1)).isoformat()
+        status, _, plan_body = self.request("GET", f"/plans/{plan_date}")
+        plan_html = plan_body.decode("utf-8")
+        self.assertEqual(200, status)
+        self.assertIn("方式：</strong>食堂 / 外食", plan_html)
+        self.assertIn("外食选择", plan_html)
+        self.assertIn("酱汁分开，不喝油汤", plan_html)
 
     def test_checkin_web_question_flow_settings_and_origin(self):
         today = date.today().isoformat()
