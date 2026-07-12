@@ -13,12 +13,12 @@ This file tracks the approved end-to-end delivery against concrete code and veri
 | Constrained planning and rescue | implemented | immutable plan projections, Result v2 hard-constraint compiler, scoped rescue provenance | invalid-plan and rescue feedback tests pass |
 | Inventory and carry-over | implemented | inventory events in context, planning, rescue, Web/CLI and portable bundle | round-trip tests pass |
 | Context / Result v2 and agent-run audit | implemented | doctrine hash; profile/goal/strategy/target; versioned rule/experiment; policy/schema/validator/run IDs | generated and external-agent run tests pass |
-| Web closed-loop journey | implemented; final browser rerun pending | `/setup`, `/`, `/capture`, `/plans`, `/questions`, `/learning`, `/inventory`, `/profile`, `/insights`, `/data`, `/rescue` | HTTP integration plus core real-browser flow passed; late experiment/metric UI needs final rerun |
+| Web closed-loop journey | verified | `/setup`, `/`, `/capture`, `/plans`, `/questions`, `/learning`, `/inventory`, `/profile`, `/insights`, `/data`, `/rescue` | HTTP integration and isolated real-browser flow passed, including experiment lifecycle, metric history, completed rescue and feedback write-back |
 | CLI closed-loop journey | implemented | setup/plan/feedback/questions/learning/inventory/evidence/rescue/metric/calibration/export/import | CLI integration passes |
 | Data portability and recovery | implemented | SHA manifest, integrity/schema preview, pre-restore backup, atomic DB replacement, Web/CLI | round trip passes |
 | Backward compatibility | implemented | prefill active/legacy settings; setup only gates generation; legacy overview remains reachable | legacy suite passes |
-| Accessibility | implemented; final browser rerun pending | semantic forms/errors, keyboard focus trap/inert drawer, responsive grids, reduced motion | automated markup and 320/720/1440 effective-viewport checks pass; final late-surface QA pending |
-| Full verification and draft PR | in progress | latest full suite: 67 tests; release/compile/diff checks passed | final browser rerun; Web commit, push, draft PR |
+| Accessibility | verified | semantic forms/errors, keyboard focus trap/inert drawer, responsive grids, reduced motion | automated markup and real-browser 320/720/1440 effective-viewport checks pass with one h1, zero unlabeled controls, no horizontal overflow and no console warnings/errors |
+| Full verification and draft PR | in progress | latest full suite: 67 tests; release/compile/diff checks passed; final browser rerun passed | rerun all local gates, push and create draft PR |
 
 ## Classification decision
 
