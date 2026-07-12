@@ -1,0 +1,262 @@
+name: release-builds
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+env:
+  VERSION: 0.3.0
+  APPIMAGETOOL_X86_64_SHA256: a6d71e2b6cd66f8e8d16c37ad164658985e0cf5fcaa950c90a482890cb9d13e0
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    env:
+      WINDOWS_SIGNING_AVAILABLE: ${{ secrets.WINDOWS_CERTIFICATE_BASE64 != '' }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Require Authenticode secrets for tagged releases
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE_BASE64: ${{ secrets.WINDOWS_CERTIFICATE_BASE64 }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          if (-not $env:WINDOWS_CERTIFICATE_BASE64 -or -not $env:WINDOWS_CERTIFICATE_PASSWORD) {
+            throw "Tagged releases require Windows Authenticode secrets"
+          }
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.8.22"
+          enable-cache: true
+      - run: uv sync --locked --extra desktop --no-dev
+      - run: .\.venv\Scripts\pyinstaller.exe --noconfirm --clean packaging/mealcircuit.spec
+      - name: Smoke test packaged executable
+        shell: pwsh
+        run: |
+          $env:MEALCIRCUIT_HOME = Join-Path $env:RUNNER_TEMP "desktop-smoke"
+          & .\dist\MealCircuit\MealCircuit.exe --smoke-test
+      - name: Authenticode sign packaged executable when configured
+        if: env.WINDOWS_SIGNING_AVAILABLE == 'true'
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE_BASE64: ${{ secrets.WINDOWS_CERTIFICATE_BASE64 }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          [IO.File]::WriteAllBytes("$env:RUNNER_TEMP\signing.pfx", [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE_BASE64))
+          $signtool = (Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Filter signtool.exe -Recurse | Sort-Object FullName -Descending | Select-Object -First 1).FullName
+          & $signtool sign /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 /f "$env:RUNNER_TEMP\signing.pfx" /p $env:WINDOWS_CERTIFICATE_PASSWORD ".\dist\MealCircuit\MealCircuit.exe"
+      - name: Build portable ZIP
+        shell: pwsh
+        run: Compress-Archive -Path .\dist\MealCircuit -DestinationPath ".\dist\MealCircuit-$env:VERSION-windows-x64-portable.zip"
+      - name: Build installer
+        shell: pwsh
+        run: |
+          choco install innosetup --no-progress -y
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" "/DMyAppVersion=$env:VERSION" "/DSourceDir=$pwd\dist\MealCircuit" "/DOutputDir=$pwd\dist" packaging\windows\MealCircuit.iss
+      - name: Authenticode sign installer when certificate secrets are available
+        if: env.WINDOWS_SIGNING_AVAILABLE == 'true'
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE_BASE64: ${{ secrets.WINDOWS_CERTIFICATE_BASE64 }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          $signtool = (Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Filter signtool.exe -Recurse | Sort-Object FullName -Descending | Select-Object -First 1).FullName
+          & $signtool sign /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 /f "$env:RUNNER_TEMP\signing.pfx" /p $env:WINDOWS_CERTIFICATE_PASSWORD ".\dist\MealCircuit-$env:VERSION-windows-x64-setup.exe"
+          if ((Get-AuthenticodeSignature ".\dist\MealCircuit\MealCircuit.exe").Status -ne "Valid") { throw "Executable signature invalid" }
+          if ((Get-AuthenticodeSignature ".\dist\MealCircuit-$env:VERSION-windows-x64-setup.exe").Status -ne "Valid") { throw "Installer signature invalid" }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: desktop-windows
+          path: |
+            dist/MealCircuit-*-windows-x64-portable.zip
+            dist/MealCircuit-*-windows-x64-setup.exe
+
+  macos-universal:
+    runs-on: macos-14
+    env:
+      APPLE_SIGNING_AVAILABLE: ${{ secrets.APPLE_CERTIFICATE_BASE64 != '' }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Require Apple signing secrets for tagged releases
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          test -n "$APPLE_CERTIFICATE_BASE64" && test -n "$APPLE_CERTIFICATE_PASSWORD"
+          test -n "$APPLE_SIGNING_IDENTITY" && test -n "$APPLE_ID"
+          test -n "$APPLE_APP_PASSWORD" && test -n "$APPLE_TEAM_ID"
+      - name: Install python.org universal2 Python
+        run: |
+          curl --fail --location --retry 5 -o "$RUNNER_TEMP/python.pkg" https://www.python.org/ftp/python/3.13.5/python-3.13.5-macos11.pkg
+          pkgutil --check-signature "$RUNNER_TEMP/python.pkg" | grep -q "Python Software Foundation"
+          sudo installer -pkg "$RUNNER_TEMP/python.pkg" -target /
+          /Library/Frameworks/Python.framework/Versions/3.13/bin/python3 -c "import platform; print(platform.platform())"
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.8.22"
+          enable-cache: true
+      - name: Install locked dependencies
+        run: |
+          PY=/Library/Frameworks/Python.framework/Versions/3.13/bin/python3
+          uv sync --locked --extra desktop --no-dev --python "$PY"
+      - name: Build universal2 app
+        env:
+          MEALCIRCUIT_TARGET_ARCH: universal2
+        run: .venv/bin/pyinstaller --noconfirm --clean packaging/mealcircuit.spec
+      - name: Verify slices and smoke test
+        run: |
+          file dist/MealCircuit.app/Contents/MacOS/MealCircuit | tee "$RUNNER_TEMP/file.txt"
+          grep -q x86_64 "$RUNNER_TEMP/file.txt"
+          grep -q arm64 "$RUNNER_TEMP/file.txt"
+          MEALCIRCUIT_HOME="$RUNNER_TEMP/desktop-smoke" dist/MealCircuit.app/Contents/MacOS/MealCircuit --smoke-test
+      - name: Codesign and notarize when Apple secrets are available
+        if: env.APPLE_SIGNING_AVAILABLE == 'true'
+        env:
+          APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          echo "$APPLE_CERTIFICATE_BASE64" | base64 --decode > "$RUNNER_TEMP/signing.p12"
+          security create-keychain -p temporary "$RUNNER_TEMP/build.keychain"
+          security import "$RUNNER_TEMP/signing.p12" -k "$RUNNER_TEMP/build.keychain" -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k temporary "$RUNNER_TEMP/build.keychain"
+          security list-keychains -d user -s "$RUNNER_TEMP/build.keychain"
+          codesign --deep --force --options runtime --timestamp --sign "$APPLE_SIGNING_IDENTITY" dist/MealCircuit.app
+          codesign --verify --deep --strict --verbose=2 dist/MealCircuit.app
+      - name: Create DMG
+        run: hdiutil create -volname MealCircuit -srcfolder dist/MealCircuit.app -ov -format UDZO "dist/MealCircuit-$VERSION-macos-universal.dmg"
+      - name: Submit DMG for notarization
+        if: env.APPLE_SIGNING_AVAILABLE == 'true'
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          xcrun notarytool submit "dist/MealCircuit-$VERSION-macos-universal.dmg" --apple-id "$APPLE_ID" --password "$APPLE_APP_PASSWORD" --team-id "$APPLE_TEAM_ID" --wait
+          xcrun stapler staple "dist/MealCircuit-$VERSION-macos-universal.dmg"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: desktop-macos
+          path: dist/MealCircuit-*-macos-universal.dmg
+
+  linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.8.22"
+          enable-cache: true
+      - run: uv sync --locked --extra desktop --no-dev
+      - run: .venv/bin/pyinstaller --noconfirm --clean packaging/mealcircuit.spec
+      - run: MEALCIRCUIT_HOME="$RUNNER_TEMP/desktop-smoke" dist/MealCircuit/MealCircuit --smoke-test
+      - name: Build AppImage
+        run: |
+          APPDIR="$RUNNER_TEMP/MealCircuit.AppDir"
+          mkdir -p "$APPDIR/usr/bin" "$APPDIR/usr/share/applications" "$APPDIR/usr/share/icons/hicolor/scalable/apps"
+          cp -a dist/MealCircuit "$APPDIR/usr/bin/MealCircuit"
+          install -m 755 packaging/linux/AppRun "$APPDIR/AppRun"
+          install -m 644 packaging/linux/MealCircuit.desktop "$APPDIR/MealCircuit.desktop"
+          install -m 644 packaging/linux/MealCircuit.desktop "$APPDIR/usr/share/applications/MealCircuit.desktop"
+          install -m 644 mealcircuit/static/favicon.svg "$APPDIR/mealcircuit.svg"
+          install -m 644 mealcircuit/static/favicon.svg "$APPDIR/usr/share/icons/hicolor/scalable/apps/mealcircuit.svg"
+          curl --fail --location --retry 5 -o "$RUNNER_TEMP/appimagetool" https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          echo "$APPIMAGETOOL_X86_64_SHA256  $RUNNER_TEMP/appimagetool" | sha256sum --check --strict
+          chmod +x "$RUNNER_TEMP/appimagetool"
+          ARCH=x86_64 "$RUNNER_TEMP/appimagetool" --appimage-extract-and-run "$APPDIR" "dist/MealCircuit-$VERSION-linux-x86_64.AppImage"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: desktop-linux
+          path: dist/MealCircuit-*-linux-x86_64.AppImage
+
+  android:
+    runs-on: ubuntu-latest
+    env:
+      ANDROID_SIGNING_AVAILABLE: ${{ secrets.ANDROID_KEYSTORE_BASE64 != '' }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Require Android signing secrets for tagged releases
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          test -n "$ANDROID_KEYSTORE_BASE64" && test -n "$ANDROID_KEYSTORE_PASSWORD"
+          test -n "$ANDROID_KEY_ALIAS" && test -n "$ANDROID_KEY_PASSWORD"
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+      - uses: android-actions/setup-android@v3
+      - run: sdkmanager "platforms;android-36" "build-tools;36.0.0"
+      - name: Restore release keystore when configured
+        if: env.ANDROID_SIGNING_AVAILABLE == 'true'
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: echo "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/mealcircuit.jks"
+      - name: Build APK and AAB
+        working-directory: android
+        env:
+          MEALCIRCUIT_KEYSTORE_PATH: ${{ runner.temp }}/mealcircuit.jks
+          MEALCIRCUIT_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          MEALCIRCUIT_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          MEALCIRCUIT_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: ./gradlew --no-daemon testDebugUnitTest lintRelease assembleRelease bundleRelease
+      - name: Verify Android signatures when configured
+        if: env.ANDROID_SIGNING_AVAILABLE == 'true'
+        run: |
+          "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --verbose android/app/build/outputs/apk/release/app-release.apk
+          jarsigner -verify -strict android/app/build/outputs/bundle/release/app-release.aab
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-release
+          path: |
+            android/app/build/outputs/apk/release/*.apk
+            android/app/build/outputs/bundle/release/*.aab
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [windows, macos-universal, linux, android]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+      - uses: anchore/sbom-action@v0
+        with:
+          path: release-assets
+          format: cyclonedx-json
+          output-file: release-assets/MealCircuit-${{ github.ref_name }}.cdx.json
+          artifact-name: release-sbom
+      - name: Generate checksums
+        run: cd release-assets && find . -maxdepth 1 -type f ! -name SHA256SUMS.txt -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS.txt
+      - uses: softprops/action-gh-release@v2
+        with:
+          body_path: docs/releases/v0.3.0.md
+          files: release-assets/*

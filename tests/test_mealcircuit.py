@@ -996,10 +996,12 @@ class WebAppTest(unittest.TestCase):
         raise AssertionError("unreachable")
 
     def test_pages_and_material_form(self):
-        for path in ("/", "/daily", "/history", "/tasks/photo", "/tasks/material", "/tasks", "/ai", "/foods", "/overview"):
+        for path in ("/", "/daily", "/history", "/tasks/photo", "/tasks/material", "/tasks", "/ai", "/sync", "/foods", "/overview"):
             status, _, body = self.request("GET", path)
             self.assertEqual(status, 200)
             self.assertIn(b"MealCircuit", body)
+            if path == "/sync":
+                self.assertIn("同步服务 URL", body.decode("utf-8"))
         status, home_headers, home = self.request("GET", "/")
         decoded_home = home.decode("utf-8")
         for label in ("今日结论", "今日状态", "明日计划", "处理队列", "照片任务", "原材料"):

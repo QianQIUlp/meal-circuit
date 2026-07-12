@@ -1,0 +1,9 @@
+{
+  "recovery_key": "MC1-AAAQ-EAYE-AUDA-OCAJ-BIFQ-YDIO-B4IB-CEQT-CQKR-MFYY-DENB-WHA5-DYPQ-630DCD29",
+  "entity_id": "food_019f4a15-5fd1-7582-ae7e-5d45b235d388",
+  "revision_id": "rev_119f4a15-5fd1-7582-ae7e-5d45b235d389",
+  "plain_sha256": "441ec0b03b54a3508b442b1d26ce309d755a577a08101085b534ea53cd58c820",
+  "encrypted_sha256": "56df2be316fbd974339c977ccc71afeabb4636d068b6fc757476aeec52a4c155",
+  "salt_hex": "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f",
+  "nonce_hex": "000102030405060708090a0b"
+}

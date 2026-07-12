@@ -1,14 +1,30 @@
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
 import sys
 from pathlib import Path
 
-from . import adaptive, personalization, portability, service
+from . import adaptive, ai, personalization, portability, service
 from .configuration import configuration_status, initialize_private_home
 from .db import init_db
 from .migration import apply_migration, migration_preview
+from .portable import ENCRYPTED_MAGIC, apply_import, export_data, preview_import
+from .sync import (
+    abort_account_key_rotation,
+    delete_sync_account,
+    bootstrap_sync,
+    list_conflicts,
+    login_sync,
+    register_sync,
+    rotate_account_key,
+    resolve_conflict,
+    set_media_policy,
+    sync_now,
+    sync_status,
+    unlink_sync,
+)
 from .validation import ValidationError
 
 
@@ -54,6 +70,54 @@ def build_parser() -> argparse.ArgumentParser:
     migration = sub.add_parser("migrate-data", help="从旧 DietOS 工程安全迁移私人数据")
     migration.add_argument("--from-repo", required=True)
     migration.add_argument("--apply", action="store_true", help="实际复制；默认只预览")
+    export_parser = sub.add_parser("export-data", help="导出 Portable Data v1；默认端到端加密")
+    export_parser.add_argument("--output", "-o", required=True)
+    export_parser.add_argument("--plain", action="store_true", help="导出明文 ZIP（包含敏感健康数据）")
+    export_parser.add_argument(
+        "--i-understand-plaintext-risk",
+        action="store_true",
+        help="确认明文包会暴露私人健康数据；仅与 --plain 同时使用",
+    )
+    import_parser = sub.add_parser("import-data", help="预览或导入 Portable Data v1")
+    import_parser.add_argument("archive")
+    import_parser.add_argument("--mode", choices=["restore", "merge"], default="restore")
+    import_action = import_parser.add_mutually_exclusive_group()
+    import_action.add_argument("--preview", action="store_true", help="只验证并展示变更（默认）")
+    import_action.add_argument("--apply", action="store_true", help="确认后实际导入")
+    sync_configure = sub.add_parser("sync-configure", help="交互式注册或登录可配置同步服务")
+    sync_configure.add_argument("--server-url", required=True)
+    sync_configure.add_argument("--login-name", required=True)
+    sync_configure.add_argument("--device-name", required=True)
+    sync_configure.add_argument("--register", action="store_true", help="创建新账户；默认登录已有账户")
+    sync_configure.add_argument(
+        "--bootstrap",
+        action="store_true",
+        help="首次激活由服务管理员预建的空账户",
+    )
+    sync_configure.add_argument(
+        "--allow-insecure-localhost",
+        action="store_true",
+        help="仅本机调试允许 http://localhost",
+    )
+    sub.add_parser("sync-status", help="显示本机同步状态，不显示密钥或令牌")
+    sync_now_parser = sub.add_parser("sync-now", help="立即执行一次加密 push / pull / ack")
+    sync_now_parser.add_argument(
+        "--include-on-demand-media", action="store_true",
+        help="照片策略为按需时，本次同时下载缺失照片",
+    )
+    media_policy = sub.add_parser("sync-media-policy", help="设置照片同步策略")
+    media_policy.add_argument("policy", choices=["all", "all_wifi", "on_demand"])
+    conflicts = sub.add_parser("sync-conflicts", help="列出或解决同步冲突")
+    conflicts.add_argument("--resolve")
+    conflicts.add_argument("--choice", choices=["local", "remote"])
+    sub.add_parser("sync-unlink", help="取消本机同步关联，保留全部本地数据")
+    sub.add_parser("sync-rotate-key", help="重新加密全部远端数据并撤销其他设备")
+    sub.add_parser("sync-rotate-abort", help="中止本设备未完成的密钥轮换")
+    sub.add_parser("sync-delete-account", help="永久删除远端同步账户；本地数据保留")
+    ai_secure = sub.add_parser("ai-configure-secure", help="交互式保存本设备模型配置和 API Key")
+    ai_secure.add_argument("--provider", choices=["openai", "anthropic", "deepseek"], required=True)
+    ai_secure.add_argument("--model", required=True)
+    sub.add_parser("ai-clear-secure", help="清除系统安全存储中的模型配置和 API Key")
     listing = sub.add_parser("list", help="列出任务")
     listing.add_argument("--status", choices=["pending", "completed"])
     sub.add_parser("pending", help="统一列出照片、原材料和每日复盘待办")
@@ -225,6 +289,111 @@ def main() -> None:
             return
         if args.command == "migrate-data":
             emit(apply_migration(args.from_repo) if args.apply else migration_preview(args.from_repo))
+            return
+        if args.command == "export-data":
+            if args.plain and not args.i_understand_plaintext_risk:
+                raise ValidationError("明文导出必须同时传入 --i-understand-plaintext-risk")
+            if args.i_understand_plaintext_risk and not args.plain:
+                raise ValidationError("--i-understand-plaintext-risk 只能与 --plain 同时使用")
+            emit(export_data(args.output, encrypted=not args.plain))
+            return
+        if args.command == "import-data":
+            archive = Path(args.archive).expanduser().resolve()
+            recovery_key = None
+            if archive.is_file():
+                with archive.open("rb") as stream:
+                    if stream.read(len(ENCRYPTED_MAGIC)) == ENCRYPTED_MAGIC:
+                        recovery_key = getpass.getpass("Portable Data 恢复密钥：")
+            action = apply_import if args.apply else preview_import
+            emit(action(archive, recovery_key=recovery_key, mode=args.mode))
+            return
+        if args.command == "sync-configure":
+            if args.register and args.bootstrap:
+                raise ValidationError("--register 与 --bootstrap 不能同时使用")
+            password = getpass.getpass("同步账户密码：")
+            if args.register or args.bootstrap:
+                confirmation = getpass.getpass("再次输入同步账户密码：")
+                if password != confirmation:
+                    raise ValidationError("两次输入的账户密码不一致")
+
+                def confirm_recovery(value: str) -> bool:
+                    print("\n恢复密钥只显示这一次。丢失全部设备且没有此密钥时，远端数据不可恢复。")
+                    print(value)
+                    entered = getpass.getpass("请完整重新输入恢复密钥以确认已保存：")
+                    return entered.strip().upper() == value
+
+                action = bootstrap_sync if args.bootstrap else register_sync
+                emit(
+                    action(
+                        server_url=args.server_url,
+                        login_name=args.login_name,
+                        password=password,
+                        device_name=args.device_name,
+                        confirm_recovery_key=confirm_recovery,
+                        allow_insecure_localhost=args.allow_insecure_localhost,
+                    )
+                )
+            else:
+                recovery_key = getpass.getpass("恢复密钥：")
+                emit(
+                    login_sync(
+                        server_url=args.server_url,
+                        login_name=args.login_name,
+                        password=password,
+                        device_name=args.device_name,
+                        recovery_key=recovery_key,
+                        allow_insecure_localhost=args.allow_insecure_localhost,
+                    )
+                )
+            return
+        if args.command == "sync-status":
+            emit(sync_status())
+            return
+        if args.command == "sync-now":
+            emit(sync_now(include_on_demand_media=args.include_on_demand_media))
+            return
+        if args.command == "sync-media-policy":
+            emit(set_media_policy(args.policy))
+            return
+        if args.command == "sync-conflicts":
+            if bool(args.resolve) != bool(args.choice):
+                raise ValidationError("解决冲突时必须同时提供 --resolve 和 --choice")
+            emit(resolve_conflict(args.resolve, args.choice) if args.resolve else list_conflicts())
+            return
+        if args.command == "sync-unlink":
+            confirmation = input("输入 UNLINK 取消本机同步关联（本地数据会保留）：").strip()
+            if confirmation != "UNLINK":
+                raise ValidationError("已取消解绑")
+            emit(unlink_sync())
+            return
+        if args.command == "sync-rotate-key":
+            confirmation = input("输入 ROTATE 确认重新加密全部远端数据并撤销其他设备：").strip()
+            if confirmation != "ROTATE":
+                raise ValidationError("已取消密钥轮换")
+
+            def confirm_rotated_recovery(value: str) -> bool:
+                print("\n新的恢复密钥只显示这一次；所有其他设备将需要重新加入。")
+                print(value)
+                entered = getpass.getpass("请完整重新输入新的恢复密钥：")
+                return entered.strip().upper() == value
+
+            emit(rotate_account_key(confirm_rotated_recovery))
+            return
+        if args.command == "sync-rotate-abort":
+            emit(abort_account_key_rotation())
+            return
+        if args.command == "sync-delete-account":
+            confirmation = input("输入 DELETE ACCOUNT 永久删除远端账户（本地数据保留）：").strip()
+            if confirmation != "DELETE ACCOUNT":
+                raise ValidationError("已取消账户删除")
+            emit(delete_sync_account(getpass.getpass("同步账户密码：")))
+            return
+        if args.command == "ai-configure-secure":
+            api_key = getpass.getpass("API Key（不会回显）：")
+            emit(ai.store_secure_config(args.provider, args.model, api_key))
+            return
+        if args.command == "ai-clear-secure":
+            emit(ai.clear_secure_config())
             return
         init_db()
         if args.command == "list":

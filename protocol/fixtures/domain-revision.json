@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "entity_id": "food_019f4a15-5fd1-7582-ae7e-5d45b235d388",
+  "entity_kind": "food_item",
+  "revision_id": "rev_119f4a15-5fd1-7582-ae7e-5d45b235d389",
+  "parent_revision_ids": [],
+  "created_at": "2026-07-10T03:00:00Z",
+  "author_device_id": "device_219f4a15-5fd1-7582-ae7e-5d45b235d390",
+  "deleted": false,
+  "payload": {
+    "food": {
+      "id": "food_019f4a15-5fd1-7582-ae7e-5d45b235d388",
+      "name": "合成测试燕麦",
+      "brand": "",
+      "basis": "100g",
+      "protein_g": 13.0,
+      "created_at": "2026-07-10T03:00:00Z",
+      "updated_at": "2026-07-10T03:00:00Z"
+    },
+    "history": []
+  }
+}

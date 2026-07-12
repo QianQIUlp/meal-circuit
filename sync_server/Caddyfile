@@ -1,0 +1,8 @@
+{
+    email {$CADDY_EMAIL}
+}
+
+{$SYNC_HOSTNAME} {
+    encode zstd gzip
+    reverse_proxy sync:8080
+}

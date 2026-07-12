@@ -1,4 +1,6 @@
 {
+  "schema_version": 1,
+  "timezone": "Asia/Shanghai",
   "meal_environment": "请填写主要用餐环境",
   "protein_target_g": null,
   "portion_method": "请填写常用份量表达方式",

@@ -8,9 +8,10 @@ permissions:
   contents: read
 
 jobs:
-  test:
+  python-base:
     runs-on: windows-latest
     strategy:
+      fail-fast: false
       matrix:
         python-version: ["3.11", "3.13"]
     steps:
@@ -18,5 +19,146 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-      - run: python -m unittest discover -s tests -v
+      - run: .\test.ps1
       - run: python tools/release_check.py
+      - run: python -m compileall -q mealcircuit sync_server tests tools
+      - run: git diff --check
+
+  sync-postgres:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_DB: mealcircuit
+          POSTGRES_USER: mealcircuit
+          POSTGRES_PASSWORD: integration-password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U mealcircuit"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      MEALCIRCUIT_SYNC_DATABASE_URL: postgresql+psycopg://mealcircuit:integration-password@localhost:5432/mealcircuit
+      MEALCIRCUIT_SYNC_POSTGRES_TEST_URL: postgresql+psycopg://mealcircuit:integration-password@localhost:5432/mealcircuit
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.8.22"
+          enable-cache: true
+      - run: uv sync --locked --extra server --group dev
+      - run: uv run alembic -c sync_server/alembic.ini upgrade head
+      - run: uv run python -m unittest discover -s tests -v
+      - run: uv run python tools/generate_openapi.py --check
+      - run: uv run python tools/validate_protocol.py
+      - run: uv run python tools/release_check.py
+
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+      - uses: android-actions/setup-android@v3
+      - run: sdkmanager "platforms;android-36" "build-tools;36.0.0"
+      - run: ./gradlew --no-daemon testDebugUnitTest assembleDebug lintDebug compileDebugAndroidTestKotlin
+        working-directory: android
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-debug-apk
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+
+  android-instrumentation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+      - uses: android-actions/setup-android@v3
+      - run: sdkmanager "platforms;android-36" "build-tools;36.0.0"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.8.22"
+          enable-cache: true
+      - run: uv sync --locked --extra server --group dev
+      - name: Start real sync service and seed Python desktop revision
+        run: |
+          export MEALCIRCUIT_SYNC_DATABASE_URL="sqlite+pysqlite:///$RUNNER_TEMP/cross-client-server.db"
+          export MEALCIRCUIT_SYNC_BLOB_ROOT="$RUNNER_TEMP/cross-client-blobs"
+          export MEALCIRCUIT_SYNC_REGISTRATION_MODE=open
+          uv run alembic -c sync_server/alembic.ini upgrade head
+          uv run uvicorn sync_server.main:app --host 127.0.0.1 --port 18080 >"$RUNNER_TEMP/sync-server.log" 2>&1 &
+          echo $! > "$RUNNER_TEMP/sync-server.pid"
+          for attempt in $(seq 1 30); do curl --fail --silent http://127.0.0.1:18080/healthz && break; sleep 1; done
+          curl --fail --silent http://127.0.0.1:18080/healthz
+          uv run python -m tools.cross_client_sync_test prepare \
+            --home "$RUNNER_TEMP/python-prepare" \
+            --state "$RUNNER_TEMP/cross-client-state.json"
+      - uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 35
+          arch: x86_64
+          disable-animations: true
+          script: |
+            adb reverse tcp:18080 tcp:18080
+            RECOVERY=$(uv run python -c "import json,os; print(json.load(open(os.environ['RUNNER_TEMP'] + '/cross-client-state.json'))['recovery_key'])")
+            cd android
+            ./gradlew --no-daemon connectedDebugAndroidTest \
+              -Pandroid.testInstrumentationRunnerArguments.syncServerUrl=http://127.0.0.1:18080 \
+              -Pandroid.testInstrumentationRunnerArguments.syncLogin=cross-client \
+              -Pandroid.testInstrumentationRunnerArguments.syncPassword=synthetic-cross-client-password \
+              -Pandroid.testInstrumentationRunnerArguments.syncRecovery="$RECOVERY"
+      - name: Verify Android revision from Python desktop client
+        if: always()
+        run: |
+          if [ -f "$RUNNER_TEMP/cross-client-state.json" ]; then
+            uv run python -m tools.cross_client_sync_test verify \
+              --home "$RUNNER_TEMP/python-verify" \
+              --state "$RUNNER_TEMP/cross-client-state.json" \
+              --server-database "$RUNNER_TEMP/cross-client-server.db" \
+              --server-blob-root "$RUNNER_TEMP/cross-client-blobs" \
+              --server-log "$RUNNER_TEMP/sync-server.log" \
+              --backup-output "$RUNNER_TEMP/cross-client-server-backup.db"
+          fi
+          if [ -f "$RUNNER_TEMP/sync-server.pid" ]; then
+            kill "$(cat "$RUNNER_TEMP/sync-server.pid")" || true
+          fi
+
+  supply-chain:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.8.22"
+          enable-cache: true
+      - run: uv lock --check
+      - run: uv sync --locked --group dev
+      - run: uv run pip-audit --requirement requirements/sync-server.lock
+      - run: uv export --locked --extra desktop --no-dev --no-emit-project --format requirements-txt --output-file "$RUNNER_TEMP/desktop-resolved.txt"
+      - run: uv run pip-audit --requirement "$RUNNER_TEMP/desktop-resolved.txt"
+      - run: uv run python tools/dependency_check.py
+      - uses: anchore/sbom-action@v0
+        with:
+          path: .
+          format: cyclonedx-json
+          output-file: mealcircuit-source.cdx.json
+          artifact-name: mealcircuit-source-sbom

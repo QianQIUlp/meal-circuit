@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=MealCircuit
+Comment=Local-first meal feedback workbench
+Exec=MealCircuit
+Icon=mealcircuit
+Categories=Utility;Health;
+Terminal=false

@@ -8,6 +8,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator
 
+from .db_migrations import (
+    CURRENT_SCHEMA_VERSION as DOMAIN_SCHEMA_VERSION,
+    create_migration_backup,
+    detected_schema_version,
+    migrate,
+)
 from .storage import ROOT, backups_root, db_path
 
 
@@ -63,8 +69,6 @@ def _backup_before_schema_upgrade(path: Path) -> Path | None:
         backup_conn.close()
         source_conn.close()
     return target
-
-
 @contextmanager
 def connect(path: Path | None = None) -> Iterator[sqlite3.Connection]:
     target = (path or db_path()).resolve()
@@ -84,8 +88,13 @@ def connect(path: Path | None = None) -> Iterator[sqlite3.Connection]:
 
 
 def init_db(path: Path | None = None) -> None:
+    if path is None:
+        from .portable import recover_interrupted_import
+
+        recover_interrupted_import()
     target = (path or db_path()).resolve()
     target.parent.mkdir(parents=True, exist_ok=True)
+    existed_before = target.is_file() and target.stat().st_size > 0
     existing_version = _schema_version(target)
     if existing_version > CURRENT_SCHEMA_VERSION:
         raise sqlite3.DatabaseError(
@@ -93,6 +102,12 @@ def init_db(path: Path | None = None) -> None:
         )
     _backup_before_schema_upgrade(target)
     with connect(target) as conn:
+        domain_version = detected_schema_version(conn)
+        domain_backup = (
+            create_migration_backup(conn, target, domain_version)
+            if existed_before and domain_version < DOMAIN_SCHEMA_VERSION
+            else None
+        )
         conn.executescript(
             """
             BEGIN IMMEDIATE;
@@ -111,6 +126,7 @@ def init_db(path: Path | None = None) -> None:
                 created_at TEXT NOT NULL,
                 completed_at TEXT,
                 result_json TEXT,
+                result_provenance_json TEXT,
                 result_version INTEGER NOT NULL DEFAULT 0,
                 input_version INTEGER NOT NULL DEFAULT 1
             );
@@ -208,7 +224,9 @@ def init_db(path: Path | None = None) -> None:
                 review_date TEXT NOT NULL UNIQUE,
                 status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'completed')),
                 source_record_ids_json TEXT NOT NULL DEFAULT '[]',
+                source_checkin_versions_json TEXT NOT NULL DEFAULT '{}',
                 result_json TEXT,
+                result_provenance_json TEXT,
                 result_version INTEGER NOT NULL DEFAULT 0,
                 schema_version INTEGER NOT NULL DEFAULT 1,
                 policy_version TEXT NOT NULL DEFAULT '',
@@ -225,7 +243,9 @@ def init_db(path: Path | None = None) -> None:
                 review_id TEXT NOT NULL REFERENCES daily_reviews(id),
                 version INTEGER NOT NULL,
                 source_record_ids_json TEXT NOT NULL,
+                source_checkin_versions_json TEXT NOT NULL DEFAULT '{}',
                 result_json TEXT NOT NULL,
+                result_provenance_json TEXT,
                 completed_at TEXT,
                 archived_at TEXT NOT NULL,
                 archive_reason TEXT NOT NULL DEFAULT ''
@@ -732,6 +752,28 @@ def init_db(path: Path | None = None) -> None:
                     "INSERT INTO schema_migrations(version,description,applied_at,checksum) VALUES(?,?,?,?)",
                     (version, description, timestamp_now, expected_checksum),
                 )
+        migrate(
+            conn,
+            target,
+            existed_before=existed_before,
+            initial_backup=(domain_version, domain_backup) if domain_backup is not None else None,
+        )
+        backfilled = conn.execute(
+            "SELECT value FROM app_metadata WHERE key='domain_backfill_version'"
+        ).fetchone()
+        backfill_version = int(backfilled[0]) if backfilled else 0
+        if backfill_version < 2:
+            from .domain_store import seed_current_entities
+
+            seed_current_entities(conn)
+            conn.execute(
+                """INSERT INTO app_metadata(key,value) VALUES('domain_backfill_version','2')
+                   ON CONFLICT(key) DO UPDATE SET value='2'"""
+            )
+        else:
+            from .domain_store import refresh_configuration_entities
+
+            refresh_configuration_entities(conn)
 
 
 def row_dict(row: sqlite3.Row | None) -> dict | None:
@@ -740,7 +782,7 @@ def row_dict(row: sqlite3.Row | None) -> dict | None:
     result = dict(row)
     for key in (
         "result_json", "structured_json", "correction_json", "source_record_ids_json",
-        "source_checkin_versions_json", "answers_json", "draft_json", "profile_json",
+        "result_provenance_json", "source_checkin_versions_json", "answers_json", "draft_json", "profile_json",
         "goal_json", "goal_version_ids_json", "strategy_json", "value_json",
         "source_detail_json", "applicability_json",
         "reason_codes_json", "outcome_json", "answer_json", "payload_json", "question_schema_json", "subject_json",

@@ -3,15 +3,23 @@ from __future__ import annotations
 import json
 import re
 import shutil
-import uuid
 import hashlib
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, timedelta
 from pathlib import Path
 from typing import BinaryIO
 
 from . import checkins
-from .configuration import load_doctrine, load_resolved_settings, load_settings
+from .configuration import configured_today, load_doctrine, load_resolved_settings, load_settings
 from .db import connect, init_db, row_dict
+from .domain import new_id, utc_now
+from .domain_store import (
+    capture_correction,
+    capture_derived_result,
+    capture_entity,
+    capture_task_input,
+    preference_entity_id,
+    task_input_entity_id,
+)
 from .meal_modes import (
     LEGACY_DEFAULT_MEAL_MODES,
     MEAL_KEYS,
@@ -35,11 +43,76 @@ IMAGE_SIGNATURES = {
 
 
 def now() -> str:
-    return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+    return utc_now()
 
 
-def new_id(prefix: str) -> str:
-    return f"{prefix}_{uuid.uuid4().hex[:12]}"
+def _revision_references(entity_ids: set[str]) -> list[dict]:
+    if not entity_ids:
+        return []
+    init_db()
+    placeholders = ",".join("?" for _ in entity_ids)
+    with connect() as conn:
+        return [
+            dict(row)
+            for row in conn.execute(
+                f"""SELECT entity_id,entity_kind,revision_id FROM entity_heads
+                    WHERE entity_id IN ({placeholders}) ORDER BY entity_kind,entity_id""",
+                tuple(sorted(entity_ids)),
+            )
+        ]
+
+
+def _result_provenance(source_revisions: list[dict], generator: dict | None = None) -> dict:
+    by_entity = {item["entity_id"]: item for item in source_revisions}
+    settings_id = preference_entity_id("settings")
+    doctrine_id = preference_entity_id("doctrine")
+    with connect() as conn:
+        hashes = {
+            row["kind"]: row["content_sha256"]
+            for row in conn.execute(
+                "SELECT kind,content_sha256 FROM config_documents WHERE kind IN ('settings','doctrine')"
+            )
+        }
+    metadata = dict(generator or {"provider": "external_agent", "model": "unspecified"})
+    metadata.pop("api_key", None)
+    metadata["generated_at"] = now()
+    return {
+        "schema_version": 1,
+        "source_revisions": source_revisions,
+        "settings_revision_id": (by_entity.get(settings_id) or {}).get("revision_id"),
+        "settings_sha256": hashes.get("settings"),
+        "doctrine_revision_id": (by_entity.get(doctrine_id) or {}).get("revision_id"),
+        "doctrine_sha256": hashes.get("doctrine"),
+        "result_schema_version": 1,
+        "generator": metadata,
+    }
+
+
+def _generator_metadata(provider) -> dict:
+    config = getattr(provider, "config", None)
+    return {
+        "provider": str(getattr(config, "provider", provider.__class__.__name__)),
+        "model": str(getattr(config, "model", "unspecified")),
+    }
+
+
+def _decorate_staleness(provenance: dict | None) -> dict | None:
+    if not isinstance(provenance, dict):
+        return provenance
+    references = provenance.get("source_revisions") or []
+    entity_ids = {
+        item.get("entity_id") for item in references if isinstance(item, dict) and item.get("entity_id")
+    }
+    current = {item["entity_id"]: item["revision_id"] for item in _revision_references(entity_ids)}
+    stale = [
+        item["entity_id"]
+        for item in references
+        if isinstance(item, dict) and current.get(item.get("entity_id")) != item.get("revision_id")
+    ]
+    value = json.loads(json.dumps(provenance, ensure_ascii=False))
+    value["stale"] = bool(stale)
+    value["stale_entity_ids"] = stale
+    return value
 
 
 def _client_identity(client=None) -> tuple[str | None, str | None]:
@@ -150,6 +223,8 @@ def create_photo_task(stream: BinaryIO, note: str = "") -> dict:
                 "INSERT INTO tasks(id,type,status,original_input,image_path,created_at) VALUES(?,?,?,?,?,?)",
                 (task_id, "photo", "pending", note.strip(), stored_path, now()),
             )
+            capture_entity(conn, "task", task_id)
+            capture_task_input(conn, task_id)
     except Exception:
         absolute.unlink(missing_ok=True)
         raise
@@ -169,6 +244,8 @@ def create_material_task(materials: str) -> dict:
             "INSERT INTO tasks(id,type,status,original_input,created_at) VALUES(?,?,?,?,?)",
             (task_id, "material", "pending", materials, now()),
         )
+        capture_entity(conn, "task", task_id)
+        capture_task_input(conn, task_id)
     return get_task(task_id)
 
 
@@ -204,6 +281,7 @@ def get_task(task_id: str) -> dict:
                 "SELECT * FROM task_corrections WHERE task_id=? ORDER BY created_at", (task_id,)
             ).fetchall()
         ]
+        task["result_provenance_json"] = _decorate_staleness(task.get("result_provenance_json"))
     return task
 
 
@@ -238,6 +316,7 @@ def update_task_input(task_id: str, text: str, expected_version: int) -> dict:
             )
             if updated.rowcount != 1:
                 raise ValidationError("任务状态或输入已变化，请刷新页面后重试")
+        capture_task_input(conn, task_id)
     return get_task(task_id)
 
 
@@ -247,6 +326,8 @@ def complete_task(
     *,
     provenance_context: dict | None = None,
     agent_run_id: str | None = None,
+    source_revisions: list[dict] | None = None,
+    generator: dict | None = None,
 ) -> dict:
     task = get_task(task_id)
     if task["status"] == "completed":
@@ -258,25 +339,39 @@ def complete_task(
     validate_result(task["type"], result, fact_only=policy["fact_only"])
     from .planning import enrich_task_result
 
-    result = enrich_task_result(result, context)
+    stored_result = enrich_task_result(result, context)
+    if source_revisions is None:
+        source_revisions = context["source_revisions"]
+    portable_provenance = _result_provenance(source_revisions, generator)
+    timestamp = now()
     with connect() as conn:
         updated = conn.execute(
-            """UPDATE tasks SET status='completed', result_json=?, result_version=1,
+            """UPDATE tasks SET status='completed', result_json=?, result_provenance_json=?, result_version=1,
                schema_version=2,policy_version=?,validator_version=?,source_manifest_json=?,
                context_hash=?,agent_run_id=?,completed_at=? WHERE id=? AND status='pending'""",
             (
-                json.dumps(result, ensure_ascii=False),
+                json.dumps(stored_result, ensure_ascii=False),
+                json.dumps(portable_provenance, ensure_ascii=False),
                 policy["policy_version"],
                 VALIDATOR_VERSION,
                 json.dumps(_source_manifest_for_commit(context, agent_run_id), ensure_ascii=False, sort_keys=True),
                 context.get("context_hash") or "",
                 agent_run_id,
-                now(),
+                timestamp,
                 task_id,
             ),
         )
         if updated.rowcount != 1:
             raise ValidationError("任务状态已变化，请重新读取")
+        capture_entity(conn, "task", task_id)
+        capture_derived_result(
+            conn,
+            source_entity_id=task_id,
+            source_kind="task",
+            result_version=1,
+            result=stored_result,
+            provenance=portable_provenance,
+        )
     from .adaptive import linked_dates
 
     for observed_date in linked_dates(task_id):
@@ -285,7 +380,7 @@ def complete_task(
 
 
 def generate_task_result(task_id: str, client=None) -> dict:
-    from .ai import generate_json
+    from .ai import generate_json, provider_from_environment
     from .personalization import require_generation
 
     task = get_task(task_id)
@@ -293,14 +388,17 @@ def generate_task_result(task_id: str, client=None) -> dict:
         raise ValidationError("任务已完成；不得覆盖原结果，请新增用户校正")
     require_generation(task["type"])
     context = task_context(task_id)
-    run_id = _start_agent_run(task["type"], context, client)
+    provider = client or provider_from_environment()
+    run_id = _start_agent_run(task["type"], context, provider)
     try:
-        result = generate_json(context, task["type"], client)
+        result = generate_json(context, task["type"], provider)
         completed = complete_task(
             task_id,
             result,
             provenance_context=context,
             agent_run_id=run_id,
+            source_revisions=context["source_revisions"],
+            generator=_generator_metadata(provider),
         )
     except Exception as exc:
         _finish_agent_run(run_id, error=exc)
@@ -337,6 +435,7 @@ def add_correction(task_id: str, correction: dict) -> dict:
             "INSERT INTO task_corrections(id,task_id,correction_json,created_at) VALUES(?,?,?,?)",
             (correction_id, task_id, json.dumps(payload, ensure_ascii=False), now()),
         )
+        capture_correction(conn, correction_id)
     from .adaptive import linked_dates
 
     for observed_date in linked_dates(task_id):
@@ -405,6 +504,7 @@ def create_food(item: dict) -> dict:
         )
         after = dict(conn.execute("SELECT * FROM food_items WHERE id=?", (food_id,)).fetchone())
         _food_history(conn, food_id, "create", None, after)
+        capture_entity(conn, "food_item", food_id)
     return get_food(food_id)
 
 
@@ -465,6 +565,7 @@ def update_food(food_id: str, item: dict) -> dict:
         )
         after = dict(conn.execute("SELECT * FROM food_items WHERE id=?", (food_id,)).fetchone())
         _food_history(conn, food_id, "update", before, after)
+        capture_entity(conn, "food_item", food_id)
     return get_food(food_id)
 
 
@@ -475,6 +576,7 @@ def delete_food(food_id: str) -> None:
         conn.execute("UPDATE food_items SET deleted_at=?,updated_at=? WHERE id=?", (timestamp, timestamp, food_id))
         after = dict(conn.execute("SELECT * FROM food_items WHERE id=?", (food_id,)).fetchone())
         _food_history(conn, food_id, "delete", before, after)
+        capture_entity(conn, "food_item", food_id)
 
 
 def _record_ids_for_date(conn, record_date: str) -> list[str]:
@@ -521,18 +623,20 @@ def _queue_daily_review(conn, record_date: str, archive_reason: str = "new_daily
             ) VALUES(?,?,?,?,?,?,?,?)""",
             (new_id("review"), record_date, "pending", source_json, checkin_versions_json, 0, timestamp, timestamp),
         )
+        created = conn.execute("SELECT id FROM daily_reviews WHERE review_date=?", (record_date,)).fetchone()
+        capture_entity(conn, "daily_review", created["id"], created_at=timestamp)
         return
     if review["status"] == "completed" and review["result_json"]:
         conn.execute(
             """INSERT INTO daily_review_history(
                 id,review_id,version,source_record_ids_json,source_checkin_versions_json,
-                result_json,completed_at,archived_at,archive_reason,schema_version,review_mode,
+                result_json,result_provenance_json,completed_at,archived_at,archive_reason,schema_version,review_mode,
                 source_manifest_json,context_hash,agent_run_id,policy_version,validator_version,plan_version_id
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 new_id("review_history"), review["id"], review["result_version"],
                 review["source_record_ids_json"], review["source_checkin_versions_json"],
-                review["result_json"], review["completed_at"], timestamp, archive_reason,
+                review["result_json"], review["result_provenance_json"], review["completed_at"], timestamp, archive_reason,
                 review["schema_version"], review["review_mode"], review["source_manifest_json"], review["context_hash"],
                 review["agent_run_id"], review["policy_version"], review["validator_version"],
                 review["plan_version_id"],
@@ -540,11 +644,12 @@ def _queue_daily_review(conn, record_date: str, archive_reason: str = "new_daily
         )
     conn.execute(
         """UPDATE daily_reviews SET status='pending',source_record_ids_json=?,source_checkin_versions_json=?,
-           result_json=NULL,source_manifest_json='{}',context_hash='',agent_run_id=NULL,
+           result_json=NULL,result_provenance_json=NULL,source_manifest_json='{}',context_hash='',agent_run_id=NULL,
            policy_version='',validator_version='',plan_version_id=NULL,updated_at=?,completed_at=NULL
            WHERE review_date=?""",
         (source_json, checkin_versions_json, timestamp, record_date),
     )
+    capture_entity(conn, "daily_review", review["id"], created_at=timestamp)
 
 
 def queue_review_for_external_change(record_date: str, reason: str) -> dict:
@@ -568,7 +673,7 @@ def _validate_checkin_date(value: str) -> str:
         parsed = date.fromisoformat(value)
     except ValueError as exc:
         raise ValidationError("日期必须是 YYYY-MM-DD") from exc
-    if parsed > date.today():
+    if parsed > configured_today():
         raise ValidationError("不能填写未来日期的每日状态")
     return value
 
@@ -724,6 +829,7 @@ def save_checkin_answer(checkin_date: str, module_key: str, question_id: str, va
             (status, json.dumps(active, ensure_ascii=False), timestamp, row["id"]),
         )
         conn.execute("UPDATE daily_checkins SET updated_at=? WHERE id=?", (timestamp, row["checkin_id"]))
+        capture_entity(conn, "checkin_day", row["checkin_id"], created_at=timestamp)
     return get_checkin_module(checkin_date, module_key)
 
 
@@ -753,6 +859,7 @@ def complete_checkin_module(checkin_date: str, module_key: str, expected_version
             (json.dumps(answers, ensure_ascii=False), checkins.SCHEMA_VERSION, timestamp, timestamp, row["id"]),
         )
         conn.execute("UPDATE daily_checkins SET updated_at=? WHERE id=?", (timestamp, row["checkin_id"]))
+        capture_entity(conn, "checkin_day", row["checkin_id"], created_at=timestamp)
         _queue_daily_review(conn, checkin_date, "checkin_module_updated")
     return get_checkin_module(checkin_date, module_key)
 
@@ -780,6 +887,7 @@ def skip_checkin_module(checkin_date: str, module_key: str, expected_version: in
             (checkins.SCHEMA_VERSION, timestamp, timestamp, row["id"]),
         )
         conn.execute("UPDATE daily_checkins SET updated_at=? WHERE id=?", (timestamp, row["checkin_id"]))
+        capture_entity(conn, "checkin_day", row["checkin_id"], created_at=timestamp)
         _queue_daily_review(conn, checkin_date, "checkin_module_skipped")
     return get_checkin_module(checkin_date, module_key)
 
@@ -796,6 +904,7 @@ def discard_checkin_draft(checkin_date: str, module_key: str, expected_version: 
             "UPDATE daily_checkin_modules SET status=?,draft_json=NULL,updated_at=? WHERE id=?",
             (status, now(), row["id"]),
         )
+        capture_entity(conn, "checkin_day", row["checkin_id"])
     return get_checkin_module(checkin_date, module_key)
 
 
@@ -810,6 +919,7 @@ def add_daily_record(record_date: str, raw_input: str, structured: dict | None =
     init_db()
     with connect() as conn:
         conn.execute("INSERT INTO daily_records VALUES(?,?,?,?,?)", item)
+        capture_entity(conn, "daily_record", item[0], created_at=item[4])
         _queue_daily_review(conn, record_date)
     return {"id": item[0], "record_date": item[1], "raw_input": item[2], "structured_json": structured, "created_at": item[4]}
 
@@ -842,24 +952,25 @@ def requeue_daily_review(review_date: str, reason: str) -> dict:
         conn.execute(
             """INSERT INTO daily_review_history(
                 id,review_id,version,source_record_ids_json,source_checkin_versions_json,
-                result_json,completed_at,archived_at,archive_reason,schema_version,review_mode,
+                result_json,result_provenance_json,completed_at,archived_at,archive_reason,schema_version,review_mode,
                 source_manifest_json,context_hash,agent_run_id,policy_version,validator_version,plan_version_id
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 new_id("review_history"), current["id"], current["result_version"],
                 current["source_record_ids_json"], current["source_checkin_versions_json"],
-                current["result_json"], current["completed_at"], timestamp, reason,
+                current["result_json"], current["result_provenance_json"], current["completed_at"], timestamp, reason,
                 current["schema_version"], current["review_mode"], current["source_manifest_json"], current["context_hash"],
                 current["agent_run_id"], current["policy_version"], current["validator_version"],
                 current["plan_version_id"],
             ),
         )
         conn.execute(
-            """UPDATE daily_reviews SET status='pending',result_json=NULL,source_manifest_json='{}',context_hash='',
+            """UPDATE daily_reviews SET status='pending',result_json=NULL,result_provenance_json=NULL,source_manifest_json='{}',context_hash='',
                    agent_run_id=NULL,policy_version='',validator_version='',plan_version_id=NULL,
                    updated_at=?,completed_at=NULL
                WHERE review_date=?""", (timestamp, review_date)
         )
+        capture_entity(conn, "daily_review", current["id"], created_at=timestamp)
     return get_daily_review(review_date)
 
 
@@ -872,6 +983,9 @@ def get_daily_review(review_date: str) -> dict:
         review["history"] = [row_dict(row) for row in conn.execute(
             "SELECT * FROM daily_review_history WHERE review_id=? ORDER BY version", (review["id"],)
         ).fetchall()]
+        review["result_provenance_json"] = _decorate_staleness(
+            review.get("result_provenance_json")
+        )
         return review
 
 
@@ -1124,7 +1238,7 @@ def daily_review_context(review_date: str, days: int = 14) -> dict:
             "SELECT * FROM adjustments WHERE active=1 ORDER BY updated_at DESC"
         ).fetchall()]
         checkin_rows = conn.execute(
-            """SELECT c.checkin_date,m.module_key,m.status,m.answers_json,m.version,m.completed_at
+            """SELECT c.id AS checkin_id,c.checkin_date,m.module_key,m.status,m.answers_json,m.version,m.completed_at
                FROM daily_checkins c JOIN daily_checkin_modules m ON m.checkin_id=c.id
                WHERE c.checkin_date BETWEEN ? AND ? AND m.version>0
                ORDER BY c.checkin_date,m.module_key""",
@@ -1150,6 +1264,16 @@ def daily_review_context(review_date: str, days: int = 14) -> dict:
         _ingredient_carryover_obligations(review_date, recent_review_rows)
         if home_cooking.get("enabled") else []
     )
+    priority_foods = list_priority_foods()
+    source_ids = {
+        *(item["id"] for item in records),
+        *(item["id"] for item in memories),
+        *(item["id"] for item in adjustments),
+        *(row["checkin_id"] for row in checkin_rows),
+        *(row["id"] for row in recent_review_rows),
+        *(item["id"] for item in priority_foods),
+        *(preference_entity_id(kind) for kind in ("profile", "settings", "doctrine", "checkin_settings")),
+    }
     target_modules = [
         {
             "module_key": item["module_key"], "label": item["label"], "status": item["status"],
@@ -1231,7 +1355,8 @@ def daily_review_context(review_date: str, days: int = 14) -> dict:
         ),
         "long_term_memories": memories,
         "current_adjustments": adjustments,
-        "priority_foods": list_priority_foods(),
+        "priority_foods": priority_foods,
+        "source_revisions": _revision_references(source_ids),
         "settings": settings,
         "home_cooking_preferences": home_cooking,
         "meal_modes": settings.get("meal_modes") or legacy_home_meal_modes(home_cooking),
@@ -1275,6 +1400,8 @@ def complete_daily_review(
     *,
     provenance_context: dict | None = None,
     agent_run_id: str | None = None,
+    source_revisions: list[dict] | None = None,
+    generator: dict | None = None,
 ) -> dict:
     from .personalization import require_generation
 
@@ -1304,6 +1431,10 @@ def complete_daily_review(
     from .planning import validate_and_enrich_daily_result
 
     result = validate_and_enrich_daily_result(result, context)
+    if source_revisions is None:
+        source_revisions = context["source_revisions"]
+    portable_provenance = _result_provenance(source_revisions, generator)
+    stored_result = json.loads(json.dumps(result, ensure_ascii=False))
     timestamp = now()
     next_version = review["result_version"] + 1
     menu = result.get("tomorrow_menu") or {}
@@ -1329,12 +1460,14 @@ def complete_daily_review(
     committed_manifest = _source_manifest_for_commit(context, agent_run_id)
     with connect() as conn:
         updated = conn.execute(
-            """UPDATE daily_reviews SET status='completed',result_json=?,result_version=result_version+1,
+            """UPDATE daily_reviews SET status='completed',result_json=?,result_provenance_json=?,result_version=result_version+1,
                schema_version=2,review_mode=?,source_manifest_json=?,context_hash=?,agent_run_id=?,
                policy_version=?,validator_version=?,plan_version_id=?,updated_at=?,completed_at=?
                WHERE review_date=? AND status='pending'""",
             (
-                json.dumps(result, ensure_ascii=False), safety_mode,
+                json.dumps(stored_result, ensure_ascii=False),
+                json.dumps(portable_provenance, ensure_ascii=False),
+                safety_mode,
                 json.dumps(_source_manifest_for_commit(context, agent_run_id), ensure_ascii=False, sort_keys=True), context["context_hash"],
                 agent_run_id, policy["policy_version"], VALIDATOR_VERSION,
                 plan_version_id, timestamp, timestamp, review_date,
@@ -1381,11 +1514,21 @@ def complete_daily_review(
                     timestamp,
                 ),
             )
+        current = conn.execute("SELECT id FROM daily_reviews WHERE review_date=?", (review_date,)).fetchone()
+        capture_entity(conn, "daily_review", current["id"], created_at=timestamp)
+        capture_derived_result(
+            conn,
+            source_entity_id=current["id"],
+            source_kind="daily_review",
+            result_version=review["result_version"] + 1,
+            result=stored_result,
+            provenance=portable_provenance,
+        )
     return get_daily_review(review_date)
 
 
 def generate_daily_review(review_date: str, client=None) -> dict:
-    from .ai import generate_json
+    from .ai import generate_json, provider_from_environment
     from .personalization import require_generation
 
     review = ensure_daily_review(review_date)
@@ -1393,14 +1536,17 @@ def generate_daily_review(review_date: str, client=None) -> dict:
         raise ValidationError("该日期复盘已完成；新增每日记录后才可重新复盘")
     require_generation("daily")
     context = daily_review_context(review_date)
-    run_id = _start_agent_run("daily", context, client)
+    provider = client or provider_from_environment()
+    run_id = _start_agent_run("daily", context, provider)
     try:
-        result = generate_json(context, "daily", client)
+        result = generate_json(context, "daily", provider)
         completed = complete_daily_review(
             review_date,
             result,
             provenance_context=context,
             agent_run_id=run_id,
+            source_revisions=context["source_revisions"],
+            generator=_generator_metadata(provider),
         )
     except Exception as exc:
         _finish_agent_run(run_id, error=exc)
@@ -1634,7 +1780,7 @@ def pending_work() -> dict:
 
 
 def daily_state(review_date: str | None = None) -> dict:
-    target = review_date or date.today().isoformat()
+    target = review_date or configured_today().isoformat()
     init_db()
     with connect() as conn:
         review = row_dict(conn.execute(
@@ -1645,12 +1791,15 @@ def daily_state(review_date: str | None = None) -> dict:
         ).fetchone()[0]
     if review is None:
         return {"date": target, "status": "unrecorded", "record_count": record_count, "review": None}
+    review["result_provenance_json"] = _decorate_staleness(
+        review.get("result_provenance_json")
+    )
     return {"date": target, "status": review["status"], "record_count": record_count, "review": review}
 
 
 def dashboard_snapshot(review_date: str | None = None, days: int = 14) -> dict:
     """Build a read-only dashboard projection without queueing or reopening work."""
-    target = review_date or date.today().isoformat()
+    target = review_date or configured_today().isoformat()
     try:
         end = date.fromisoformat(target)
     except ValueError as exc:
@@ -1748,6 +1897,7 @@ def add_memory(kind: str, content: str, evidence: str = "") -> dict:
     item = (new_id("memory"), kind, content.strip(), evidence.strip(), 1, now(), now())
     with connect() as conn:
         conn.execute("INSERT INTO memories VALUES(?,?,?,?,?,?,?)", item)
+        capture_entity(conn, "memory", item[0], created_at=item[5])
     return {"id": item[0], "kind": kind, "content": item[2], "evidence": item[3]}
 
 
@@ -1757,6 +1907,7 @@ def add_adjustment(content: str, reason: str = "") -> dict:
     item = (new_id("adjustment"), content.strip(), reason.strip(), 1, now(), now())
     with connect() as conn:
         conn.execute("INSERT INTO adjustments VALUES(?,?,?,?,?,?)", item)
+        capture_entity(conn, "adjustment", item[0], created_at=item[4])
     return {"id": item[0], "content": item[1], "reason": item[2]}
 
 
@@ -1778,7 +1929,10 @@ def task_context(task_id: str, days: int = 14) -> dict:
 
     generation_policy = require_generation(task["type"])
     evidence_links = task_evidence_links(task_id)
-    anchor = max((date.fromisoformat(item["observed_date"]) for item in evidence_links), default=date.today())
+    anchor = max(
+        (date.fromisoformat(item["observed_date"]) for item in evidence_links),
+        default=configured_today(),
+    )
     cutoff = (anchor - timedelta(days=days - 1)).isoformat()
     doctrine = load_doctrine()
     personalization = active_personalization()
@@ -1821,6 +1975,14 @@ def task_context(task_id: str, days: int = 14) -> dict:
         "validator_version": VALIDATOR_VERSION,
         "agent_run_id": None,
     }
+    source_ids = {
+        task_input_entity_id(task_id),
+        *(item["id"] for item in records),
+        *(item["id"] for item in matches),
+        *(item["id"] for item in memories),
+        *(item["id"] for item in adjustments),
+        *(preference_entity_id(kind) for kind in ("profile", "settings", "doctrine", "checkin_settings")),
+    }
     context = {
         "task": task,
         "context_schema_version": 2,
@@ -1841,6 +2003,7 @@ def task_context(task_id: str, days: int = 14) -> dict:
         "confirmed_rules": adaptations["confirmed_rules"],
         "inventory": inventory,
         "source_manifest": source_manifest,
+        "source_revisions": _revision_references(source_ids),
         "result_schema": result_schema(task["type"], fact_only=generation_policy["fact_only"]),
         "analysis_boundary": "照片与数量只能区间估算；不可伪造不可见油、酱汁、重量或品牌。",
     }
