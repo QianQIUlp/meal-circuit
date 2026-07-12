@@ -18,7 +18,7 @@ This file tracks the approved end-to-end delivery against concrete code and veri
 | Data portability and recovery | implemented | SHA manifest, integrity/schema preview, pre-restore backup, atomic DB replacement, Web/CLI | round trip passes |
 | Backward compatibility | implemented | prefill active/legacy settings; setup only gates generation; legacy overview remains reachable | legacy suite passes |
 | Accessibility | verified | semantic forms/errors, keyboard focus trap/inert drawer, responsive grids, reduced motion | automated markup and real-browser 320/720/1440 effective-viewport checks pass with one h1, zero unlabeled controls, no horizontal overflow and no console warnings/errors |
-| Full verification and draft PR | verified and delivered | 67/67 tests; release/compile/diff checks; isolated browser rerun; branch pushed; [Draft PR #14](https://github.com/QianQIUlp/meal-circuit/pull/14) open against `main` | GitHub reports PR state `OPEN` and `isDraft=true`; CI must remain green |
+| Full verification and draft PR | verified and delivered | 67/67 tests on local Python 3.11.9 and 3.13; release/compile/diff checks; isolated browser rerun; [Draft PR #14](https://github.com/QianQIUlp/meal-circuit/pull/14) open against `main` | GitHub reports `OPEN`, `isDraft=true`; Python 3.11/3.13 push and pull-request checks pass |
 
 ## Classification decision
 

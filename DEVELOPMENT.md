@@ -225,6 +225,6 @@
 - 改动文件：`mealcircuit/server.py`、`mealcircuit/agent_cli.py`、`tests/test_adaptive.py`。
 - 核心功能：把计划步骤、学习页和救场完成态中的 Python 3.12+ 嵌套 f-string 拆为兼容 3.11 的预计算片段；CLI 明确使用 UTF-8 标准输出；可移植包与初始化路径断言按文件身份/规范路径比较，兼容 runner 的 `RUNNER~1` 与长路径别名。
 - 验证：自适应专项 23 项通过；本机 Python 3.13 与临时非安装式 Python 3.11.9 均完成全量 67 项；两版 `compileall`、`git diff --check` 和 `tools/release_check.py` 通过。
-- 仍未实现：无新增产品缺口；等待修复提交的 GitHub Actions Python 3.11/3.13 矩阵结果。
-- 下一任务：推送修复并确认 Draft PR 全部远端检查绿色。
+- 仍未实现：无新增产品缺口。
+- 下一任务：Draft PR #14 保持 Draft，等待 reviewer 审阅；不自动合并或标记 Ready。
 - 用户用法：无变化；CLI 在 Windows 重定向或子进程调用时也稳定输出 UTF-8 JSON。
