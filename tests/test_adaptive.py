@@ -219,7 +219,8 @@ class AdaptiveDomainTest(unittest.TestCase):
     def test_web_first_run_template_becomes_valid_after_onboarding(self):
         (self.home / "settings.json").unlink()
         initialized = initialize_private_home()
-        self.assertIn(str(self.home / "settings.json"), initialized["created"])
+        created = {Path(item).resolve() for item in initialized["created"]}
+        self.assertIn((self.home / "settings.json").resolve(), created)
         self._complete_standard_profile()
         resolved = load_resolved_settings()
         self.assertEqual([112.0, 160.0], resolved["protein_target_g"])
@@ -483,7 +484,7 @@ class AdaptiveDomainTest(unittest.TestCase):
         adaptive.create_inventory_item("北豆腐", "半盒", expires_on="2026-07-12")
         bundle = self.home / "exports" / "round-trip.zip"
         exported = portability.export_bundle(bundle)
-        self.assertEqual(str(bundle), exported["path"])
+        self.assertTrue(Path(exported["path"]).samefile(bundle))
         preview = portability.preview_import(bundle)
         self.assertEqual("ok", preview["database_integrity"])
         self.assertGreaterEqual(preview["table_counts"]["daily_records"], 1)
@@ -522,6 +523,7 @@ class AdaptiveDomainTest(unittest.TestCase):
                 check=True,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
                 env=os.environ.copy(),
             )
             return json.loads(completed.stdout)
@@ -530,7 +532,7 @@ class AdaptiveDomainTest(unittest.TestCase):
         self.assertEqual(plan["plan_version_id"], run("plan", plan["plan_date"])["plan_version_id"])
         self.assertEqual("豆腐", run("inventory", "list")[0]["name"])
         bundle = self.home / "exports" / "cli.zip"
-        self.assertEqual(str(bundle), run("export-bundle", "--output", str(bundle))["path"])
+        self.assertTrue(Path(run("export-bundle", "--output", str(bundle))["path"]).samefile(bundle))
         self.assertEqual("ok", run("import-bundle", str(bundle))["database_integrity"])
         experiment_file = self.home / "experiment.json"
         experiment_file.write_text(json.dumps({

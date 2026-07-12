@@ -21,6 +21,13 @@ def emit(value: object, output: str | None = None) -> None:
         print(payload)
 
 
+def configure_utf8_stdio() -> None:
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            reconfigure(encoding="utf-8")
+
+
 def load_json_value(path: str):
     try:
         value = json.loads(Path(path).read_text(encoding="utf-8"))
@@ -207,6 +214,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    configure_utf8_stdio()
     args = build_parser().parse_args()
     try:
         if args.command == "init":

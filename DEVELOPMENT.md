@@ -218,3 +218,13 @@
 - 仍未实现：无自动后台模型、账户、云同步、诊断、治疗建议或自动接受学习规则；这些是明确产品边界，不是本闭环缺口。
 - 下一任务：Draft PR #14 已创建并保持 Draft；等待 GitHub Actions 后由 reviewer 审阅，不自动合并或标记 Ready。
 - 用户用法：运行 `.\start.ps1` 后按 Web 初始化进入“今天”；先记录真实情况，打开正式计划执行并回执，重复阻力会出现在“学习确认”；“目标与边界 → 备份与迁移”可导出完整 ZIP。也可用 `python -m mealcircuit.agent_cli --help` 查看同等 CLI 流程。
+
+## 2026-07-12：CI 跨版本兼容修正
+
+- 目标：修复 Draft PR #14 在 GitHub Windows runner 暴露的 Python 3.11 语法、CLI 编码和 Windows 短路径兼容问题，不改变领域行为。
+- 改动文件：`mealcircuit/server.py`、`mealcircuit/agent_cli.py`、`tests/test_adaptive.py`。
+- 核心功能：把计划步骤格式化从 Python 3.12+ 嵌套 f-string 拆为兼容 3.11 的纯函数；CLI 明确使用 UTF-8 标准输出；可移植包与初始化路径断言按文件身份/规范路径比较，兼容 runner 的 `RUNNER~1` 与长路径别名。
+- 验证：自适应专项 23 项通过；全量 67 项通过；全部 Python 文件通过 `ast.parse(..., feature_version=(3, 11))`；`compileall`、`git diff --check` 和 `tools/release_check.py` 通过。
+- 仍未实现：无新增产品缺口；等待修复提交的 GitHub Actions Python 3.11/3.13 矩阵结果。
+- 下一任务：推送修复并确认 Draft PR 全部远端检查绿色。
+- 用户用法：无变化；CLI 在 Windows 重定向或子进程调用时也稳定输出 UTF-8 JSON。

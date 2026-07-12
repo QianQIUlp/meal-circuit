@@ -261,6 +261,18 @@ def render_today_workspace(work_date: str) -> str:
     )
 
 
+def _plan_step_text(item: str | dict) -> str:
+    if isinstance(item, str):
+        return item
+    minutes = f"{item.get('minutes')} 分钟" if item.get("minutes") else None
+    return " · ".join(str(value) for value in (
+        item.get("instruction") or item.get("text"),
+        minutes,
+        item.get("heat"),
+        item.get("done_signal"),
+    ) if value)
+
+
 def render_plan_page(plan_date: str) -> str:
     plan = adaptive.get_plan_for_date(plan_date)
     if not plan:
@@ -276,10 +288,7 @@ def render_plan_page(plan_date: str) -> str:
             f'<li>{esc(item if isinstance(item, str) else " · ".join(str(value) for value in (item.get("name"), item.get("amount"), item.get("prep")) if value))}</li>'
             for item in ingredients
         )
-        step_html = "".join(
-            f'<li>{esc(item if isinstance(item, str) else " · ".join(str(value) for value in (item.get("instruction") or item.get("text"), f"{item.get("minutes")} 分钟" if item.get("minutes") else None, item.get("heat"), item.get("done_signal")) if value))}</li>'
-            for item in steps
-        )
+        step_html = "".join(f'<li>{esc(_plan_step_text(item))}</li>' for item in steps)
         execution = meal.get("execution") or {}
         execution_bits = [
             f'主动 {execution["active_minutes"]} 分钟' if execution.get("active_minutes") is not None else "",
