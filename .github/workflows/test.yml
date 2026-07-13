@@ -83,7 +83,10 @@ jobs:
           path: android/app/build/outputs/apk/debug/app-debug.apk
 
   android-instrumentation:
-    runs-on: ubuntu-latest
+    # The emulator action is designed for hardware-accelerated macOS runners.
+    # Ubuntu's no-KVM fallback can report sys.boot_completed before Android's
+    # input/settings services are ready, making the action fail before tests run.
+    runs-on: macos-15-intel
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
