@@ -118,8 +118,10 @@ jobs:
             --home "$RUNNER_TEMP/python-prepare" \
             --state "$RUNNER_TEMP/cross-client-state.json"
           SYNC_RECOVERY=$(uv run python -c 'import json,os; print(json.load(open(os.path.join(os.environ["RUNNER_TEMP"], "cross-client-state.json")))["recovery_key"])')
-          echo "::add-mask::$SYNC_RECOVERY"
-          echo "SYNC_RECOVERY=$SYNC_RECOVERY" >> "$GITHUB_ENV"
+          # healthz responses do not end with a newline. Force the workflow
+          # command onto its own line so GitHub actually registers the mask.
+          printf '\n::add-mask::%s\n' "$SYNC_RECOVERY"
+          printf 'SYNC_RECOVERY=%s\n' "$SYNC_RECOVERY" >> "$GITHUB_ENV"
       - uses: reactivecircus/android-emulator-runner@v2
         with:
           api-level: 35
