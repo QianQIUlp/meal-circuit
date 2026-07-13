@@ -1,0 +1,7 @@
+# Direct desktop/build dependencies. Platform-specific transitive packages are
+# resolved by pip on the native runner; every public direct dependency is exact.
+cryptography==49.0.0
+keyring==25.7.0
+pyinstaller==6.21.0
+pywebview==6.2.1
+tzdata==2026.3; sys_platform == "win32"

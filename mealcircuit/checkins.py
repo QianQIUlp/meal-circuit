@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 
+from .contracts import load_contract
 from .validation import ValidationError
 
 
@@ -56,6 +57,42 @@ QUESTIONS = {
         {"id": "timing", "label": "症状主要在什么时候出现？", "type": "multi", "options": _options(("morning", "早晨"), ("after_meal", "餐后"), ("afternoon", "下午"), ("evening", "晚间"), ("ongoing", "全天持续")), "when": ("gut_state", {"symptoms"})},
         {"id": "bowel_state", "label": "今天的排便情况更接近哪种？", "type": "single", "options": _options(("normal", "正常"), ("loose", "偏稀"), ("hard", "偏硬"), ("none", "今天没有排便"), ("not_relevant", "不确定或不相关")), "when": ("gut_state", {"symptoms"})},
     ],
+}
+
+
+# The shared contract is authoritative.  The literal definitions above remain
+# readable for old source distributions, while every supported build replaces
+# them from the same JSON consumed by Android.
+_CHECKIN_CONTRACT = load_contract("checkin-modules-v1.json")
+SCHEMA_VERSION = int(_CHECKIN_CONTRACT["schema_version"])
+MODULES = tuple(
+    {
+        "key": module["key"],
+        "label": module["label"],
+        "description": module["description"],
+        "max_steps": len(module["questions"]),
+    }
+    for module in _CHECKIN_CONTRACT["modules"]
+)
+MODULE_BY_KEY = {item["key"]: item for item in MODULES}
+
+
+def _contract_question(value: dict) -> dict:
+    question = deepcopy(value)
+    condition = question.pop("when", None)
+    if condition:
+        question["when"] = (condition["question_id"], set(condition["values"]))
+    contains = question.pop("when_contains", None)
+    if contains:
+        question["when_contains"] = (contains["question_id"], contains["value"])
+    if "step" in question:
+        question["step"] = str(question["step"])
+    return question
+
+
+QUESTIONS = {
+    module["key"]: [_contract_question(question) for question in module["questions"]]
+    for module in _CHECKIN_CONTRACT["modules"]
 }
 
 

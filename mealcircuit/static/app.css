@@ -151,6 +151,7 @@ code { color: var(--accent-strong); }
 .icon-up { --icon: url("/assets/ui/icons/chevron-up.svg"); }
 .icon-down { --icon: url("/assets/ui/icons/chevron-down.svg"); }
 .icon-settings { --icon: url("/assets/ui/icons/settings.svg"); }
+.icon-sync { --icon: url("/assets/ui/icons/hard-drive.svg"); }
 .icon-alert { --icon: url("/assets/ui/icons/triangle-alert.svg"); }
 .icon-sun { --icon: url("/assets/ui/icons/sun.svg"); }
 .icon-moon { --icon: url("/assets/ui/icons/moon.svg"); }

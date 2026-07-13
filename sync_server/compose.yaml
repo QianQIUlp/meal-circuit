@@ -1,0 +1,62 @@
+services:
+  db:
+    image: postgres:18-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: mealcircuit
+      POSTGRES_USER: mealcircuit
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+    volumes:
+      - postgres-data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mealcircuit"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  sync:
+    build:
+      context: ..
+      dockerfile: sync_server/Dockerfile
+    restart: unless-stopped
+    environment:
+      MEALCIRCUIT_SYNC_DATABASE_URL: postgresql+psycopg://mealcircuit:${POSTGRES_PASSWORD}@db/mealcircuit
+      MEALCIRCUIT_SYNC_BLOB_ROOT: /var/lib/mealcircuit-sync/blobs
+      MEALCIRCUIT_SYNC_REGISTRATION_MODE: ${REGISTRATION_MODE:-first-user}
+      MEALCIRCUIT_SYNC_QUOTA_BYTES: ${QUOTA_BYTES:-10737418240}
+    volumes:
+      - blob-data:/var/lib/mealcircuit-sync/blobs
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8080:8080"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  caddy:
+    image: caddy:2-alpine
+    profiles: ["https"]
+    restart: unless-stopped
+    environment:
+      SYNC_HOSTNAME: ${SYNC_HOSTNAME:?set SYNC_HOSTNAME}
+      CADDY_EMAIL: ${CADDY_EMAIL:?set CADDY_EMAIL}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      sync:
+        condition: service_healthy
+    ports:
+      - "80:80"
+      - "443:443"
+
+volumes:
+  postgres-data:
+  blob-data:
+  caddy-data:
+  caddy-config:

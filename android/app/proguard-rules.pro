@@ -1,0 +1,3 @@
+-keepattributes *Annotation*
+-keep class org.mealcircuit.app.domain.** { *; }
+-dontwarn org.conscrypt.**

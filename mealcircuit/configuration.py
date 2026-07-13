@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .meal_modes import legacy_home_meal_modes, meal_modes_are_valid
 from .storage import (
@@ -17,6 +20,7 @@ from .storage import (
 from .validation import ValidationError
 
 
+SETTINGS_SCHEMA_VERSION = 1
 SETTING_FIELDS = (
     "meal_environment",
     "protein_target_g",
@@ -46,7 +50,29 @@ HOME_COOKING_EQUIPMENT = {"rice_cooker", "stovetop_pan", "stovetop_pot", "refrig
 def validate_settings(value: object, *, allow_missing_protein: bool = False) -> dict:
     if not isinstance(value, dict):
         raise ValidationError("settings.json 顶层必须是对象")
+    raw_version = value.get("schema_version", 0)
+    if not isinstance(raw_version, int) or isinstance(raw_version, bool) or raw_version not in {0, SETTINGS_SCHEMA_VERSION}:
+        raise ValidationError(f"不支持的 settings schema_version：{raw_version}")
+    timezone_name = value.get("timezone", "UTC")
+    if not isinstance(timezone_name, str) or not timezone_name.strip():
+        raise ValidationError("timezone 必须是 IANA 时区名称")
+    timezone_name = timezone_name.strip()
+    if timezone_name != "UTC":
+        try:
+            ZoneInfo(timezone_name)
+        except ZoneInfoNotFoundError as exc:
+            # Windows Python does not ship the IANA database. Keep validation strict
+            # when tzdata exists, and otherwise accept only a well-formed IANA key.
+            try:
+                ZoneInfo("Etc/UTC")
+            except ZoneInfoNotFoundError:
+                if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_+-]+(?:/[A-Za-z0-9_+.-]+)+", timezone_name):
+                    raise ValidationError(f"timezone 不是有效的 IANA 时区名称：{timezone_name}") from exc
+            else:
+                raise ValidationError(f"timezone 不是可用的 IANA 时区：{timezone_name}") from exc
     settings = {key: value.get(key) for key in SETTING_FIELDS}
+    settings["schema_version"] = SETTINGS_SCHEMA_VERSION
+    settings["timezone"] = timezone_name
     settings["home_cooking"] = _validate_home_cooking(value.get("home_cooking"))
     target = settings["protein_target_g"]
     if target is None and allow_missing_protein:
@@ -136,6 +162,31 @@ def load_resolved_settings() -> dict:
     return resolved_settings(settings)
 
 
+def configured_today(settings: dict | None = None) -> date:
+    if settings is not None:
+        value = settings
+    elif settings_path().is_file():
+        value = load_settings(allow_missing_protein=True)
+    else:
+        # A brand-new installation must be able to render onboarding before
+        # private settings exist. Invalid existing settings still fail above.
+        value = {"timezone": "UTC"}
+    timezone_name = str(value.get("timezone") or "UTC")
+    # UTC is part of the standard library and must keep source checkouts usable on
+    # Windows even before the package-managed ``tzdata`` dependency is installed.
+    if timezone_name == "UTC":
+        return datetime.now(timezone.utc).date()
+    try:
+        timezone_value = ZoneInfo(timezone_name)
+    except ZoneInfoNotFoundError as exc:
+        if timezone_name in {"Asia/Shanghai", "Asia/Singapore"}:
+            return datetime.now(timezone(timedelta(hours=8))).date()
+        raise ValidationError(
+            f"缺少 IANA 时区数据，无法按 {timezone_name} 判断今天；请安装 tzdata 或改用 UTC"
+        ) from exc
+    return datetime.now(timezone_value).date()
+
+
 def load_doctrine() -> dict:
     private_path = private_doctrine_path()
     if private_path.is_file():
@@ -175,7 +226,7 @@ def initialize_private_home() -> dict:
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(source, target)
         created.append(str(target))
-    for directory in ("uploads", "food-labels", "exports", "backups", "archive/tmp-imports"):
+    for directory in ("uploads", "food-labels", "assets", "exports", "backups", "archive/tmp-imports"):
         target = home / directory
         existed = target.exists()
         target.mkdir(parents=True, exist_ok=True)
@@ -210,6 +261,16 @@ def configuration_status() -> dict:
         onboarding = onboarding_status()
     except (ValidationError, OSError):
         onboarding = {"status": "unavailable", "safety_mode": "setup_required"}
+    unresolved_assets: list[str] = []
+    try:
+        from .db import connect, init_db
+        from .domain_store import unresolved_asset_references
+
+        init_db()
+        with connect() as connection:
+            unresolved_assets = unresolved_asset_references(connection)
+    except (OSError, RuntimeError, ValidationError):
+        pass
     return {
         "home": str(app_home()),
         "database": str(db_path()),
@@ -220,4 +281,5 @@ def configuration_status() -> dict:
         "ai": ai,
         "ai_error": ai_error,
         "onboarding": onboarding,
+        "unresolved_assets": unresolved_assets,
     }

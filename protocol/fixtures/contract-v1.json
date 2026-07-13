@@ -1,0 +1,170 @@
+{
+  "context": {
+    "window_days": 14,
+    "required_task_keys": [
+      "task",
+      "task_input",
+      "source_revisions",
+      "recent_records",
+      "recent_checkins",
+      "food_library_matches",
+      "long_term_memories",
+      "current_adjustments",
+      "preferences",
+      "result_schema"
+    ],
+    "required_daily_keys": [
+      "source_revisions",
+      "recent_records",
+      "recent_checkins",
+      "priority_foods",
+      "ingredient_carryover_obligations",
+      "long_term_memories",
+      "current_adjustments",
+      "settings",
+      "result_schema"
+    ]
+  },
+  "photo_result": {
+    "summary": "一份可见的主食和蛋白组合，数量只能区间估算。",
+    "candidates": [
+      {
+        "name": "鸡肉米饭",
+        "portion_range": "鸡肉约 100–150g，米饭约 150–220g",
+        "nutrition": {
+          "energy_kcal": [420, 650],
+          "protein_g": [30, 48],
+          "carbs_g": [45, 75],
+          "fat_g": [8, 24]
+        },
+        "confidence": 0.74
+      }
+    ],
+    "unknowns": ["烹调油和酱汁用量不可见"],
+    "advice": ["保持标准份量，不为估算误差补偿性节食"]
+  },
+  "material_result": {
+    "summary": "现有食材可组成一份蛋白主菜和基础主食。",
+    "combinations": ["鸡肉、米饭和西兰花"],
+    "batch_nutrition": {
+      "energy_kcal": [900, 1180],
+      "protein_g": [82, 105],
+      "carbs_g": [105, 145],
+      "fat_g": [18, 36]
+    },
+    "per_serving_nutrition": {
+      "energy_kcal": [450, 590],
+      "protein_g": [41, 53],
+      "carbs_g": [52, 73],
+      "fat_g": [9, 18]
+    },
+    "gaps": ["缺少确认后的烹调油用量"],
+    "risks": ["酱汁可能提高钠摄入"],
+    "minimal_adjustments": ["优先增加蔬菜，不额外堆叠蛋白加餐"]
+  },
+  "daily": {
+    "tomorrow": "2026-07-11",
+    "settings": {
+      "meal_environment": "食堂与宿舍",
+      "protein_target_g": [100, 130],
+      "home_cooking": {"enabled": false}
+    },
+    "priority_food_ids": ["food_fixture-priority"],
+    "carryovers": [
+      {"id": "carryover_fixture-tomato", "ingredient": "番茄"}
+    ],
+    "result": {
+      "system_status": "observe",
+      "facts": ["今日已有两个明确蛋白来源"],
+      "inferences": ["无需为了目标数字机械追加加餐"],
+      "core_advice": ["明天保持三餐，只撤掉重复加餐"],
+      "do_not_adjust": ["不跳餐、不清零主食、不极端压低热量"],
+      "risk_signals": ["外食酱汁用量未知"],
+      "priority_food_decisions": [
+        {
+          "food_id": "food_fixture-priority",
+          "decision": "use",
+          "reason": "作为低摩擦早餐主食"
+        }
+      ],
+      "ingredient_carryover_decisions": [
+        {
+          "carryover_id": "carryover_fixture-tomato",
+          "ingredient": "番茄",
+          "decision": "use",
+          "reason": "处于计划复用窗口内",
+          "planned_use": "次日午餐配菜"
+        }
+      ],
+      "tomorrow_menu": {
+        "date": "2026-07-11",
+        "environment": "食堂与宿舍",
+        "protein_target_g": [100, 130],
+        "meals": [
+          {
+            "name": "早餐",
+            "foods": ["鸡蛋", "燕麦"],
+            "portion_guidance": "鸡蛋 2 个，燕麦 1 碗",
+            "protein_g": [20, 28],
+            "substitutions": ["无糖豆浆替换一个鸡蛋"]
+          },
+          {
+            "name": "午餐",
+            "foods": ["食堂瘦肉主菜", "米饭", "蔬菜"],
+            "portion_guidance": "1.5 掌蛋白、1 拳主食、2 拳蔬菜",
+            "protein_g": [38, 50],
+            "substitutions": ["鱼类替换瘦肉"]
+          },
+          {
+            "name": "晚餐",
+            "foods": ["豆腐", "鸡肉", "蔬菜"],
+            "portion_guidance": "总计约 1.5 掌蛋白并保留标准主食",
+            "protein_g": [42, 55],
+            "substitutions": ["鸡蛋替换部分鸡肉"]
+          }
+        ],
+        "conditional_snack": {
+          "condition": "三餐后仍未达到蛋白目标下界且确有饥饿",
+          "options": ["无糖酸奶", "无糖豆浆"]
+        },
+        "training_adjustment": "训练前后增加 0.5–1 拳主食。",
+        "gut_adjustment": "出现不适时降低油、辣、酸并保留基础三餐。"
+      },
+      "one_line_review": "保持标准三餐，撤掉重复加餐。"
+    }
+  },
+  "merge_cases": [
+    {
+      "name": "disjoint_fields",
+      "base": {"name": "燕麦", "protein": 10},
+      "local": {"name": "全谷燕麦", "protein": 10},
+      "remote": {"name": "燕麦", "protein": 13},
+      "expected": {"name": "全谷燕麦", "protein": 13},
+      "conflicts": []
+    },
+    {
+      "name": "same_field",
+      "base": {"name": "燕麦"},
+      "local": {"name": "A"},
+      "remote": {"name": "B"},
+      "expected": {"name": "A"},
+      "conflicts": ["name"]
+    },
+    {
+      "name": "identified_array",
+      "base": {"items": [{"id": "one", "name": "燕麦", "protein": 10}]},
+      "local": {"items": [{"id": "one", "name": "全谷燕麦", "protein": 10}]},
+      "remote": {"items": [{"id": "one", "name": "燕麦", "protein": 13}]},
+      "expected": {"items": [{"id": "one", "name": "全谷燕麦", "protein": 13}]},
+      "conflicts": []
+    },
+    {
+      "name": "identified_array_conflict",
+      "base": {"items": [{"id": "one", "name": "燕麦"}]},
+      "local": {"items": [{"id": "one", "name": "A"}]},
+      "remote": {"items": [{"id": "one", "name": "B"}]},
+      "expected": {"items": [{"id": "one", "name": "A"}]},
+      "conflicts": ["items[one].name"]
+    }
+  ]
+}

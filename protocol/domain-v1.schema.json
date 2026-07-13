@@ -1,0 +1,102 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mealcircuit.local/protocol/domain-v1.schema.json",
+  "title": "MealCircuit Domain Revision v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "entity_id",
+    "entity_kind",
+    "revision_id",
+    "parent_revision_ids",
+    "created_at",
+    "author_device_id",
+    "deleted",
+    "payload"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "entity_id": { "$ref": "#/$defs/id" },
+    "entity_kind": {
+      "enum": [
+        "task",
+        "task_input",
+        "analysis_result",
+        "correction",
+        "food_item",
+        "daily_record",
+        "checkin_day",
+        "checkin_draft",
+        "daily_review",
+        "memory",
+        "adjustment",
+        "preferences",
+        "asset"
+      ]
+    },
+    "revision_id": { "$ref": "#/$defs/id" },
+    "parent_revision_ids": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/id" }
+    },
+    "created_at": { "type": "string", "format": "date-time" },
+    "author_device_id": { "$ref": "#/$defs/id" },
+    "deleted": { "type": "boolean" },
+    "payload": { "type": "object" }
+  },
+  "allOf": [
+    {"if": {"properties": {"entity_kind": {"const": "task"}}}, "then": {"properties": {"payload": {"$ref": "#/$defs/taskPayload"}}}},
+    {"if": {"properties": {"entity_kind": {"const": "task_input"}}}, "then": {"properties": {"payload": {"$ref": "#/$defs/taskInputPayload"}}}},
+    {"if": {"properties": {"entity_kind": {"const": "analysis_result"}}}, "then": {"properties": {"payload": {"$ref": "#/$defs/resultPayload"}}}},
+    {"if": {"properties": {"entity_kind": {"const": "correction"}}}, "then": {"properties": {"payload": {"$ref": "#/$defs/correctionPayload"}}}},
+    {"if": {"properties": {"entity_kind": {"const": "food_item"}}}, "then": {"properties": {"payload": {"$ref": "#/$defs/foodPayload"}}}},
+    {"if": {"properties": {"entity_kind": {"const": "daily_record"}}}, "then": {"properties": {"payload": {"$ref": "#/$defs/dailyRecordPayload"}}}},
+    {"if": {"properties": {"entity_kind": {"enum": ["checkin_day", "checkin_draft"]}}}, "then": {"properties": {"payload": {"$ref": "#/$defs/checkinPayload"}}}},
+    {"if": {"properties": {"entity_kind": {"const": "daily_review"}}}, "then": {"properties": {"payload": {"$ref": "#/$defs/dailyReviewPayload"}}}},
+    {"if": {"properties": {"entity_kind": {"const": "memory"}}}, "then": {"properties": {"payload": {"$ref": "#/$defs/memoryPayload"}}}},
+    {"if": {"properties": {"entity_kind": {"const": "adjustment"}}}, "then": {"properties": {"payload": {"$ref": "#/$defs/adjustmentPayload"}}}},
+    {"if": {"properties": {"entity_kind": {"const": "preferences"}}}, "then": {"properties": {"payload": {"$ref": "#/$defs/preferencesPayload"}}}},
+    {"if": {"properties": {"entity_kind": {"const": "asset"}}}, "then": {"properties": {"payload": {"$ref": "#/$defs/assetPayload"}}}}
+  ],
+  "$defs": {
+    "id": {
+      "type": "string",
+      "pattern": "^[A-Za-z][A-Za-z0-9_-]{0,95}$"
+    },
+    "taskPayload": {
+      "type": "object", "required": ["task"],
+      "properties": {"task": {"type": "object", "required": ["id", "type", "status", "created_at"], "properties": {"id": {"$ref": "#/$defs/id"}, "type": {"enum": ["photo", "material"]}, "status": {"enum": ["pending", "completed"]}, "created_at": {"type": "string", "format": "date-time"}}}}
+    },
+    "taskInputPayload": {
+      "type": "object", "required": ["task_id", "task_type", "input_version", "original_input", "input_history"],
+      "properties": {"task_id": {"$ref": "#/$defs/id"}, "task_type": {"enum": ["photo", "material"]}, "input_version": {"type": "integer", "minimum": 1}, "original_input": {"type": "string"}, "input_history": {"type": "array"}, "asset_id": {"$ref": "#/$defs/id"}}
+    },
+    "resultPayload": {
+      "type": "object", "required": ["source_entity_id", "source_kind", "result_version", "result", "provenance"],
+      "properties": {"source_entity_id": {"$ref": "#/$defs/id"}, "source_kind": {"type": "string"}, "result_version": {"type": "integer", "minimum": 1}, "result": {"type": "object"}, "provenance": {"type": "object"}}
+    },
+    "correctionPayload": {"type": "object", "required": ["id", "task_id", "correction_json", "created_at"]},
+    "foodPayload": {
+      "type": "object", "required": ["food", "history"],
+      "properties": {"food": {"type": "object", "required": ["id", "name", "basis", "created_at", "updated_at"]}, "history": {"type": "array"}}
+    },
+    "dailyRecordPayload": {
+      "type": "object", "required": ["id", "record_date", "raw_input", "created_at"],
+      "properties": {"id": {"$ref": "#/$defs/id"}, "record_date": {"type": "string", "format": "date"}, "raw_input": {"type": "string"}, "created_at": {"type": "string", "format": "date-time"}}
+    },
+    "checkinPayload": {
+      "type": "object", "required": ["checkin", "modules"],
+      "properties": {"checkin": {"type": "object", "required": ["id", "checkin_date", "created_at", "updated_at"]}, "modules": {"type": "array", "items": {"type": "object", "required": ["module", "history"]}}}
+    },
+    "dailyReviewPayload": {
+      "type": "object", "required": ["review", "history"],
+      "properties": {"review": {"type": "object", "required": ["id", "review_date", "status", "source_record_ids_json", "result_version", "created_at", "updated_at"]}, "history": {"type": "array"}}
+    },
+    "memoryPayload": {"type": "object", "required": ["id", "kind", "content", "active", "created_at", "updated_at"]},
+    "adjustmentPayload": {"type": "object", "required": ["id", "content", "active", "created_at", "updated_at"]},
+    "preferencesPayload": {"type": "object", "required": ["kind", "content"], "properties": {"kind": {"enum": ["profile", "settings", "doctrine", "checkin_settings"]}}},
+    "assetPayload": {"type": "object", "required": ["sha256", "media_type", "extension", "byte_count"]}
+  }
+}

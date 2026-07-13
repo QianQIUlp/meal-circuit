@@ -66,27 +66,27 @@ def validate_result(task_type: str, value: Any, *, fact_only: bool = False) -> d
             if not isinstance(confidence, (int, float)) or isinstance(confidence, bool) or not 0 <= confidence <= 1:
                 raise ValidationError(f"candidates[{i}].confidence 必须在 0 到 1 之间")
             _validate_nutrition(item.get("nutrition"), f"candidates[{i}].nutrition")
-        _required_list(obj.get("unknowns"), "unknowns")
+        _text_list(obj.get("unknowns"), "unknowns")
         if fact_only:
             if "advice" in obj:
                 raise ValidationError("事实型照片结果不得包含 advice 字段")
         else:
-            _required_list(obj.get("advice"), "advice")
+            _text_list(obj.get("advice"), "advice")
     elif task_type == "material":
         if fact_only:
-            _required_list(obj.get("observed_items"), "observed_items")
-            _required_list(obj.get("unknowns"), "unknowns")
+            _text_list(obj.get("observed_items"), "observed_items")
+            _text_list(obj.get("unknowns"), "unknowns")
             for forbidden in ("combinations", "minimal_adjustments"):
                 if forbidden in obj:
                     raise ValidationError(f"事实型原材料结果不得包含 {forbidden} 字段")
         else:
-            _required_list(obj.get("combinations"), "combinations")
+            _text_list(obj.get("combinations"), "combinations")
         _validate_nutrition(obj.get("batch_nutrition"), "batch_nutrition")
         _validate_nutrition(obj.get("per_serving_nutrition"), "per_serving_nutrition")
-        _required_list(obj.get("gaps"), "gaps")
-        _required_list(obj.get("risks"), "risks")
+        _text_list(obj.get("gaps"), "gaps")
+        _text_list(obj.get("risks"), "risks")
         if not fact_only:
-            _required_list(obj.get("minimal_adjustments"), "minimal_adjustments")
+            _text_list(obj.get("minimal_adjustments"), "minimal_adjustments")
     else:
         raise ValidationError(f"未知任务类型：{task_type}")
     return obj

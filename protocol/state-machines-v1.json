@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "machines": {
+    "task": {
+      "initial": "pending",
+      "terminal": ["completed"],
+      "transitions": {
+        "pending": ["pending", "completed"],
+        "completed": ["completed"]
+      }
+    },
+    "daily_review": {
+      "initial": "pending",
+      "terminal": [],
+      "transitions": {
+        "pending": ["pending", "completed"],
+        "completed": ["completed", "pending"]
+      }
+    },
+    "checkin_module": {
+      "initial": "not_started",
+      "terminal": [],
+      "transitions": {
+        "not_started": ["not_started", "in_progress", "completed", "skipped"],
+        "in_progress": ["not_started", "in_progress", "completed", "skipped"],
+        "completed": ["completed", "in_progress", "skipped"],
+        "skipped": ["skipped", "in_progress", "completed"]
+      }
+    },
+    "managed_asset": {
+      "initial": "local",
+      "terminal": [],
+      "transitions": {
+        "local": ["local", "uploading", "unresolved"],
+        "uploading": ["local", "uploading", "synced"],
+        "synced": ["synced", "local"],
+        "unresolved": ["unresolved", "local"]
+      }
+    }
+  }
+}

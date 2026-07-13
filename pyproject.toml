@@ -1,0 +1,64 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mealcircuit"
+version = "0.3.0"
+description = "Local-first long-horizon meal feedback workbench"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "MealCircuit contributors" }]
+dependencies = [
+  "tzdata>=2026.3,<2027; platform_system == 'Windows'"
+]
+
+[project.optional-dependencies]
+sync = [
+  "cryptography>=45,<50",
+  "keyring>=25,<27"
+]
+desktop = [
+  "cryptography>=45,<50",
+  "keyring>=25,<27",
+  "pywebview>=5.4,<7",
+  "pyinstaller>=6.20,<7"
+]
+server = [
+  "fastapi>=0.116,<1",
+  "uvicorn[standard]>=0.35,<1",
+  "pydantic>=2.11,<3",
+  "sqlalchemy>=2.0,<3",
+  "alembic>=1.16,<2",
+  "psycopg[binary]>=3.2,<4",
+  "argon2-cffi>=25,<26",
+  "httpx>=0.28,<1"
+]
+
+[project.scripts]
+mealcircuit = "mealcircuit.agent_cli:main"
+mealcircuit-web = "mealcircuit.server:main"
+mealcircuit-desktop = "mealcircuit.desktop:main"
+mealcircuit-sync-admin = "sync_server.admin:main"
+
+[dependency-groups]
+dev = [
+  "jsonschema==4.25.1",
+  "pip-audit==2.10.1"
+]
+
+[tool.setuptools.packages.find]
+include = ["mealcircuit*", "sync_server*"]
+
+[tool.setuptools.package-data]
+mealcircuit = ["static/**/*"]
+sync_server = ["alembic.ini", "Caddyfile", "alembic/**/*"]
+
+[tool.setuptools.data-files]
+"share/mealcircuit/protocol" = [
+  "protocol/checkin-modules-v1.json",
+  "protocol/domain-v1.schema.json",
+  "protocol/state-machines-v1.json",
+  "protocol/sync-v1.openapi.json"
+]
