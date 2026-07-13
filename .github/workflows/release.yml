@@ -21,19 +21,14 @@ jobs:
   windows:
     runs-on: windows-latest
     env:
-      WINDOWS_SIGNING_AVAILABLE: ${{ secrets.WINDOWS_CERTIFICATE_BASE64 != '' }}
+      WINDOWS_SIGNING_AVAILABLE: ${{ secrets.WINDOWS_CERTIFICATE_BASE64 != '' && secrets.WINDOWS_CERTIFICATE_PASSWORD != '' }}
     steps:
       - uses: actions/checkout@v4
-      - name: Require Authenticode secrets for tagged releases
-        if: startsWith(github.ref, 'refs/tags/v')
+      - name: Warn when Windows tagged release is unsigned
+        if: startsWith(github.ref, 'refs/tags/v') && env.WINDOWS_SIGNING_AVAILABLE != 'true'
         shell: pwsh
-        env:
-          WINDOWS_CERTIFICATE_BASE64: ${{ secrets.WINDOWS_CERTIFICATE_BASE64 }}
-          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
         run: |
-          if (-not $env:WINDOWS_CERTIFICATE_BASE64 -or -not $env:WINDOWS_CERTIFICATE_PASSWORD) {
-            throw "Tagged releases require Windows Authenticode secrets"
-          }
+          Write-Output "::warning::Windows portable ZIP and installer will be published unsigned; Windows may show Unknown Publisher."
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
@@ -130,22 +125,13 @@ jobs:
     needs: macos-build
     runs-on: macos-15
     env:
-      APPLE_SIGNING_AVAILABLE: ${{ secrets.APPLE_CERTIFICATE_BASE64 != '' }}
+      APPLE_SIGNING_AVAILABLE: ${{ secrets.APPLE_CERTIFICATE_BASE64 != '' && secrets.APPLE_CERTIFICATE_PASSWORD != '' && secrets.APPLE_SIGNING_IDENTITY != '' && secrets.APPLE_ID != '' && secrets.APPLE_APP_PASSWORD != '' && secrets.APPLE_TEAM_ID != '' }}
     steps:
       - uses: actions/checkout@v4
-      - name: Require Apple signing secrets for tagged releases
-        if: startsWith(github.ref, 'refs/tags/v')
-        env:
-          APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      - name: Warn when macOS tagged release lacks Developer ID signing
+        if: startsWith(github.ref, 'refs/tags/v') && env.APPLE_SIGNING_AVAILABLE != 'true'
         run: |
-          test -n "$APPLE_CERTIFICATE_BASE64" && test -n "$APPLE_CERTIFICATE_PASSWORD"
-          test -n "$APPLE_SIGNING_IDENTITY" && test -n "$APPLE_ID"
-          test -n "$APPLE_APP_PASSWORD" && test -n "$APPLE_TEAM_ID"
+          echo "::warning::macOS DMG will contain an ad-hoc signed app without Apple Developer ID signing or notarization."
       - uses: actions/download-artifact@v4
         with:
           pattern: macos-app-*
@@ -232,7 +218,7 @@ jobs:
   android:
     runs-on: ubuntu-latest
     env:
-      ANDROID_SIGNING_AVAILABLE: ${{ secrets.ANDROID_KEYSTORE_BASE64 != '' }}
+      ANDROID_SIGNING_AVAILABLE: ${{ secrets.ANDROID_KEYSTORE_BASE64 != '' && secrets.ANDROID_KEYSTORE_PASSWORD != '' && secrets.ANDROID_KEY_ALIAS != '' && secrets.ANDROID_KEY_PASSWORD != '' }}
     steps:
       - uses: actions/checkout@v4
       - name: Require Android signing secrets for tagged releases
