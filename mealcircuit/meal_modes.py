@@ -7,6 +7,7 @@ MEAL_KEYS = ("breakfast", "lunch", "dinner")
 MEAL_NAMES = {"breakfast": "早餐", "lunch": "午餐", "dinner": "晚餐"}
 MEAL_KEYS_BY_NAME = {value: key for key, value in MEAL_NAMES.items()}
 PREPARATION_MODES = {"home_cook", "quick_assembly", "eat_out"}
+MEAL_MODE_LABELS = {"home_cook": "独居下厨", "quick_assembly": "快速组装", "eat_out": "外食"}
 LEGACY_DEFAULT_MEAL_MODES = {
     "breakfast": "quick_assembly",
     "lunch": "eat_out",
@@ -49,3 +50,7 @@ def meal_modes_are_valid(value: Any) -> bool:
         and set(value) == set(MEAL_KEYS)
         and all(value[key] in PREPARATION_MODES for key in MEAL_KEYS)
     )
+
+
+def meal_environment_for_modes(modes: dict[str, str]) -> str:
+    return "、".join(f"{MEAL_NAMES[key]}{MEAL_MODE_LABELS[modes[key]]}" for key in MEAL_KEYS)

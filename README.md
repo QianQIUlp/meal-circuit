@@ -77,6 +77,8 @@ All analysis results must pass JSON Schema-level structural validation before th
 
 The daily menu always covers breakfast, lunch, dinner, a conditional snack, training-day adjustments, and gut-symptom adjustments. During onboarding, each person chooses `home_cook`, `quick_assembly`, or `eat_out` separately for breakfast, lunch, and dinner; this is stored in their versioned personal strategy rather than fixed by repository defaults. Every home-cooked meal gets its own beginner-friendly single-serving execution card, while shopping, online filtering, and three-day ingredient reuse remain coordinated across the day. The system reads recent completed home meals by meal slot plus likely carryover ingredients and rotates dishes and flavor profiles independently for each slot.
 
+A next-day per-meal answer can temporarily override those defaults for one date. `day-context.meal_mode_resolution` records the defaults, explicit overrides, effective modes, target date, and question version. An `eat_out` meal renders concrete protein/staple/vegetable/sauce guidance and cannot contain a home recipe; unanswered meals inherit the personal strategy, and legacy `mixed` answers are not guessed.
+
 “Today Status” shows five daily modules by default. You answer one question at a time, and single-question drafts are preserved automatically; only after a full module is completed do its answers enter the agent context and re-queue the daily review. Modules can be hidden, reordered, or switched to on-demand recording in “Adjust Modules”. An explicit skip only means the user did not provide the information; the system does not infer “no training” or “no symptoms” from that.
 
 ## Independent Devices and Optional Sync
@@ -273,6 +275,8 @@ flowchart LR
 | **记录与记忆** | 保存每日饮食、长期趋势、当前调整和复盘版本历史 |
 
 每日菜单固定覆盖早餐、午餐、晚餐、条件加餐、训练日调整和肠胃异常调整。初始化时，用户分别为早餐、午餐和晚餐选择“在家下厨”“快速组装”或“外食”；这些选择保存在版本化个人策略中，而不是写死在仓库默认配置里。每个在家下厨餐次都有独立的一人份新手执行卡，同时共享采购清单、网购筛选关键词和三日食材复用方向。系统按餐次读取近期已完成菜单并独立轮换菜式和主风味。
+
+次日逐餐问答可以只覆盖某一天的默认方式。`day-context.meal_mode_resolution` 会保存长期默认、明确覆盖、最终有效方式、目标日期和问题版本。外食餐次直接显示蛋白、主食、蔬菜与酱汁选择规则，并禁止携带自炊菜谱；未指定餐次继续沿用个人策略，旧 `mixed` 答案不会被猜成具体餐次。
 
 “今日状态”默认显示五个每日模块。每次只回答一个问题，单题草稿会自动保留；完成整个模块后，答案才会进入 Agent 上下文并重新排队当日复盘。模块可以在“调整模块”中隐藏、排序或改为按需记录。明确跳过只表示用户不提供，系统不会据此推断“未训练”或“没有症状”。
 

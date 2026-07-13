@@ -126,6 +126,14 @@ def compile_constraints(context: dict) -> list[dict]:
                 "value": event.get("answer_json"),
                 "source": "adaptive_question",
             })
+        elif key == "tomorrow_meal_modes":
+            compiled.append({
+                "id": f"question:{event['id']}",
+                "kind": "tomorrow_meal_modes",
+                "hard": True,
+                "value": event.get("answer_json"),
+                "source": "adaptive_question",
+            })
     return compiled
 
 

@@ -29,7 +29,7 @@
 8. 使用 `day-complete YYYY-MM-DD --file result.json` 提交，禁止直接改数据库绕过校验。
 9. `day-context` 中的 `priority_foods` 必须逐项评估；结果的 `priority_food_decisions` 必须覆盖全部高优先级食品，标明 `use` 或 `skip` 及具体原因。
 10. 高优先级只表示满足对应功能条件时优先；具体食品用途、份量和跳过条件必须读取食品库及私人设置，不得在公开规则中假定。
-11. 三餐的 `home_cook`、`quick_assembly` 或 `eat_out` 方式以版本化个人策略中的 `day-context.settings.meal_modes` 为准，不得由仓库规则固定。存在在家下厨餐次时，必须读取 `recent_home_meals`、`recent_online_categories` 和 `home_cooking_generation_protocol`；每个 `home_cook` 餐次分别生成一人份新手执行卡，并完整提供共享采购、网购筛选和三日食材复用信息。
+11. 三餐的长期默认方式来自版本化个人策略；`day-context.meal_mode_resolution.overrides` 中明确的单日安排优先，最终必须严格采用 `effective_meal_modes`。`eat_out` 餐次提供外食选择规则且不得生成 `recipe_card`；每个 `home_cook` 餐次分别生成一人份新手执行卡，并读取 `recent_home_meals`、`recent_online_categories` 和 `home_cooking_generation_protocol`。
 12. `ingredient_carryover_obligations` 是上一轮复用计划推导出的可能剩余食材；生成明日菜单前必须逐项评估，并在 `ingredient_carryover_decisions` 覆盖全部项目。可用且临近窗口结束的食材优先进入明日午餐或晚餐；若今日记录否定库存、已坏或与肠胃状态冲突，必须使用 `skip` 或 `discard` 写清原因。
 13. 每个在家下厨餐次均不得超过个人策略中的时间和炊具限制；同一餐次连续下厨不得重复菜品或主风味。确因健康恢复、临期食材或采购限制重复时，必须使用允许的 `repeat_reason` 明确说明，不得用“方便”笼统绕过轮换。
 

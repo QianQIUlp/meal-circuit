@@ -322,12 +322,20 @@ def render_plan_page(plan_date: str) -> str:
             f'炊具：{"、".join(execution.get("cookware") or [])}' if execution.get("cookware") else "",
         ]
         execution_html = " · ".join(item for item in execution_bits if item)
+        eat_out = meal.get("eat_out_guidance") or {}
+        eat_out_html = (
+            '<div class="notice"><strong>外食选择</strong>'
+            f'<p>蛋白：{esc(eat_out.get("protein_anchor"))}</p>'
+            f'<p>主食：{esc(eat_out.get("staple"))}；蔬菜：{esc(eat_out.get("vegetables"))}</p>'
+            f'<p>酱汁：{esc(eat_out.get("sauce_rule"))}；备选：{esc(eat_out.get("fallback"))}</p></div>'
+            if eat_out else ""
+        )
         current_status = feedback.get("status") if feedback else ""
         status_options = "".join(f'<option value="{key}"{_selected(current_status,key)}>{label}</option>' for key,label in FEEDBACK_LABELS.items())
         reason_checks = "".join(f'<label class="choice-row compact"><input type="checkbox" name="reason_codes" value="{key}"><span>{label}</span></label>' for key,label in REASON_LABELS.items())
         version = feedback.get("version", 0) if feedback else 0
         cards.append(f'''<article class="plan-card"><div class="section-header"><div><p class="eyebrow">{esc(meal.get('slot') or meal.get('meal_type') or '')}</p><h2>{esc(meal.get('name') or '未命名餐次')}</h2></div>{f'<span class="status completed">{esc(FEEDBACK_LABELS.get(current_status,current_status))}</span>' if feedback else '<span class="status pending">待回执</span>'}</div>
-        {f'<p><strong>份量：</strong>{esc(meal.get("portion_guidance"))}</p>' if meal.get('portion_guidance') else ''}{f'<p class="muted">{esc(execution_html)}</p>' if execution_html else ''}{f'<h3>食材</h3><ul>{detail}</ul>' if detail else ''}{f'<h3>执行步骤</h3><ol>{step_html}</ol>' if step_html else ''}
+        {f'<p><strong>方式：</strong>{esc(MEAL_MODE_LABELS.get(meal.get("mode"), meal.get("mode") or ""))}</p>' if meal.get('mode') else ''}{f'<p><strong>份量：</strong>{esc(meal.get("portion_guidance"))}</p>' if meal.get('portion_guidance') else ''}{eat_out_html}{f'<p class="muted">{esc(execution_html)}</p>' if execution_html else ''}{f'<h3>{"可选食物" if meal.get("mode")=="eat_out" else "食材"}</h3><ul>{detail}</ul>' if detail else ''}{f'<h3>执行步骤</h3><ol>{step_html}</ol>' if step_html else ''}
         <details class="feedback-box"{' open' if not feedback else ''}><summary>{'修订执行回执' if feedback else '记录实际执行结果'}</summary><form method="post" action="/plans/{esc(plan_date)}/{esc(meal['plan_item_id'])}/feedback"><input type="hidden" name="expected_version" value="{version}"><label>执行状态<select name="status" required><option value="">请选择</option>{status_options}</select></label><fieldset><legend>偏离原因（调整或未执行时必选）</legend><div class="option-grid">{reason_checks}</div></fieldset><label>实际怎么做的（可选）<textarea name="actual_text">{esc(feedback.get('actual_text','') if feedback else '')}</textarea></label><button type="submit">保存回执</button></form></details>
         {f'<form class="rescue-form" method="post" action="/rescue/start"><input type="hidden" name="plan_date" value="{esc(plan_date)}"><input type="hidden" name="plan_item_id" value="{esc(meal["plan_item_id"])}"><label>计划临时做不了怎么办？<select name="issue_code">{"".join(f"<option value={key!r}>{label}</option>" for key,label in RESCUE_LABELS.items())}</select></label><input name="input_text" aria-label="救场补充" placeholder="可补充当前手边条件"><button class="secondary" type="submit">生成救场任务</button></form>' if plan.get('scope_current') else ''}</article>''')
     stale = '' if plan.get('scope_current') else '<div class="form-error" role="alert"><strong>这是旧目标或策略版本的历史计划</strong><p>仍可补录实际执行结果，但不能据此生成新的救场建议。</p></div>'
@@ -336,6 +344,12 @@ def render_plan_page(plan_date: str) -> str:
 
 def render_questions_page(question_date: str) -> str:
     pending = adaptive.schedule_questions(question_date)
+    answered_modes = [
+        item for item in adaptive.question_events_for_date(question_date, include_pending=False)
+        if item.get("question_key") == "tomorrow_meal_modes" and item.get("status") == "answered"
+    ]
+    if answered_modes and not any(item.get("question_key") == "tomorrow_meal_modes" for item in pending):
+        pending.append(answered_modes[-1])
     if not pending:
         return f'<section class="panel quiet-success"><h1>{esc(question_date)} 没有待回答问题</h1><p>问题预算已用完，或当前没有会实质改变计划的未知项。</p><a class="button secondary" href="/">返回今天</a></section>'
     cards = []
@@ -348,10 +362,21 @@ def render_questions_page(question_date: str) -> str:
             statuses = "".join(f'<option value="{key}">{FEEDBACK_LABELS.get(key,key)}</option>' for key in schema.get("statuses", []))
             reasons = "".join(f'<label class="choice-row compact"><input type="checkbox" name="reason_codes" value="{key}"><span>{REASON_LABELS.get(key,key)}</span></label>' for key in schema.get("reason_codes", []))
             control = f'<label>执行状态<select name="feedback_status" required><option value="">请选择</option>{statuses}</select></label><fieldset><legend>偏离原因</legend><div class="option-grid">{reasons}</div></fieldset><label>补充<textarea name="actual_text"></textarea></label><button>保存答案</button>'
+        elif schema.get("kind") == "meal_mode_overrides":
+            labels = {"inherit": "沿用个人默认", "home_cook": "在家下厨", "quick_assembly": "快速组装", "eat_out": "外食"}
+            current = item.get("answer_json") or {}
+            selects = "".join(
+                f'<label>{meal_name}<select name="{key}_mode">'
+                + "".join(f'<option value="{mode}"{_selected(current.get(key, "inherit"), mode)}>{labels[mode]}</option>' for mode in schema.get("options", []))
+                + '</select></label>'
+                for key, meal_name in (("breakfast", "早餐"), ("lunch", "午餐"), ("dinner", "晚餐"))
+            )
+            control = f'<div class="row">{selects}</div><button>{"更新" if item.get("status") == "answered" else "保存"}明日逐餐安排</button>'
         else:
             options = "".join(f'<label class="choice-row"><input type="radio" name="answer" value="{esc(value)}" required><span>{esc(choice_labels.get(value,value))}</span></label>' for value in schema.get("options", []))
             control = f'<div class="option-list">{options}</div><button>保存答案</button>'
-        cards.append(f'''<article class="panel question-card"><p class="eyebrow">{esc(item['category'])}</p><h2>{esc(item.get('prompt') or item['reason'])}</h2><p>{esc(item['reason'])}</p><p class="muted">会影响：{esc(item['expected_impact'])}</p><form method="post" action="/questions/{esc(item['id'])}/answer"><input type="hidden" name="version" value="{esc(item['version'])}">{control}</form><form method="post" action="/questions/{esc(item['id'])}/skip"><input type="hidden" name="version" value="{esc(item['version'])}"><button class="link-button" type="submit">暂时跳过</button></form></article>''')
+        skip_form = '' if item.get("status") == "answered" else f'<form method="post" action="/questions/{esc(item["id"])}/skip"><input type="hidden" name="version" value="{esc(item["version"])}"><button class="link-button" type="submit">暂时跳过</button></form>'
+        cards.append(f'''<article class="panel question-card"><p class="eyebrow">{esc(item['category'])}</p><h2>{esc(item.get('prompt') or item['reason'])}</h2><p>{esc(item['reason'])}</p><p class="muted">会影响：{esc(item['expected_impact'])}</p><form method="post" action="/questions/{esc(item['id'])}/answer"><input type="hidden" name="version" value="{esc(item['version'])}">{control}</form>{skip_form}</article>''')
     return f'<section class="section-header"><div><p class="eyebrow">Question budget</p><h1>只补齐会改变行动的信息</h1><p class="muted">跳过会明确记录为未知，不会被推断成“否”。</p></div><span class="history-count">{len(cards)} 题</span></section><div class="question-list">{"".join(cards)}</div>'
 
 
@@ -1209,12 +1234,19 @@ def render_daily_review_result(result: dict) -> str:
         protein = meal["protein_g"]
         mode = MEAL_MODE_LABELS.get(meal.get("mode"), "")
         mode_html = f'<span class="meal-time">{esc(mode)}</span>' if mode else '<span class="meal-time">次日</span>'
+        eat_out = meal.get("eat_out_guidance") or {}
+        guidance_html = (
+            f'<p class="meal-foods"><strong>外食提醒：</strong>蛋白 {esc(eat_out.get("protein_anchor"))}；'
+            f'主食 {esc(eat_out.get("staple"))}；蔬菜 {esc(eat_out.get("vegetables"))}；'
+            f'酱汁 {esc(eat_out.get("sauce_rule"))}；备选 {esc(eat_out.get("fallback"))}</p>'
+            if eat_out else ""
+        )
         meals.append(
             '<li class="meal-item"><span class="meal-node" aria-hidden="true"></span>'
             f'<div class="meal-title"><span>{esc(meal["name"])}</span>{mode_html}</div>'
             f'<p class="meal-foods">{esc("、".join(meal["foods"]))}</p>'
             f'<p class="meal-foods">{esc(meal["portion_guidance"])} · 蛋白 {esc(protein[0])}–{esc(protein[1])}g</p>'
-            f'<p class="meal-foods">替换：{esc("、".join(meal["substitutions"]) or "无")}</p></li>'
+            f'<p class="meal-foods">替换：{esc("、".join(meal["substitutions"]) or "无")}</p>{guidance_html}</li>'
         )
     snack = menu["conditional_snack"]
     priority_decisions = []
@@ -1705,6 +1737,11 @@ class Handler(BaseHTTPRequestHandler):
                         "status": (values.get("feedback_status") or [""])[-1],
                         "reason_codes": values.get("reason_codes") or [],
                         "actual_text": (values.get("actual_text") or [""])[-1],
+                    }
+                elif schema.get("kind") == "meal_mode_overrides":
+                    answer = {
+                        key: (values.get(f"{key}_mode") or ["inherit"])[-1]
+                        for key in ("breakfast", "lunch", "dinner")
                     }
                 else:
                     answer = (values.get("answer") or [""])[-1]

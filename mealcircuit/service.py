@@ -4,6 +4,7 @@ import json
 import re
 import shutil
 import hashlib
+from copy import deepcopy
 from datetime import date, timedelta
 from pathlib import Path
 from typing import BinaryIO
@@ -27,6 +28,7 @@ from .meal_modes import (
     MEAL_NAMES,
     home_cooked_meal_names,
     legacy_home_meal_modes,
+    meal_environment_for_modes,
     meal_rotation,
 )
 from .storage import resolve_data_path, store_data_path, upload_root
@@ -1044,12 +1046,18 @@ def daily_review_schema(settings: dict | None = None) -> dict:
             "technique": "stable_string",
             "repeat_reason": "omit unless health_recovery|ingredient_expiry|shopping_constraint",
         }
+        eat_out_guidance = {
+            "protein_anchor": "string", "staple": "string", "vegetables": "string",
+            "sauce_rule": "string", "fallback": "string",
+        }
         schema["tomorrow_menu"]["meals"] = []
         for key in MEAL_KEYS:
             name, mode = MEAL_NAMES[key], meal_modes[key]
             meal_spec = {**meal_shape, "name": name, "mode": mode}
             if mode == "home_cook":
                 meal_spec.update({"recipe_card": recipe_card, "rotation": rotation_card})
+            elif mode == "eat_out":
+                meal_spec["eat_out_guidance"] = eat_out_guidance
             schema["tomorrow_menu"]["meals"].append(meal_spec)
         schema["tomorrow_menu"].update({
             "shopping_list": [{
@@ -1071,10 +1079,15 @@ def daily_review_schema(settings: dict | None = None) -> dict:
         }]
     elif settings.get("meal_modes"):
         meal_shape = schema["tomorrow_menu"]["meals"][0]
-        schema["tomorrow_menu"]["meals"] = [
-            {**meal_shape, "name": MEAL_NAMES[key], "mode": meal_modes[key]}
-            for key in MEAL_KEYS
-        ]
+        schema["tomorrow_menu"]["meals"] = []
+        for key in MEAL_KEYS:
+            meal_spec = {**meal_shape, "name": MEAL_NAMES[key], "mode": meal_modes[key]}
+            if meal_modes[key] == "eat_out":
+                meal_spec["eat_out_guidance"] = {
+                    "protein_anchor": "string", "staple": "string", "vegetables": "string",
+                    "sauce_rule": "string", "fallback": "string",
+                }
+            schema["tomorrow_menu"]["meals"].append(meal_spec)
     return schema
 
 
@@ -1216,6 +1229,48 @@ def _recent_review_rows_for_carryover(review_date: str, days: int = 14) -> list:
         ).fetchall()
 
 
+def _effective_meal_settings(settings: dict, planning_answers: list[dict], review_date: str) -> tuple[dict, dict]:
+    defaults = settings.get("meal_modes") or legacy_home_meal_modes(settings.get("home_cooking"))
+    effective = dict(defaults)
+    overrides: dict[str, str] = {}
+    source = None
+    for event in planning_answers:
+        if event.get("status") != "answered" or event.get("question_key") != "tomorrow_meal_modes":
+            continue
+        answer = event.get("answer_json") or {}
+        if not isinstance(answer, dict):
+            continue
+        candidate = {
+            key: answer.get(key) for key in MEAL_KEYS
+            if answer.get(key) in {"home_cook", "quick_assembly", "eat_out"}
+        }
+        overrides.update(candidate)
+        source = {"question_id": event["id"], "question_version": event["version"]}
+    effective.update(overrides)
+    resolved = deepcopy(settings)
+    if overrides:
+        resolved["meal_modes"] = effective
+        home = deepcopy(resolved.get("home_cooking") or {})
+        home["enabled"] = "home_cook" in effective.values()
+        home["meal_modes"] = effective
+        home_meals = [key for key in MEAL_KEYS if effective[key] == "home_cook"]
+        home["meal_scope"] = (
+            "dinner" if home_meals == ["dinner"] else
+            "lunch_and_dinner" if home_meals == ["lunch", "dinner"] else
+            "custom"
+        )
+        resolved["home_cooking"] = home
+        resolved["meal_environment"] = meal_environment_for_modes(effective)
+    resolution = {
+        "target_date": (date.fromisoformat(review_date) + timedelta(days=1)).isoformat(),
+        "default_meal_modes": defaults,
+        "overrides": overrides,
+        "effective_meal_modes": effective,
+        "source": source,
+    }
+    return resolved, resolution
+
+
 def daily_review_context(review_date: str, days: int = 14) -> dict:
     from .personalization import require_generation
     from .planning import PLANNING_POLICY_VERSION
@@ -1226,6 +1281,9 @@ def daily_review_context(review_date: str, days: int = 14) -> dict:
     cutoff = (end - timedelta(days=days - 1)).isoformat()
     doctrine = load_doctrine()
     settings = load_resolved_settings()
+    from . import adaptive
+    planning_answers = adaptive.question_events_for_date(review_date, include_pending=False)
+    settings, meal_mode_resolution = _effective_meal_settings(settings, planning_answers, review_date)
     with connect() as conn:
         records = [row_dict(row) for row in conn.execute(
             """SELECT * FROM daily_records WHERE record_date BETWEEN ? AND ?
@@ -1282,7 +1340,6 @@ def daily_review_context(review_date: str, days: int = 14) -> dict:
         }
         for item in target_state["modules"] if item["version"] > 0
     ]
-    from . import adaptive
     from .personalization import active_personalization
 
     personalization = active_personalization()
@@ -1291,7 +1348,6 @@ def daily_review_context(review_date: str, days: int = 14) -> dict:
     adaptations = adaptive.active_adaptations(review_date)
     inventory = adaptive.list_inventory()
     experiment = adaptive.active_experiment()
-    planning_answers = adaptive.question_events_for_date(review_date, include_pending=False)
     source_manifest = {
         "records": [item["id"] for item in records],
         "memories": [{"id": item["id"], "updated_at": item["updated_at"]} for item in memories],
@@ -1358,8 +1414,9 @@ def daily_review_context(review_date: str, days: int = 14) -> dict:
         "priority_foods": priority_foods,
         "source_revisions": _revision_references(source_ids),
         "settings": settings,
+        "meal_mode_resolution": meal_mode_resolution,
         "home_cooking_preferences": home_cooking,
-        "meal_modes": settings.get("meal_modes") or legacy_home_meal_modes(home_cooking),
+        "meal_modes": meal_mode_resolution["effective_meal_modes"],
         "recent_home_meals": recent_home_meals,
         "recent_home_dinners": recent_home_dinners,
         "recent_online_categories": recent_online_categories,
@@ -1377,7 +1434,7 @@ def daily_review_context(review_date: str, days: int = 14) -> dict:
         "planning_answers": planning_answers,
         "source_manifest": source_manifest,
         "home_cooking_generation_protocol": [
-            "逐餐严格读取 meal_modes；每个 home_cook 餐次分别生成一人份新手执行卡，quick_assembly 使用低摩擦组装，eat_out 给外食选择规则。",
+            "逐餐严格读取 effective_meal_modes；单日明确安排优先于个人默认。每个 home_cook 餐次分别生成一人份新手执行卡，quick_assembly 使用低摩擦组装，eat_out 给外食选择规则且不得生成 recipe_card。",
             "优先复用食材但按餐次轮换菜式；同一餐次连续两天不重复 dish_key 或 flavor_profile。",
             "生成明日菜单前必须逐项评估 ingredient_carryover_obligations；未过期且适合当前状态的食材优先组装进明日午餐或晚餐。",
             "临近过期的食材优先明日用完；已超过保存窗口、今日记录否定库存或与肠胃状态冲突时可跳过或丢弃，但必须说明原因。",
