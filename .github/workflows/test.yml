@@ -85,7 +85,7 @@ jobs:
   android-instrumentation:
     # The emulator action is designed for hardware-accelerated macOS runners.
     # Ubuntu's no-KVM fallback can report sys.boot_completed before Android's
-    # input/settings services are ready, making the action fail before tests run.
+    # package/input/settings services are stable enough to run instrumentation.
     runs-on: macos-15-intel
     steps:
       - uses: actions/checkout@v4

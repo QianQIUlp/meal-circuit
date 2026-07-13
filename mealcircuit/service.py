@@ -14,12 +14,19 @@ from .configuration import configured_today, load_doctrine, load_resolved_settin
 from .db import connect, init_db, row_dict
 from .domain import new_id, utc_now
 from .domain_store import (
+    active_result_entity_id,
     capture_correction,
     capture_derived_result,
     capture_entity,
     capture_task_input,
     preference_entity_id,
     task_input_entity_id,
+    tombstone_derived_results,
+)
+from .menu_semantics import (
+    SEMANTIC_SIGNATURE_VERSION,
+    compare_signatures,
+    semantic_signature,
 )
 from .meal_modes import (
     LEGACY_DEFAULT_MEAL_MODES,
@@ -33,6 +40,7 @@ from .meal_modes import (
 )
 from .storage import resolve_data_path, store_data_path, upload_root
 from .validation import VALIDATOR_VERSION, ValidationError, validate_daily_review_result, validate_result
+from .review_lifecycle import revision_policy
 
 MAX_UPLOAD_BYTES = 10 * 1024 * 1024
 IMAGE_SIGNATURES = {
@@ -171,23 +179,30 @@ def _source_manifest_for_commit(context: dict, agent_run_id: str | None) -> dict
     return manifest
 
 
-def _finish_agent_run(run_id: str, *, result: dict | None = None, error: Exception | None = None) -> None:
+def _finish_agent_run(
+    run_id: str,
+    *,
+    result: dict | None = None,
+    error: Exception | None = None,
+    attempts: list[dict] | None = None,
+) -> None:
     status = "failed" if error is not None else "completed"
     error_summary = "" if error is None else f"{error.__class__.__name__}: {str(error)[:500]}"
     result_hash = ""
-    attempts = []
+    recorded_attempts = list(attempts or [])
     if result is not None:
         result_hash = hashlib.sha256(
             json.dumps(result, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
         ).hexdigest()
-        attempts.append({"attempt": 1, "status": "valid"})
-    elif error is not None:
-        attempts.append({"attempt": 1, "status": "failed", "error": error_summary})
+        if not recorded_attempts:
+            recorded_attempts.append({"attempt": 1, "status": "valid"})
+    elif error is not None and not recorded_attempts:
+        recorded_attempts.append({"attempt": 1, "status": "failed", "error": error_summary})
     with connect() as conn:
         updated = conn.execute(
             """UPDATE agent_runs SET status=?,error_summary=?,validation_attempts_json=?,result_hash=?,completed_at=?
                WHERE id=? AND status='running'""",
-            (status, error_summary, json.dumps(attempts, ensure_ascii=False), result_hash, now(), run_id),
+            (status, error_summary, json.dumps(recorded_attempts, ensure_ascii=False), result_hash, now(), run_id),
         )
         if updated.rowcount != 1:
             raise ValidationError("Agent 运行状态已变化")
@@ -611,6 +626,40 @@ def _has_daily_source(conn, record_date: str) -> bool:
     )
 
 
+def _revision_policy_with_connection(conn, review) -> dict:
+    item = row_dict(review) if not isinstance(review, dict) else dict(review)
+    return revision_policy(conn, item, configured_today())
+
+
+def review_revision_policy(review_date: str) -> dict:
+    init_db()
+    with connect() as conn:
+        review = conn.execute(
+            "SELECT * FROM daily_reviews WHERE review_date=?", (review_date,)
+        ).fetchone()
+        if review is None:
+            raise KeyError(review_date)
+        return _revision_policy_with_connection(conn, review)
+
+
+def _archive_review(conn, review, timestamp: str, archive_reason: str) -> None:
+    conn.execute(
+        """INSERT INTO daily_review_history(
+            id,review_id,version,source_record_ids_json,source_checkin_versions_json,
+            result_json,result_provenance_json,completed_at,archived_at,archive_reason,schema_version,review_mode,
+            source_manifest_json,context_hash,agent_run_id,policy_version,validator_version,plan_version_id
+        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (
+            new_id("review_history"), review["id"], review["result_version"],
+            review["source_record_ids_json"], review["source_checkin_versions_json"],
+            review["result_json"], review["result_provenance_json"], review["completed_at"], timestamp,
+            archive_reason, review["schema_version"], review["review_mode"], review["source_manifest_json"],
+            review["context_hash"], review["agent_run_id"], review["policy_version"],
+            review["validator_version"], review["plan_version_id"],
+        ),
+    )
+
+
 def _queue_daily_review(conn, record_date: str, archive_reason: str = "new_daily_record") -> None:
     timestamp = now()
     source_ids = _record_ids_for_date(conn, record_date)
@@ -628,29 +677,23 @@ def _queue_daily_review(conn, record_date: str, archive_reason: str = "new_daily
         created = conn.execute("SELECT id FROM daily_reviews WHERE review_date=?", (record_date,)).fetchone()
         capture_entity(conn, "daily_review", created["id"], created_at=timestamp)
         return
-    if review["status"] == "completed" and review["result_json"]:
+    policy = _revision_policy_with_connection(conn, review)
+    if review["status"] == "completed" and review["result_json"] and policy["mode"] == "locked":
+        _archive_review(conn, review, timestamp, archive_reason)
+    if policy["mode"] == "replaceable" and review["result_json"]:
         conn.execute(
-            """INSERT INTO daily_review_history(
-                id,review_id,version,source_record_ids_json,source_checkin_versions_json,
-                result_json,result_provenance_json,completed_at,archived_at,archive_reason,schema_version,review_mode,
-                source_manifest_json,context_hash,agent_run_id,policy_version,validator_version,plan_version_id
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (
-                new_id("review_history"), review["id"], review["result_version"],
-                review["source_record_ids_json"], review["source_checkin_versions_json"],
-                review["result_json"], review["result_provenance_json"], review["completed_at"], timestamp, archive_reason,
-                review["schema_version"], review["review_mode"], review["source_manifest_json"], review["context_hash"],
-                review["agent_run_id"], review["policy_version"], review["validator_version"],
-                review["plan_version_id"],
-            ),
+            """UPDATE daily_reviews SET status='pending',source_record_ids_json=?,source_checkin_versions_json=?,
+               updated_at=?,completed_at=NULL WHERE review_date=?""",
+            (source_json, checkin_versions_json, timestamp, record_date),
         )
-    conn.execute(
-        """UPDATE daily_reviews SET status='pending',source_record_ids_json=?,source_checkin_versions_json=?,
-           result_json=NULL,result_provenance_json=NULL,source_manifest_json='{}',context_hash='',agent_run_id=NULL,
-           policy_version='',validator_version='',plan_version_id=NULL,updated_at=?,completed_at=NULL
-           WHERE review_date=?""",
-        (source_json, checkin_versions_json, timestamp, record_date),
-    )
+    else:
+        conn.execute(
+            """UPDATE daily_reviews SET status='pending',source_record_ids_json=?,source_checkin_versions_json=?,
+               result_json=NULL,result_provenance_json=NULL,source_manifest_json='{}',context_hash='',agent_run_id=NULL,
+               policy_version='',validator_version='',plan_version_id=NULL,updated_at=?,completed_at=NULL
+               WHERE review_date=?""",
+            (source_json, checkin_versions_json, timestamp, record_date),
+        )
     capture_entity(conn, "daily_review", review["id"], created_at=timestamp)
 
 
@@ -951,27 +994,21 @@ def requeue_daily_review(review_date: str, reason: str) -> dict:
     timestamp = now()
     with connect() as conn:
         current = conn.execute("SELECT * FROM daily_reviews WHERE review_date=?", (review_date,)).fetchone()
-        conn.execute(
-            """INSERT INTO daily_review_history(
-                id,review_id,version,source_record_ids_json,source_checkin_versions_json,
-                result_json,result_provenance_json,completed_at,archived_at,archive_reason,schema_version,review_mode,
-                source_manifest_json,context_hash,agent_run_id,policy_version,validator_version,plan_version_id
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (
-                new_id("review_history"), current["id"], current["result_version"],
-                current["source_record_ids_json"], current["source_checkin_versions_json"],
-                current["result_json"], current["result_provenance_json"], current["completed_at"], timestamp, reason,
-                current["schema_version"], current["review_mode"], current["source_manifest_json"], current["context_hash"],
-                current["agent_run_id"], current["policy_version"], current["validator_version"],
-                current["plan_version_id"],
-            ),
-        )
-        conn.execute(
-            """UPDATE daily_reviews SET status='pending',result_json=NULL,result_provenance_json=NULL,source_manifest_json='{}',context_hash='',
-                   agent_run_id=NULL,policy_version='',validator_version='',plan_version_id=NULL,
-                   updated_at=?,completed_at=NULL
-               WHERE review_date=?""", (timestamp, review_date)
-        )
+        policy = _revision_policy_with_connection(conn, current)
+        if policy["mode"] == "replaceable":
+            conn.execute(
+                """UPDATE daily_reviews SET status='pending',updated_at=?,completed_at=NULL
+                   WHERE review_date=?""",
+                (timestamp, review_date),
+            )
+        else:
+            _archive_review(conn, current, timestamp, reason)
+            conn.execute(
+                """UPDATE daily_reviews SET status='pending',result_json=NULL,result_provenance_json=NULL,
+                       source_manifest_json='{}',context_hash='',agent_run_id=NULL,policy_version='',validator_version='',
+                       plan_version_id=NULL,updated_at=?,completed_at=NULL WHERE review_date=?""",
+                (timestamp, review_date),
+            )
         capture_entity(conn, "daily_review", current["id"], created_at=timestamp)
     return get_daily_review(review_date)
 
@@ -985,6 +1022,7 @@ def get_daily_review(review_date: str) -> dict:
         review["history"] = [row_dict(row) for row in conn.execute(
             "SELECT * FROM daily_review_history WHERE review_id=? ORDER BY version", (review["id"],)
         ).fetchall()]
+        review["revision_policy"] = _revision_policy_with_connection(conn, review)
         review["result_provenance_json"] = _decorate_staleness(
             review.get("result_provenance_json")
         )
@@ -1114,6 +1152,27 @@ def _home_menu_history(rows: list) -> tuple[list[dict], list[str]]:
             if category and category not in online_categories:
                 online_categories.append(category)
     return meals, online_categories
+
+
+def _semantic_menu_history(rows: list) -> list[dict]:
+    history = []
+    for row in rows:
+        item = row_dict(row)
+        menu = (item.get("result_json") or {}).get("tomorrow_menu") or {}
+        for meal in menu.get("meals") or []:
+            if not isinstance(meal, dict) or not meal.get("name"):
+                continue
+            signature = semantic_signature(meal)
+            history.append({
+                "review_date": item["review_date"],
+                "menu_date": menu.get("date"),
+                "meal_name": meal.get("name"),
+                "mode": meal.get("mode"),
+                "semantic_signature": {
+                    key: value for key, value in signature.items() if key != "content_text"
+                },
+            })
+    return history
 
 
 def _carryover_id(source_key: str, menu_date: str, index: int, ingredient: str) -> str:
@@ -1316,6 +1375,7 @@ def daily_review_context(review_date: str, days: int = 14) -> dict:
         recent_checkins.append(item)
     target_state = get_checkin_state(review_date)
     recent_home_meals, recent_online_categories = _home_menu_history(recent_review_rows)
+    recent_meal_semantics = _semantic_menu_history(recent_review_rows)
     recent_home_dinners = [item for item in recent_home_meals if item.get("meal_name") == "晚餐"]
     home_cooking = settings.get("home_cooking") or {"enabled": False}
     carryover_obligations = (
@@ -1391,6 +1451,7 @@ def daily_review_context(review_date: str, days: int = 14) -> dict:
         "context_schema_version": 2,
         "result_schema_version": 2,
         "validator_version": VALIDATOR_VERSION,
+        "meal_semantic_signature_version": SEMANTIC_SIGNATURE_VERSION,
         "planning_policy_version": PLANNING_POLICY_VERSION,
         "agent_run_id": None,
     }
@@ -1419,6 +1480,18 @@ def daily_review_context(review_date: str, days: int = 14) -> dict:
         "meal_modes": meal_mode_resolution["effective_meal_modes"],
         "recent_home_meals": recent_home_meals,
         "recent_home_dinners": recent_home_dinners,
+        "recent_meal_semantics": recent_meal_semantics,
+        "repeat_evidence": {
+            "ingredient_expiry": [
+                item["id"] for item in carryover_obligations
+                if item.get("urgency") in {"due_today_or_confirm_used", "use_tomorrow"}
+            ],
+            "health_recovery": any(
+                value in json.dumps(target_modules, ensure_ascii=False)
+                for value in ("recovery", "symptoms", "腹泻", "反酸", "胃痛")
+            ),
+            "shopping_constraint": bool(inventory),
+        },
         "recent_online_categories": recent_online_categories,
         "ingredient_carryover_obligations": carryover_obligations,
         "safety": personalization["safety"],
@@ -1435,7 +1508,7 @@ def daily_review_context(review_date: str, days: int = 14) -> dict:
         "source_manifest": source_manifest,
         "home_cooking_generation_protocol": [
             "逐餐严格读取 effective_meal_modes；单日明确安排优先于个人默认。每个 home_cook 餐次分别生成一人份新手执行卡，quick_assembly 使用低摩擦组装，eat_out 给外食选择规则且不得生成 recipe_card。",
-            "优先复用食材但按餐次轮换菜式；同一餐次连续两天不重复 dish_key 或 flavor_profile。",
+            "优先复用食材但按餐次轮换菜式；服务端会根据菜名、实际食材、调味与步骤计算语义指纹，改日期或 dish_key 不能绕过重复检查。",
             "生成明日菜单前必须逐项评估 ingredient_carryover_obligations；未过期且适合当前状态的食材优先组装进明日午餐或晚餐。",
             "临近过期的食材优先明日用完；已超过保存窗口、今日记录否定库存或与肠胃状态冲突时可跳过或丢弃，但必须说明原因。",
             "新采购清单不得在可用剩余食材能完成同等功能时重复购买。",
@@ -1464,12 +1537,14 @@ def complete_daily_review(
 
     policy = require_generation("daily")
     review = ensure_daily_review(review_date)
-    if review["status"] == "completed":
-        raise ValidationError("该日期复盘已完成；新增每日记录后才可重新复盘")
+    revision = review.get("revision_policy") or review_revision_policy(review_date)
+    replacing = bool(review.get("result_json") and revision["mode"] == "replaceable")
+    if review["status"] == "completed" and not replacing:
+        raise ValidationError("该复盘已因执行事实或日期锁定；请重新排队以追加正式版本")
     context = provenance_context or daily_review_context(review_date)
     settings = context["settings"]
     validate_daily_review_result(result, settings)
-    _validate_home_meal_rotation(review_date, result, settings)
+    _validate_meal_semantics(review_date, result, settings, context)
     expected_priority_ids = {food["id"] for food in list_priority_foods()}
     submitted_priority_ids = {item["food_id"] for item in result["priority_food_decisions"]}
     if submitted_priority_ids != expected_priority_ids:
@@ -1491,9 +1566,8 @@ def complete_daily_review(
     if source_revisions is None:
         source_revisions = context["source_revisions"]
     portable_provenance = _result_provenance(source_revisions, generator)
-    stored_result = json.loads(json.dumps(result, ensure_ascii=False))
     timestamp = now()
-    next_version = review["result_version"] + 1
+    next_version = review["result_version"] if replacing else review["result_version"] + 1
     menu = result.get("tomorrow_menu") or {}
     for meal in menu.get("meals") or []:
         if not meal.get("plan_item_id"):
@@ -1512,49 +1586,75 @@ def complete_daily_review(
     safety_mode = (context.get("safety") or {}).get("mode") or "setup_required"
     from .planning import MEAL_SLOTS
 
-    plan_version_id = new_id("plan_version")
+    plan_version_id = review.get("plan_version_id") if replacing else None
+    plan_version_id = plan_version_id or new_id("plan_version")
     plan_date = menu["date"]
     committed_manifest = _source_manifest_for_commit(context, agent_run_id)
+    stored_result = json.loads(json.dumps(result, ensure_ascii=False))
     with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        current_review = conn.execute(
+            "SELECT * FROM daily_reviews WHERE id=?", (review["id"],)
+        ).fetchone()
+        if current_review is None or current_review["result_version"] != review["result_version"]:
+            raise ValidationError("复盘状态已变化，请重新读取")
+        if replacing:
+            current_policy = _revision_policy_with_connection(conn, current_review)
+            if current_policy["mode"] != "replaceable":
+                raise ValidationError("复盘在提交期间新增了执行证据，已停止原位替换")
+            status_clause = "status IN ('pending','completed')"
+        else:
+            status_clause = "status='pending'"
         updated = conn.execute(
-            """UPDATE daily_reviews SET status='completed',result_json=?,result_provenance_json=?,result_version=result_version+1,
+            f"""UPDATE daily_reviews SET status='completed',result_json=?,result_provenance_json=?,result_version=?,
                schema_version=2,review_mode=?,source_manifest_json=?,context_hash=?,agent_run_id=?,
                policy_version=?,validator_version=?,plan_version_id=?,updated_at=?,completed_at=?
-               WHERE review_date=? AND status='pending'""",
+               WHERE review_date=? AND result_version=? AND {status_clause}""",
             (
                 json.dumps(stored_result, ensure_ascii=False),
                 json.dumps(portable_provenance, ensure_ascii=False),
+                next_version,
                 safety_mode,
-                json.dumps(_source_manifest_for_commit(context, agent_run_id), ensure_ascii=False, sort_keys=True), context["context_hash"],
+                json.dumps(committed_manifest, ensure_ascii=False, sort_keys=True), context["context_hash"],
                 agent_run_id, policy["policy_version"], VALIDATOR_VERSION,
-                plan_version_id, timestamp, timestamp, review_date,
+                plan_version_id, timestamp, timestamp, review_date, review["result_version"],
             ),
         )
         if updated.rowcount != 1:
             raise ValidationError("复盘状态已变化，请重新读取")
-        conn.execute(
-            "UPDATE plan_versions SET status='superseded' WHERE plan_date=? AND status='published'",
-            (plan_date,),
-        )
-        conn.execute(
-            """INSERT INTO plan_versions(
+        existing_plan = conn.execute(
+            "SELECT id FROM plan_versions WHERE id=?", (plan_version_id,)
+        ).fetchone()
+        if existing_plan and replacing:
+            conn.execute(
+                """UPDATE plan_versions SET result_version=?,plan_date=?,status='published',schema_version=2,
+                       menu_json=?,source_manifest_json=?,context_hash=?,policy_version=?,validator_version=?,agent_run_id=?
+                   WHERE id=?""",
+                (
+                    next_version, plan_date, json.dumps(menu, ensure_ascii=False),
+                    json.dumps(committed_manifest, ensure_ascii=False, sort_keys=True), context["context_hash"],
+                    policy["policy_version"], VALIDATOR_VERSION, agent_run_id, plan_version_id,
+                ),
+            )
+            conn.execute("DELETE FROM plan_items WHERE plan_version_id=?", (plan_version_id,))
+        else:
+            conn.execute(
+                "UPDATE plan_versions SET status='superseded' WHERE plan_date=? AND status='published'",
+                (plan_date,),
+            )
+            conn.execute(
+                """INSERT INTO plan_versions(
                    id,review_id,result_version,plan_date,status,schema_version,menu_json,
                    source_manifest_json,context_hash,policy_version,validator_version,agent_run_id,created_at
                ) VALUES(?,?,?,?,'published',2,?,?,?,?,?,?,?)""",
-            (
-                plan_version_id,
-                review["id"],
-                next_version,
-                plan_date,
-                json.dumps(menu, ensure_ascii=False),
-                json.dumps(committed_manifest, ensure_ascii=False, sort_keys=True),
-                context["context_hash"],
-                policy["policy_version"],
-                VALIDATOR_VERSION,
-                agent_run_id,
-                timestamp,
-            ),
-        )
+                (
+                    plan_version_id, review["id"], next_version, plan_date,
+                    json.dumps(menu, ensure_ascii=False),
+                    json.dumps(committed_manifest, ensure_ascii=False, sort_keys=True),
+                    context["context_hash"], policy["policy_version"], VALIDATOR_VERSION,
+                    agent_run_id, timestamp,
+                ),
+            )
         for sort_order, meal in enumerate(menu.get("meals") or []):
             conn.execute(
                 """INSERT INTO plan_items(
@@ -1577,9 +1677,10 @@ def complete_daily_review(
             conn,
             source_entity_id=current["id"],
             source_kind="daily_review",
-            result_version=review["result_version"] + 1,
+            result_version=next_version,
             result=stored_result,
             provenance=portable_provenance,
+            entity_id=active_result_entity_id(current["id"]),
         )
     return get_daily_review(review_date)
 
@@ -1589,30 +1690,50 @@ def generate_daily_review(review_date: str, client=None) -> dict:
     from .personalization import require_generation
 
     review = ensure_daily_review(review_date)
-    if review["status"] == "completed":
-        raise ValidationError("该日期复盘已完成；新增每日记录后才可重新复盘")
+    if review["status"] == "completed" and review["revision_policy"]["mode"] == "locked":
+        review = requeue_daily_review(review_date, "generated_result_revised")
     require_generation("daily")
     context = daily_review_context(review_date)
     provider = client or provider_from_environment()
     run_id = _start_agent_run("daily", context, provider)
-    try:
-        result = generate_json(context, "daily", provider)
-        completed = complete_daily_review(
-            review_date,
-            result,
-            provenance_context=context,
-            agent_run_id=run_id,
-            source_revisions=context["source_revisions"],
-            generator=_generator_metadata(provider),
-        )
-    except Exception as exc:
-        _finish_agent_run(run_id, error=exc)
-        raise
-    _finish_agent_run(run_id, result=result)
-    return completed
+    attempts = []
+    candidate_context = json.loads(json.dumps(context, ensure_ascii=False))
+    for attempt in range(1, 4):
+        try:
+            result = generate_json(candidate_context, "daily", provider)
+            completed = complete_daily_review(
+                review_date,
+                result,
+                provenance_context=context,
+                agent_run_id=run_id,
+                source_revisions=context["source_revisions"],
+                generator=_generator_metadata(provider),
+            )
+        except ValidationError as exc:
+            attempts.append({"attempt": attempt, "status": "rejected", "error": str(exc)[:1000]})
+            if attempt < 3:
+                candidate_context.setdefault("candidate_rejections", []).append({
+                    "attempt": attempt,
+                    "error": str(exc)[:1000],
+                    "instruction": "生成不同的实际菜单内容；不得只改日期、菜名或 rotation 标签。",
+                })
+                continue
+            _finish_agent_run(run_id, error=exc, attempts=attempts)
+            raise
+        except Exception as exc:
+            attempts.append({"attempt": attempt, "status": "failed", "error": str(exc)[:1000]})
+            _finish_agent_run(run_id, error=exc, attempts=attempts)
+            raise
+        attempts.append({"attempt": attempt, "status": "valid"})
+        _finish_agent_run(run_id, result=result, attempts=attempts)
+        return completed
+    raise AssertionError("unreachable")
 
 
 def submit_daily_review(review_date: str, result: dict) -> dict:
+    review = ensure_daily_review(review_date)
+    if review["status"] == "completed" and review["revision_policy"]["mode"] == "locked":
+        requeue_daily_review(review_date, "generated_result_revised")
     context = daily_review_context(review_date)
     run_id = _start_agent_run(
         "daily", context, identity=("external_agent", "structured_json_submission")
@@ -1626,6 +1747,120 @@ def submit_daily_review(review_date: str, result: dict) -> dict:
         raise
     _finish_agent_run(run_id, result=result)
     return completed
+
+
+def cleanup_generated_review_history(
+    review_date: str,
+    *,
+    apply: bool = False,
+    expected_current_version: int | None = None,
+) -> dict:
+    """Collapse mistaken, unexecuted generated versions after strict evidence checks."""
+    init_db()
+    with connect() as conn:
+        review_row = conn.execute(
+            "SELECT * FROM daily_reviews WHERE review_date=?", (review_date,)
+        ).fetchone()
+        if review_row is None:
+            raise KeyError(review_date)
+        review = row_dict(review_row)
+        if review["status"] != "completed" or not review.get("result_json"):
+            raise ValidationError("只能清理已有当前结果的已完成复盘")
+        if expected_current_version is not None and review["result_version"] != expected_current_version:
+            raise ValidationError(
+                f"当前版本为 v{review['result_version']}，与预期 v{expected_current_version} 不符"
+            )
+        policy = _revision_policy_with_connection(conn, review)
+        if policy["mode"] != "replaceable":
+            raise ValidationError("清理已停止：计划已有真实证据或日期已锁定：" + ",".join(policy["reasons"]))
+        history = conn.execute(
+            "SELECT * FROM daily_review_history WHERE review_id=? ORDER BY version,id",
+            (review["id"],),
+        ).fetchall()
+        plans = conn.execute(
+            "SELECT * FROM plan_versions WHERE review_id=? ORDER BY result_version,id",
+            (review["id"],),
+        ).fetchall()
+        current_plan_id = review.get("plan_version_id")
+        stale_plans = [row for row in plans if row["id"] != current_plan_id]
+        report = {
+            "review_date": review_date,
+            "review_id": review["id"],
+            "current_version": review["result_version"],
+            "normalized_version": 1,
+            "history_versions": [row["version"] for row in history],
+            "stale_plan_versions": [row["result_version"] for row in stale_plans],
+            "current_plan_id": current_plan_id,
+            "revision_policy": policy,
+            "applied": False,
+        }
+        if not apply:
+            return report
+        conn.execute("BEGIN IMMEDIATE")
+        # Recheck after obtaining the write lock; never delete across newly arrived evidence.
+        locked_review = conn.execute(
+            "SELECT * FROM daily_reviews WHERE id=?", (review["id"],)
+        ).fetchone()
+        locked_policy = _revision_policy_with_connection(conn, locked_review)
+        if locked_policy["mode"] != "replaceable":
+            raise ValidationError("清理已停止：写入前发现新的执行证据")
+        stale_plan_ids = [row["id"] for row in stale_plans]
+        if stale_plan_ids:
+            placeholders = ",".join("?" for _ in stale_plan_ids)
+            conn.execute(
+                f"DELETE FROM plan_items WHERE plan_version_id IN ({placeholders})",
+                tuple(stale_plan_ids),
+            )
+            conn.execute(
+                f"DELETE FROM plan_versions WHERE id IN ({placeholders})",
+                tuple(stale_plan_ids),
+            )
+        conn.execute("DELETE FROM daily_review_history WHERE review_id=?", (review["id"],))
+        if current_plan_id:
+            conn.execute(
+                "UPDATE plan_versions SET result_version=1 WHERE id=?", (current_plan_id,)
+            )
+        conn.execute(
+            "UPDATE daily_reviews SET result_version=1,updated_at=? WHERE id=?",
+            (now(), review["id"]),
+        )
+        obsolete_run_ids = {
+            row["agent_run_id"] for row in [*history, *stale_plans]
+            if "agent_run_id" in row.keys() and row["agent_run_id"]
+        }
+        obsolete_run_ids.discard(review.get("agent_run_id"))
+        deleted_run_count = 0
+        for run_id in obsolete_run_ids:
+            referenced = conn.execute(
+                """SELECT 1 FROM daily_reviews WHERE agent_run_id=?
+                   UNION ALL SELECT 1 FROM plan_versions WHERE agent_run_id=? LIMIT 1""",
+                (run_id, run_id),
+            ).fetchone()
+            if not referenced:
+                conn.execute("DELETE FROM agent_runs WHERE id=?", (run_id,))
+                deleted_run_count += 1
+        stable_result_id = active_result_entity_id(review["id"])
+        tombstoned = tombstone_derived_results(
+            conn, source_entity_id=review["id"], keep_entity_id=stable_result_id
+        )
+        capture_derived_result(
+            conn,
+            source_entity_id=review["id"],
+            source_kind="daily_review",
+            result_version=1,
+            result=review["result_json"],
+            provenance=review.get("result_provenance_json") or {},
+            entity_id=stable_result_id,
+        )
+        capture_entity(conn, "daily_review", review["id"], created_at=now())
+        report.update({
+            "applied": True,
+            "deleted_history_count": len(history),
+            "deleted_plan_count": len(stale_plans),
+            "deleted_agent_run_count": deleted_run_count,
+            "tombstoned_result_entities": tombstoned,
+        })
+        return report
 
 
 def rescue_context(rescue_id: str) -> dict:
@@ -1790,43 +2025,78 @@ def _validate_ingredient_carryover_decisions(result: dict, obligations: list[dic
         raise ValidationError(f"食材承接裁决不完整；缺少={missing}，未知={unknown}")
 
 
-def _validate_home_meal_rotation(review_date: str, result: dict, settings: dict) -> None:
-    home = settings.get("home_cooking") or {"enabled": False}
-    if not home.get("enabled"):
-        return
+def _repeat_reason_supported(reason: str | None, context: dict) -> bool:
+    evidence = context.get("repeat_evidence") or {}
+    if reason == "health_recovery":
+        return evidence.get("health_recovery") is True
+    if reason == "ingredient_expiry":
+        return bool(evidence.get("ingredient_expiry"))
+    if reason == "shopping_constraint":
+        return evidence.get("shopping_constraint") is True
+    return False
+
+
+def _validate_meal_semantics(review_date: str, result: dict, settings: dict, context: dict) -> None:
     current_menu = result["tomorrow_menu"]
+    home = settings.get("home_cooking") or {}
+    window_days = int(home.get("rotation_window_days") or 3)
+    cutoff = (date.fromisoformat(review_date) - timedelta(days=max(1, window_days))).isoformat()
     with connect() as conn:
-        previous_row = conn.execute(
+        rows = conn.execute(
             """SELECT review_date,result_json FROM daily_reviews
-               WHERE status='completed' AND review_date<? ORDER BY review_date DESC LIMIT 1""",
-            (review_date,),
-        ).fetchone()
-    if previous_row is None:
-        return
-    previous_result = row_dict(previous_row).get("result_json") or {}
-    previous_menu = previous_result.get("tomorrow_menu") or {}
-    current_date = date.fromisoformat(current_menu["date"])
-    try:
-        previous_date = date.fromisoformat(previous_menu["date"])
-    except (KeyError, TypeError, ValueError):
-        return
-    if previous_date != current_date - timedelta(days=1):
-        return
-    current_meals = {meal.get("name"): meal for meal in current_menu.get("meals", [])}
-    previous_meals = {meal.get("name"): meal for meal in previous_menu.get("meals", [])}
-    for meal_name in home_cooked_meal_names(settings):
-        current_meal = current_meals.get(meal_name) or {}
-        previous_meal = previous_meals.get(meal_name) or {}
-        current = meal_rotation(current_menu, current_meal)
-        previous = meal_rotation(previous_menu, previous_meal)
-        if not current or not previous:
+               WHERE status='completed' AND review_date>=? AND review_date<? ORDER BY review_date DESC""",
+            (cutoff, review_date),
+        ).fetchall()
+    previous_meals = []
+    for row in rows:
+        previous_result = row_dict(row).get("result_json") or {}
+        previous_menu = previous_result.get("tomorrow_menu") or {}
+        for meal in previous_menu.get("meals") or []:
+            if isinstance(meal, dict):
+                previous_meals.append((row["review_date"], previous_menu.get("date"), meal))
+    conflicts = []
+    for meal in current_menu.get("meals") or []:
+        if not isinstance(meal, dict):
             continue
-        repeated = (
-            previous.get("dish_key") == current.get("dish_key")
-            or previous.get("flavor_profile") == current.get("flavor_profile")
+        current_signature = semantic_signature(meal)
+        meal["semantic_signature"] = {
+            key: value for key, value in current_signature.items() if key != "content_text"
+        }
+        for previous_review_date, previous_menu_date, previous_meal in previous_meals:
+            if previous_meal.get("name") != meal.get("name"):
+                continue
+            previous_signature = semantic_signature(previous_meal)
+            comparison = compare_signatures(
+                current_signature,
+                previous_signature,
+                home_cook=meal.get("mode") == "home_cook",
+            )
+            if not comparison["duplicate"]:
+                continue
+            rotation = meal_rotation(current_menu, meal) or {}
+            repeat_reason = rotation.get("repeat_reason")
+            allowed_near_repeat = (
+                comparison["near"]
+                and not comparison["exact"]
+                and _repeat_reason_supported(repeat_reason, context)
+            )
+            if allowed_near_repeat:
+                continue
+            conflicts.append({
+                "meal": meal.get("name"),
+                "candidate_date": current_menu.get("date"),
+                "previous_date": previous_menu_date,
+                "previous_review_date": previous_review_date,
+                "exact": comparison["exact"],
+                "semantic_score": comparison["semantic_score"],
+                "reasons": comparison["reasons"],
+                "repeat_reason": repeat_reason,
+                "repeat_reason_supported": _repeat_reason_supported(repeat_reason, context),
+            })
+    if conflicts:
+        raise ValidationError(
+            "菜单语义重复：" + json.dumps(conflicts, ensure_ascii=False, sort_keys=True)
         )
-        if repeated and not current.get("repeat_reason"):
-            raise ValidationError(f"连续{meal_name}不得重复菜品或主风味；确需重复时必须提供 repeat_reason")
 
 
 def pending_work() -> dict:
@@ -1846,6 +2116,8 @@ def daily_state(review_date: str | None = None) -> dict:
         record_count = conn.execute(
             "SELECT COUNT(*) FROM daily_records WHERE record_date=?", (target,)
         ).fetchone()[0]
+        if review is not None:
+            review["revision_policy"] = _revision_policy_with_connection(conn, review)
     if review is None:
         return {"date": target, "status": "unrecorded", "record_count": record_count, "review": None}
     review["result_provenance_json"] = _decorate_staleness(

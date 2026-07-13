@@ -19,7 +19,8 @@ from pathlib import Path
 from mealcircuit import adaptive, ai, checkins, personalization, service
 from mealcircuit import storage
 from mealcircuit.configuration import configuration_status, initialize_private_home
-from mealcircuit.db import init_db
+from mealcircuit.db import connect, init_db
+from mealcircuit.menu_semantics import compare_signatures, semantic_signature
 from mealcircuit.migration import apply_migration, migration_preview
 from mealcircuit.server import Handler, ThreadingHTTPServer, origin_matches_host, parse_host_endpoint
 from mealcircuit.storage import db_path, resolve_data_path, upload_root
@@ -229,6 +230,52 @@ def home_cooking_review_result(review_date: str, dish_key="tomato_chicken", flav
             "flavor_profile": flavor, "technique": "stir_fry",
         },
     })
+    return result
+
+
+def change_home_dinner(
+    result: dict,
+    *,
+    title: str,
+    protein: str,
+    vegetable: str,
+    seasoning: str,
+    instruction: str,
+    dish_key: str,
+    flavor: str,
+    technique: str,
+) -> dict:
+    dinner = next(meal for meal in result["tomorrow_menu"]["meals"] if meal["name"] == "晚餐")
+    dinner["foods"] = [title, "主食", "蔬菜"]
+    dinner["recipe_card"]["title"] = title
+    dinner["recipe_card"]["ingredients"] = [
+        {"name": protein, "amount": "一人份", "prep": "切成易熟大小"},
+        {"name": vegetable, "amount": "1份", "prep": "洗净切块"},
+    ]
+    dinner["recipe_card"]["seasonings"] = [
+        {"name": seasoning, "amount": "1茶匙", "timing": "烹饪中加入"}
+    ]
+    dinner["recipe_card"]["steps"] = [
+        {"instruction": instruction, "minutes": 10, "heat": "中火", "done_signal": "食材熟透"}
+    ]
+    result["tomorrow_menu"]["rotation"] = {
+        "dish_key": dish_key,
+        "primary_protein": protein,
+        "primary_vegetable": vegetable,
+        "flavor_profile": flavor,
+        "technique": technique,
+    }
+    return result
+
+
+def change_breakfast_and_lunch(result: dict) -> dict:
+    meals = {meal["name"]: meal for meal in result["tomorrow_menu"]["meals"]}
+    meals["早餐"]["foods"] = ["全麦面包", "原味酸奶", "蓝莓"]
+    meals["早餐"]["substitutions"] = ["燕麦替换面包"]
+    meals["午餐"]["foods"] = ["清蒸鱼", "杂粮饭", "绿叶菜"]
+    meals["午餐"]["substitutions"] = ["豆腐替换鱼类"]
+    if meals["午餐"].get("eat_out_guidance"):
+        meals["午餐"]["eat_out_guidance"]["protein_anchor"] = "优先选择清蒸鱼或豆腐"
     return result
 
 
@@ -568,15 +615,18 @@ class MealCircuitTest(unittest.TestCase):
         completed = service.complete_daily_review(today, daily_review_result(today))
         self.assertEqual(completed["status"], "completed")
         self.assertEqual(completed["result_version"], 1)
-        with self.assertRaises(ValidationError):
-            service.complete_daily_review(today, daily_review_result(today))
+        replacement = daily_review_result(today)
+        replacement["one_line_review"] = "未执行生成物可以直接修正，不污染正式历史。"
+        replaced = service.complete_daily_review(today, replacement)
+        self.assertEqual(replaced["result_version"], 1)
+        self.assertEqual(replaced["history"], [])
         service.add_daily_record(today, "补充：晚间饥饿低")
         reopened = service.get_daily_review(today)
         self.assertEqual(reopened["status"], "pending")
-        self.assertIsNone(reopened["result_json"])
+        self.assertEqual(reopened["result_json"]["one_line_review"], replacement["one_line_review"])
         self.assertEqual(len(reopened["source_record_ids_json"]), 3)
-        self.assertEqual(len(reopened["history"]), 1)
-        self.assertEqual(reopened["history"][0]["result_json"]["tomorrow_menu"]["protein_target_g"], [100, 130])
+        self.assertEqual(reopened["history"], [])
+        self.assertEqual(reopened["revision_policy"]["mode"], "replaceable")
 
     def test_daily_review_rejects_missing_or_wrong_menu(self):
         today = date.today().isoformat()
@@ -587,6 +637,178 @@ class MealCircuitTest(unittest.TestCase):
         invalid["tomorrow_menu"]["protein_target_g"] = [200, 220]
         with self.assertRaises(ValidationError):
             service.complete_daily_review(today, invalid)
+
+    def test_semantic_signature_rejects_renames_reordering_and_legacy_rotation(self):
+        previous = home_cooking_review_result(date.today().isoformat())["tomorrow_menu"]["meals"][2]
+        previous.pop("rotation", None)
+        renamed = copy.deepcopy(previous)
+        renamed["recipe_card"]["title"] = "鸡肉小米椒番茄"
+        renamed["recipe_card"]["ingredients"].reverse()
+        renamed["recipe_card"]["steps"].reverse()
+        comparison = compare_signatures(
+            semantic_signature(renamed), semantic_signature(previous), home_cook=True
+        )
+        self.assertTrue(comparison["duplicate"])
+        self.assertTrue(comparison["near"])
+
+        breakfast_a = {"mode": "quick_assembly", "foods": ["鸡蛋", "全麦面包", "牛奶"]}
+        breakfast_b = {"mode": "quick_assembly", "foods": ["鸡蛋", "全麦面包", "原味酸奶"]}
+        breakfast_comparison = compare_signatures(
+            semantic_signature(breakfast_b), semantic_signature(breakfast_a), home_cook=False
+        )
+        self.assertFalse(breakfast_comparison["duplicate"])
+
+    def test_replaceable_plan_is_updated_in_place_but_feedback_locks_history(self):
+        today = date.today().isoformat()
+        plan_date = (date.today() + timedelta(days=1)).isoformat()
+        service.add_daily_record(today, "今天按计划记录")
+        first = service.complete_daily_review(today, daily_review_result(today))
+        plan_id = first["plan_version_id"]
+        second_result = daily_review_result(today)
+        second_result["one_line_review"] = "修正尚未执行的生成内容。"
+        second = service.submit_daily_review(today, second_result)
+        self.assertEqual(second["result_version"], 1)
+        self.assertEqual(second["plan_version_id"], plan_id)
+        self.assertEqual(second["history"], [])
+        plan = adaptive.get_plan_for_date(plan_date)
+        meal = plan["menu"]["meals"][0]
+        adaptive.save_plan_feedback(
+            plan_date, meal["plan_item_id"], "followed", expected_version=0
+        )
+        self.assertEqual(service.get_daily_review(today)["revision_policy"]["mode"], "locked")
+        third_result = daily_review_result(today)
+        third_result["one_line_review"] = "执行反馈后修订必须形成正式版本。"
+        third = service.submit_daily_review(today, third_result)
+        self.assertEqual(third["result_version"], 2)
+        self.assertEqual(len(third["history"]), 1)
+        with connect() as conn:
+            plans = conn.execute(
+                "SELECT status,result_version FROM plan_versions WHERE review_id=? ORDER BY result_version",
+                (third["id"],),
+            ).fetchall()
+        self.assertEqual([(row["status"], row["result_version"]) for row in plans], [
+            ("superseded", 1), ("published", 2)
+        ])
+
+    def test_past_plan_is_locked(self):
+        review_date = (date.today() - timedelta(days=2)).isoformat()
+        service.add_daily_record(review_date, "过去的真实记录")
+        completed = service.complete_daily_review(review_date, daily_review_result(review_date))
+        self.assertEqual(completed["revision_policy"]["mode"], "locked")
+        self.assertIn("past_plan_date", completed["revision_policy"]["reasons"])
+
+    def test_daily_generation_retries_semantic_rejections_without_persisting_candidates(self):
+        previous_date = (date.today() - timedelta(days=1)).isoformat()
+        today = date.today().isoformat()
+        service.add_daily_record(previous_date, "前一天记录")
+        service.complete_daily_review(previous_date, daily_review_result(previous_date))
+        service.add_daily_record(today, "今天记录")
+        repeated = daily_review_result(today)
+        distinct = daily_review_result(today)
+        meals = {meal["name"]: meal for meal in distinct["tomorrow_menu"]["meals"]}
+        meals["早餐"]["foods"] = ["燕麦", "原味酸奶", "草莓"]
+        meals["午餐"]["foods"] = ["清蒸鱼", "杂粮饭", "西兰花"]
+        meals["晚餐"]["foods"] = ["豆腐汤", "红薯", "菠菜"]
+
+        class Provider:
+            provider_name = "test"
+            model = "semantic-retry"
+
+            def __init__(self):
+                self.requests = []
+                self.results = [copy.deepcopy(repeated), copy.deepcopy(repeated), distinct]
+
+            def generate(self, request):
+                self.requests.append(copy.deepcopy(request))
+                return self.results.pop(0)
+
+        provider = Provider()
+        completed = service.generate_daily_review(today, provider)
+        self.assertEqual(completed["result_version"], 1)
+        self.assertEqual(len(provider.requests), 3)
+        self.assertEqual(len(provider.requests[1].context["candidate_rejections"]), 1)
+        with connect() as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM plan_versions WHERE review_id=?", (completed["id"],)).fetchone()[0], 1)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM daily_review_history WHERE review_id=?", (completed["id"],)).fetchone()[0], 0)
+            attempts = json.loads(conn.execute("SELECT validation_attempts_json FROM agent_runs WHERE id=?", (completed["agent_run_id"],)).fetchone()[0])
+        self.assertEqual([item["status"] for item in attempts], ["rejected", "rejected", "valid"])
+
+    def test_failed_regeneration_keeps_replaceable_current_plan_unchanged(self):
+        today = date.today().isoformat()
+        service.add_daily_record(today, "今天记录")
+        original = service.complete_daily_review(today, daily_review_result(today))
+
+        class InvalidProvider:
+            def generate(self, request):
+                return {"system_status": "缺少其余字段"}
+
+        with self.assertRaises(ValidationError):
+            service.generate_daily_review(today, InvalidProvider())
+        current = service.get_daily_review(today)
+        self.assertEqual(current["result_version"], 1)
+        self.assertEqual(current["plan_version_id"], original["plan_version_id"])
+        self.assertEqual(current["result_json"], original["result_json"])
+        self.assertEqual(current["history"], [])
+
+    def test_targeted_cleanup_collapses_only_unexecuted_generated_versions(self):
+        today = date.today().isoformat()
+        service.add_daily_record(today, "今天记录")
+        current = service.complete_daily_review(today, daily_review_result(today))
+        with connect() as conn:
+            conn.execute("UPDATE daily_reviews SET result_version=5 WHERE id=?", (current["id"],))
+            conn.execute("UPDATE plan_versions SET result_version=5 WHERE id=?", (current["plan_version_id"],))
+            seeded = conn.execute("SELECT * FROM daily_reviews WHERE id=?", (current["id"],)).fetchone()
+            menu_json = json.dumps(current["result_json"]["tomorrow_menu"], ensure_ascii=False)
+            obsolete_result = service.capture_derived_result(
+                conn,
+                source_entity_id=current["id"],
+                source_kind="daily_review",
+                result_version=2,
+                result={"mistaken": True},
+                provenance={},
+            )
+            for version in range(1, 5):
+                archived = dict(seeded)
+                archived["result_version"] = version
+                service._archive_review(conn, archived, service.now(), "mistaken_generated_candidate")
+                conn.execute(
+                    """INSERT INTO plan_versions(
+                           id,review_id,result_version,plan_date,status,schema_version,menu_json,
+                           source_manifest_json,context_hash,policy_version,validator_version,agent_run_id,created_at
+                       ) VALUES(?,?,?,?, 'superseded',2,?,?,?,?,?,?,?)""",
+                    (
+                        f"stale_plan_{version}", current["id"], version,
+                        current["result_json"]["tomorrow_menu"]["date"], menu_json,
+                        "{}", "stale", "test", "validator-v2", None, service.now(),
+                    ),
+                )
+        preview = service.cleanup_generated_review_history(
+            today, expected_current_version=5
+        )
+        self.assertFalse(preview["applied"])
+        self.assertEqual(preview["history_versions"], [1, 2, 3, 4])
+        applied = service.cleanup_generated_review_history(
+            today, apply=True, expected_current_version=5
+        )
+        self.assertTrue(applied["applied"])
+        self.assertIn(obsolete_result.entity_id, applied["tombstoned_result_entities"])
+        cleaned = service.get_daily_review(today)
+        self.assertEqual(cleaned["result_version"], 1)
+        self.assertEqual(cleaned["history"], [])
+        with connect() as conn:
+            plans = conn.execute(
+                "SELECT id,result_version,status FROM plan_versions WHERE review_id=?",
+                (current["id"],),
+            ).fetchall()
+            obsolete_head = conn.execute(
+                """SELECT r.deleted FROM entity_heads h JOIN domain_revisions r
+                   ON r.revision_id=h.revision_id WHERE h.entity_id=?""",
+                (obsolete_result.entity_id,),
+            ).fetchone()
+        self.assertEqual([(row["id"], row["result_version"], row["status"]) for row in plans], [
+            (current["plan_version_id"], 1, "published")
+        ])
+        self.assertEqual(obsolete_head["deleted"], 1)
 
     def test_checkin_draft_publish_and_day_context(self):
         today = date.today().isoformat()
@@ -702,10 +924,11 @@ class MealCircuitTest(unittest.TestCase):
         service.complete_checkin_module(today, "weight", 0)
         first_requeue = service.get_daily_review(today)
         self.assertEqual(first_requeue["status"], "pending")
-        self.assertEqual(len(first_requeue["history"]), 1)
+        self.assertEqual(len(first_requeue["history"]), 0)
+        self.assertIsNotNone(first_requeue["result_json"])
         service.skip_checkin_module(today, "gut", 0)
         second_update = service.get_daily_review(today)
-        self.assertEqual(len(second_update["history"]), 1)
+        self.assertEqual(len(second_update["history"]), 0)
         self.assertEqual(second_update["source_checkin_versions_json"], {"gut": 1, "weight": 1})
 
     def test_checkin_schema_migrates_existing_review_tables(self):
@@ -915,17 +1138,25 @@ class MealCircuitTest(unittest.TestCase):
         self.assertEqual(obligations[0]["shopping_items"][0]["amount"], "3个")
 
         repeated = home_cooking_review_result(second_date)
-        with self.assertRaisesRegex(ValidationError, "连续晚餐不得重复"):
+        with self.assertRaisesRegex(ValidationError, "菜单语义重复"):
             service.complete_daily_review(second_date, repeated)
 
-        missing_carryover = home_cooking_review_result(
-            second_date, dish_key="tomato_tofu", flavor="tomato_savory"
+        missing_carryover = change_home_dinner(
+            change_breakfast_and_lunch(home_cooking_review_result(second_date)),
+            title="蒜香番茄豆腐汤", protein="豆腐", vegetable="番茄", seasoning="蒜末",
+            instruction="豆腐与番茄加水煮开", dish_key="tomato_tofu_soup",
+            flavor="garlic_tomato", technique="simmer",
         )
         with self.assertRaisesRegex(ValidationError, "食材承接裁决不完整"):
             service.complete_daily_review(second_date, missing_carryover)
 
         reuse_same_ingredient = add_carryover_decisions(
-            home_cooking_review_result(second_date, dish_key="tomato_tofu", flavor="tomato_savory"),
+            change_home_dinner(
+                change_breakfast_and_lunch(home_cooking_review_result(second_date)),
+                title="蒜香番茄豆腐汤", protein="豆腐", vegetable="番茄", seasoning="蒜末",
+                instruction="豆腐与番茄加水煮开", dish_key="tomato_tofu_soup",
+                flavor="garlic_tomato", technique="simmer",
+            ),
             context,
         )
         self.assertEqual(service.complete_daily_review(second_date, reuse_same_ingredient)["status"], "completed")
@@ -942,7 +1173,12 @@ class MealCircuitTest(unittest.TestCase):
         service.add_daily_record(second_date, "第二天独居晚餐")
         context = service.daily_review_context(second_date)
 
-        repeated = home_cooking_review_result(second_date)
+        repeated = change_home_dinner(
+            change_breakfast_and_lunch(home_cooking_review_result(second_date)),
+            title="番茄蘑菇小米椒鸡肉", protein="鸡胸肉", vegetable="番茄", seasoning="小米椒",
+            instruction="鸡肉、番茄和蘑菇下锅翻炒至熟", dish_key="tomato_mushroom_chicken",
+            flavor="tomato_sour_spicy", technique="stir_fry",
+        )
         repeated["tomorrow_menu"]["rotation"]["repeat_reason"] = "ingredient_expiry"
         add_carryover_decisions(repeated, context)
         self.assertEqual(service.complete_daily_review(second_date, repeated)["status"], "completed")
@@ -1210,7 +1446,14 @@ class WebAppTest(unittest.TestCase):
         for prior in (date.today() - timedelta(days=4), date.today() - timedelta(days=3)):
             prior_text = prior.isoformat()
             service.add_daily_record(prior_text, "重复时间阻力的浏览器学习证据。")
-            service.complete_daily_review(prior_text, daily_review_result(prior_text))
+            prior_result = daily_review_result(prior_text)
+            variant = prior.day
+            prior_meals = {meal["name"]: meal for meal in prior_result["tomorrow_menu"]["meals"]}
+            prior_meals["早餐"]["foods"] = [f"燕麦{variant}", "酸奶", f"水果{variant}"]
+            prior_meals["午餐"]["foods"] = [f"鱼类{variant}", "米饭", f"蔬菜{variant}"]
+            prior_meals["晚餐"]["foods"] = [f"快速鸡肉{variant}", "主食", f"蔬菜{variant}"]
+            prior_meals["晚餐"]["strategy_key"] = "web-time-friction-dinner"
+            service.complete_daily_review(prior_text, prior_result)
             prior_plan = adaptive.get_plan_for_date((prior + timedelta(days=1)).isoformat())
             dinner = next(item for item in prior_plan["menu"]["meals"] if item["name"] == "晚餐")
             adaptive.save_plan_feedback(
