@@ -10,7 +10,7 @@ class ValidationError(ValueError):
     pass
 
 
-VALIDATOR_VERSION = "validator-v2"
+VALIDATOR_VERSION = "validator-v3"
 
 
 def _required_object(value: Any, name: str) -> dict:

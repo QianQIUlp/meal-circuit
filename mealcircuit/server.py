@@ -339,7 +339,13 @@ def render_plan_page(plan_date: str) -> str:
         <details class="feedback-box"{' open' if not feedback else ''}><summary>{'修订执行回执' if feedback else '记录实际执行结果'}</summary><form method="post" action="/plans/{esc(plan_date)}/{esc(meal['plan_item_id'])}/feedback"><input type="hidden" name="expected_version" value="{version}"><label>执行状态<select name="status" required><option value="">请选择</option>{status_options}</select></label><fieldset><legend>偏离原因（调整或未执行时必选）</legend><div class="option-grid">{reason_checks}</div></fieldset><label>实际怎么做的（可选）<textarea name="actual_text">{esc(feedback.get('actual_text','') if feedback else '')}</textarea></label><button type="submit">保存回执</button></form></details>
         {f'<form class="rescue-form" method="post" action="/rescue/start"><input type="hidden" name="plan_date" value="{esc(plan_date)}"><input type="hidden" name="plan_item_id" value="{esc(meal["plan_item_id"])}"><label>计划临时做不了怎么办？<select name="issue_code">{"".join(f"<option value={key!r}>{label}</option>" for key,label in RESCUE_LABELS.items())}</select></label><input name="input_text" aria-label="救场补充" placeholder="可补充当前手边条件"><button class="secondary" type="submit">生成救场任务</button></form>' if plan.get('scope_current') else ''}</article>''')
     stale = '' if plan.get('scope_current') else '<div class="form-error" role="alert"><strong>这是旧目标或策略版本的历史计划</strong><p>仍可补录实际执行结果，但不能据此生成新的救场建议。</p></div>'
-    return f'<section class="section-header"><div><p class="eyebrow">Published plan · v{esc(plan["result_version"])}</p><h1>{esc(plan_date)} 执行计划</h1><p class="muted">每次修改回执都会追加事件；反馈绑定这份正式计划的目标与安全版本。</p></div><a class="button secondary" href="/questions/{esc(plan_date)}">最少提问</a></section>{stale}<div class="plan-list">{"".join(cards)}</div>'
+    revision = plan.get("revision_policy") or {"mode": "locked", "reasons": []}
+    revision_text = (
+        "尚未执行，可直接替换错误生成结果，不形成产品历史"
+        if revision["mode"] == "replaceable"
+        else "已有事实证据或日期已过，后续修改会保留正式历史"
+    )
+    return f'<section class="section-header"><div><p class="eyebrow">Published plan · v{esc(plan["result_version"])}</p><h1>{esc(plan_date)} 执行计划</h1><p class="muted">{esc(revision_text)}</p></div><a class="button secondary" href="/questions/{esc(plan_date)}">最少提问</a></section>{stale}<div class="plan-list">{"".join(cards)}</div>'
 
 
 def render_questions_page(question_date: str) -> str:
@@ -1513,7 +1519,8 @@ class Handler(BaseHTTPRequestHandler):
                 if daily["status"] == "completed":
                     review = daily["review"]
                     content = render_provenance_warning(review.get("result_provenance_json")) + render_daily_review_result(review["result_json"])
-                    state = f'<p><span class="status completed">completed</span> · 版本 {esc(review["result_version"])}</p>'
+                    lifecycle = "可替换（尚无执行证据）" if review["revision_policy"]["mode"] == "replaceable" else "已锁定（保留正式历史）"
+                    state = f'<p><span class="status completed">completed</span> · 版本 {esc(review["result_version"])} · {esc(lifecycle)}</p>'
                 elif daily["status"] == "pending":
                     state = '<p><span class="status pending">pending</span></p>'
                     content = (
@@ -1613,7 +1620,8 @@ class Handler(BaseHTTPRequestHandler):
                 body = (
                     f'<section class="panel"><h1>{esc(review_date)} 每日复盘</h1>'
                     f'<p><span class="status {esc(review["status"])}">{esc(review["status"])}</span> · '
-                    f'版本 {esc(review["result_version"])}</p></section>'
+                    f'版本 {esc(review["result_version"])} · '
+                    f'{"可替换（尚无执行证据）" if review["revision_policy"]["mode"] == "replaceable" else "已锁定（保留正式历史）"}</p></section>'
                     + render_checkin_callout(review_date)
                     + result_shell
                 )

@@ -25,13 +25,14 @@
 4. 次日菜单必须包含早餐、午餐、晚餐、条件加餐、训练日调整和肠胃异常调整；用餐环境以 `day-context.settings.meal_environment` 为准。
 5. 蛋白目标以 `day-context.settings.protein_target_g` 为准。达到目标下界后不得为了数字机械加餐。
 6. 不得只写“不补偿性节食”；必须明确写成“不跳餐、不清零主食、不极端压低热量，只撤掉重复加餐并恢复标准份量”。
-7. 用户补充同日记录后，旧复盘进入历史，新版本重新分析；不得静默覆盖。
+7. 用户补充同日记录后必须重新分析。今天或未来且尚无执行反馈、救场或学习引用的生成结果原位替换，不进入产品历史；日期已过或已有真实证据的结果才归档旧版并追加正式版本。
 8. 使用 `day-complete YYYY-MM-DD --file result.json` 提交，禁止直接改数据库绕过校验。
 9. `day-context` 中的 `priority_foods` 必须逐项评估；结果的 `priority_food_decisions` 必须覆盖全部高优先级食品，标明 `use` 或 `skip` 及具体原因。
 10. 高优先级只表示满足对应功能条件时优先；具体食品用途、份量和跳过条件必须读取食品库及私人设置，不得在公开规则中假定。
 11. 三餐的长期默认方式来自版本化个人策略；`day-context.meal_mode_resolution.overrides` 中明确的单日安排优先，最终必须严格采用 `effective_meal_modes`。`eat_out` 餐次提供外食选择规则且不得生成 `recipe_card`；每个 `home_cook` 餐次分别生成一人份新手执行卡，并读取 `recent_home_meals`、`recent_online_categories` 和 `home_cooking_generation_protocol`。
 12. `ingredient_carryover_obligations` 是上一轮复用计划推导出的可能剩余食材；生成明日菜单前必须逐项评估，并在 `ingredient_carryover_decisions` 覆盖全部项目。可用且临近窗口结束的食材优先进入明日午餐或晚餐；若今日记录否定库存、已坏或与肠胃状态冲突，必须使用 `skip` 或 `discard` 写清原因。
 13. 每个在家下厨餐次均不得超过个人策略中的时间和炊具限制；同一餐次连续下厨不得重复菜品或主风味。确因健康恢复、临期食材或采购限制重复时，必须使用允许的 `repeat_reason` 明确说明，不得用“方便”笼统绕过轮换。
+14. 不得通过修改 `dish_key`、日期、菜名或词序伪装轮换。提交前服务端会从实际菜名、食材、调味和步骤计算语义指纹；三餐完整重复一律拒绝，自炊近似重复仅在上下文确有健康恢复、临期食材或采购限制证据时放行。
 
 ## 开发约束
 

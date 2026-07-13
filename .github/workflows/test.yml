@@ -83,7 +83,10 @@ jobs:
           path: android/app/build/outputs/apk/debug/app-debug.apk
 
   android-instrumentation:
-    runs-on: ubuntu-latest
+    # The emulator action is designed for hardware-accelerated macOS runners.
+    # Ubuntu's no-KVM fallback can report sys.boot_completed before Android's
+    # package/input/settings services are stable enough to run instrumentation.
+    runs-on: macos-15-intel
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
@@ -115,7 +118,10 @@ jobs:
             --home "$RUNNER_TEMP/python-prepare" \
             --state "$RUNNER_TEMP/cross-client-state.json"
           SYNC_RECOVERY=$(uv run python -c 'import json,os; print(json.load(open(os.path.join(os.environ["RUNNER_TEMP"], "cross-client-state.json")))["recovery_key"])')
-          echo "SYNC_RECOVERY=$SYNC_RECOVERY" >> "$GITHUB_ENV"
+          # healthz responses do not end with a newline. Force the workflow
+          # command onto its own line so GitHub actually registers the mask.
+          printf '\n::add-mask::%s\n' "$SYNC_RECOVERY"
+          printf 'SYNC_RECOVERY=%s\n' "$SYNC_RECOVERY" >> "$GITHUB_ENV"
       - uses: reactivecircus/android-emulator-runner@v2
         with:
           api-level: 35

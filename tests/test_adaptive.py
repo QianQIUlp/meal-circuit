@@ -149,6 +149,12 @@ class AdaptiveDomainTest(unittest.TestCase):
             self._complete_standard_profile()
         service.add_daily_record(review_date, "记录当天实际饮食。")
         result = _review_result(review_date, dinner_food)
+        variant = date.fromisoformat(review_date).day
+        meals = {meal["name"]: meal for meal in result["tomorrow_menu"]["meals"]}
+        meals["早餐"]["foods"] = [f"早餐谷物{variant}", "牛奶", f"水果{variant}"]
+        meals["午餐"]["foods"] = [f"午餐蛋白{variant}", "米饭", f"蔬菜{variant}"]
+        meals["晚餐"]["foods"] = [f"{dinner_food}·轮换{variant}", "米饭", f"蔬菜{variant}"]
+        meals["晚餐"]["strategy_key"] = f"strategy:{dinner_food}"
         settings = load_resolved_settings()
         result["tomorrow_menu"]["protein_target_g"] = settings["protein_target_g"]
         result["tomorrow_menu"]["environment"] = settings["meal_environment"]

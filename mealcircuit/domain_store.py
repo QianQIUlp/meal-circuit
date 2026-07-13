@@ -32,6 +32,10 @@ def task_input_entity_id(task_id: str) -> str:
     return f"task_input_{uuid.uuid5(UUID_NAMESPACE, task_id)}"
 
 
+def active_result_entity_id(source_entity_id: str) -> str:
+    return f"result_{uuid.uuid5(UUID_NAMESPACE, f'active-result:{source_entity_id}')}"
+
+
 def decode_row(row: sqlite3.Row) -> dict:
     item = dict(row)
     for key, value in list(item.items()):
@@ -448,7 +452,15 @@ def capture_derived_result(
     result_version: int,
     result: dict,
     provenance: dict,
+    entity_id: str | None = None,
 ) -> DomainRevision:
+    parent_revision_ids: list[str] = []
+    if entity_id:
+        head = connection.execute(
+            "SELECT revision_id FROM entity_heads WHERE entity_id=?", (entity_id,)
+        ).fetchone()
+        if head:
+            parent_revision_ids.append(head["revision_id"])
     revision = make_revision(
         "analysis_result",
         {
@@ -458,11 +470,47 @@ def capture_derived_result(
             "result": result,
             "provenance": provenance,
         },
-        entity_id=new_id("result"),
+        entity_id=entity_id or new_id("result"),
+        parent_revision_ids=parent_revision_ids,
         author_device_id=_metadata(connection, "device_id"),
     )
     _persist_projection(connection, revision)
     return revision
+
+
+def tombstone_derived_results(
+    connection: sqlite3.Connection,
+    *,
+    source_entity_id: str,
+    keep_entity_id: str | None = None,
+) -> list[str]:
+    """Tombstone obsolete result heads so sync cannot resurrect generated mistakes."""
+    tombstoned = []
+    rows = connection.execute(
+        """SELECT h.entity_id,h.revision_id,r.payload_json,r.deleted
+           FROM entity_heads h JOIN domain_revisions r ON r.revision_id=h.revision_id
+           WHERE h.entity_kind='analysis_result'"""
+    ).fetchall()
+    for row in rows:
+        if row["entity_id"] == keep_entity_id or row["deleted"]:
+            continue
+        try:
+            payload = json.loads(row["payload_json"])
+        except json.JSONDecodeError:
+            continue
+        if payload.get("source_entity_id") != source_entity_id:
+            continue
+        revision = make_revision(
+            "analysis_result",
+            payload,
+            entity_id=row["entity_id"],
+            parent_revision_ids=[row["revision_id"]],
+            author_device_id=_metadata(connection, "device_id"),
+            deleted=True,
+        )
+        _persist_projection(connection, revision)
+        tombstoned.append(row["entity_id"])
+    return tombstoned
 
 
 def capture_correction(connection: sqlite3.Connection, correction_id: str) -> DomainRevision:
