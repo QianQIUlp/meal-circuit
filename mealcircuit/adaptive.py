@@ -7,9 +7,11 @@ from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
+from .configuration import configured_today
 from .db import connect, init_db, row_dict
 from .meal_modes import meal_rotation
 from .personalization import active_personalization, require_generation
+from .review_lifecycle import revision_policy
 from .validation import VALIDATOR_VERSION, ValidationError
 
 
@@ -288,6 +290,10 @@ def get_plan_for_date(plan_date: str, *, include_restricted_history: bool = Fals
                 "SELECT * FROM plan_items WHERE plan_version_id=? ORDER BY sort_order",
                 (projected["id"],),
             ).fetchall()
+            projected_review = conn.execute(
+                "SELECT * FROM daily_reviews WHERE id=?", (projected["review_id"],)
+            ).fetchone()
+            projected_policy = revision_policy(conn, row_dict(projected_review), configured_today())
         rows = conn.execute(
             "SELECT * FROM daily_reviews WHERE status='completed' ORDER BY review_date DESC,updated_at DESC"
         ).fetchall()
@@ -318,6 +324,7 @@ def get_plan_for_date(plan_date: str, *, include_restricted_history: bool = Fals
             "safety_mode": plan_version.get("review_mode") or "setup_required",
             "policy_version": plan_version["policy_version"],
             "context_hash": plan_version["context_hash"],
+            "revision_policy": projected_policy,
             "scope_current": _plan_scope_current(plan_version["source_manifest_json"], plan_version.get("review_mode") or "setup_required"),
         }
     for row in rows:
@@ -333,6 +340,8 @@ def get_plan_for_date(plan_date: str, *, include_restricted_history: bool = Fals
             meals.append(enriched)
         feedback = list_plan_feedback(plan_date, review_id=review["id"], result_version=review["result_version"])
         feedback_by_item = {item["plan_item_id"]: item for item in feedback}
+        with connect() as conn:
+            fallback_policy = revision_policy(conn, review, configured_today())
         return {
             "review_id": review["id"],
             "review_date": review["review_date"],
@@ -343,6 +352,7 @@ def get_plan_for_date(plan_date: str, *, include_restricted_history: bool = Fals
             "source_manifest": review.get("source_manifest_json") or {},
             "safety_mode": review.get("review_mode") or "setup_required",
             "policy_version": review.get("policy_version") or "",
+            "revision_policy": fallback_policy,
             "scope_current": _plan_scope_current(review.get("source_manifest_json") or {}, review.get("review_mode") or "setup_required"),
         }
     return None

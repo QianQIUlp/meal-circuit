@@ -2,6 +2,27 @@
 
 > 项目于 2026-07-02 从 DietOS 更名为 MealCircuit（食回路）。以下旧名称保留为真实历史记录。
 
+## 2026-07-13：稳定 PR #19 的 Android 双向同步验收
+
+- 目标：修复 PR #19 唯一失败的 `android-instrumentation`，保持真实 Python ↔ Android 双向同步测试和现有 Android 测试强度不变。
+- 改动文件：仅调整 `.github/workflows/test.yml` 的 instrumentation runner 与合成恢复字符串日志遮罩，并记录本轮过程；未修改 Android 业务逻辑、同步协议或测试命令。
+- 根因：Ubuntu 无 KVM 模拟器耗时约 434 秒后报告 `sys.boot_completed=1`，但 `connectedDebugAndroidTest` 安装 APK 时 Android package service 返回 `Broken pipe (32)`，最终只启动 0 个 instrumentation 测试；后续 Python 验证因 Android 没有产生离线 revision 而失败。这是与 PR #18 同源的模拟器服务时序故障，不是菜单语义或同步业务回归。
+- 核心功能：把 instrumentation job 移到已在 PR #18 验证通过的 `macos-15-intel` 硬件加速 runner；保留 API 35、`x86_64`、真实同步服务、`connectedDebugAndroidTest` 和双向验证。写入 `GITHUB_ENV` 前用独立换行的 `printf` 注册 `add-mask`，避免无结尾换行的 healthz 响应吞并工作流命令并在环境摘要中回显合成恢复字符串。
+- 验证：修改前已下载 PR #19 的失败 job 专属日志并确认上述根因，同时确认 PR #18 的同源补丁及其 macOS instrumentation 已成功。修改后 workflow YAML 真实解析、`git diff --check` 和发布扫描通过，基础 `test.ps1` 124 项通过（26 项可选依赖测试按设计跳过）。本机没有 Android SDK，Gradle 在解析任务依赖前明确停止，未把本地 Android 三项误报为通过；推送后由已配置 SDK 的 `android` job 执行 `testDebugUnitTest lintDebug compileDebugAndroidTestKotlin`，最终结果以完整 CI 和日志密钥扫描为准。
+- 仍未实现：本修复不改变正式 APK/AAB 签名配置，也不降低或跳过 instrumentation；正式 tag 仍受既有签名门禁约束。
+- 下一最小任务：推送当前修复，等待 `test` 与 `release-builds` 全绿，并扫描完成日志确认恢复字符串正则零命中。
+- 用户用法：无需改变；这是 CI runner 与日志安全修复。
+
+## 2026-07-13：菜单语义轮换与生成记录生命周期
+
+- 目标：阻止仅复制旧菜单、改日期或标签的低质量生成，并让尚未执行的 Agent 错误可直接替换，而不污染用户看到的正式历史。
+- 改动文件：新增 `mealcircuit/menu_semantics.py` 与 `review_lifecycle.py`；扩展复盘提交/生成、计划投影、领域同步、CLI、Web、规则、双语 README 和自动化测试。
+- 核心功能：服务端从菜名、食材、调味、步骤和技法计算语义指纹，旧结果没有 `rotation` 也能反向比较；完整重复全部拒绝，自炊近似重复只接受有上下文证据的健康恢复、临期食材或采购限制。内置生成候选先在内存完成结构、安全、约束和语义校验，最多自动重试两次，通过后才入库。今天及未来、无执行证据的计划原位更新同一版本与计划项；已有回执、救场、学习引用或已过期结果锁定后才追加正式历史。同步层以稳定 active-result 实体更新当前生成物，定向清理会为旧派生实体写 tombstone。
+- 验证：124 项 `test.ps1` 全部通过（26 项可选 E2EE/PostgreSQL 依赖按设计跳过）；`compileall`、发布扫描和 `git diff --check` 通过。新增覆盖语义改名/词序/旧 rotation、食材承接换蛋白风味技法、早餐基础食材复用与完整组合重复、三次候选重试、失败后原计划不变、可替换/锁定、执行反馈版本化、定向清理和同步 tombstone。真实 Edge/Playwright 检查 `reviews/2026-07-12` 与 `plans/2026-07-13`：页面身份正确、单一 h1、360px 无横向溢出、控制台零 warning/error，主题按钮从 light 切换到 dark；内置浏览器运行时因本机 kernel assets 路径错误无法初始化，已记录降级原因。真实库清理预检发现 v1 已有关联的 `modified` 执行回执与已完成救场，证据门按设计停止，未删除 v1–v4 或任何事实数据。
+- 仍未实现：语义词表是确定性中文/英文常见食材与技法集合，不替代营养专业判断；同步服务的可选 E2EE/PostgreSQL 集成仍需对应依赖与测试地址才会运行。
+- 下一最小任务：推送 Draft PR 并等待 CI；真实库 v1–v4 因已有执行证据必须保留，除非用户未来明确将对应回执和救场判定为误操作并另行授权事实级修复。
+- 用户用法：照常提交或生成复盘；重复菜单会返回包含日期、餐次和冲突维度的错误。页面会标明当前计划“可替换”或“已锁定”。维护清理先运行 `review-cleanup DATE --expected-version N` 预览，再明确追加 `--apply`。
+
 ## 2026-07-12：单日逐餐安排覆盖长期默认
 
 - 目标：用户明确说明“明天午餐外食、晚餐自炊”时，复盘与执行计划直接显示这一有效安排，而不是先生成虚假自炊菜单再用救场修正。
