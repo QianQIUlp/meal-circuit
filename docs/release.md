@@ -1,6 +1,6 @@
 # Release process
 
-The `release-builds` workflow builds each desktop platform natively because PyInstaller cannot cross-compile. It produces Windows x64 portable ZIP and Inno Setup installer, a verified macOS universal2 DMG, Linux x86_64 AppImage, Android release APK/AAB, SHA-256 checksums and a CycloneDX SBOM.
+The `release-builds` workflow builds each desktop platform natively because PyInstaller cannot cross-compile. It produces Windows x64 portable ZIP and Inno Setup installer, a verified macOS universal2 DMG, Linux x86_64 AppImage, Android release APK/AAB, SHA-256 checksums and a CycloneDX SBOM. The macOS workflow freezes and smoke-tests independent ARM64 and Intel slices on their native GitHub runners, then matches and combines every Mach-O file with `lipo`, verifies both architectures, signs the merged app and smoke-tests it again before creating the DMG.
 
 Required release checks are Python 3.11/3.13, PostgreSQL 18 integration, Android unit/build/lint, emulator instrumentation, Alembic upgrade, OpenAPI freshness, dependency audit, license inventory and release-data scan.
 

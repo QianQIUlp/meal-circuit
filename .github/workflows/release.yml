@@ -84,8 +84,51 @@ jobs:
             dist/MealCircuit-*-windows-x64-portable.zip
             dist/MealCircuit-*-windows-x64-setup.exe
 
+  macos-build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: macos-15
+          - arch: x86_64
+            runner: macos-15-intel
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install python.org universal2 Python
+        run: |
+          curl --fail --location --retry 5 -o "$RUNNER_TEMP/python.pkg" https://www.python.org/ftp/python/3.13.5/python-3.13.5-macos11.pkg
+          pkgutil --check-signature "$RUNNER_TEMP/python.pkg" | grep -q "Python Software Foundation"
+          sudo installer -pkg "$RUNNER_TEMP/python.pkg" -target /
+          /Library/Frameworks/Python.framework/Versions/3.13/bin/python3 -c "import platform; print(platform.platform())"
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.8.22"
+          enable-cache: true
+      - name: Install locked dependencies
+        run: |
+          PY=/Library/Frameworks/Python.framework/Versions/3.13/bin/python3
+          uv sync --locked --extra desktop --no-dev --python "$PY"
+      - name: Build native app slice
+        env:
+          MEALCIRCUIT_TARGET_ARCH: ${{ matrix.arch }}
+        run: .venv/bin/pyinstaller --noconfirm --clean packaging/mealcircuit.spec
+      - name: Verify native slice and smoke test
+        run: |
+          file dist/MealCircuit.app/Contents/MacOS/MealCircuit | tee "$RUNNER_TEMP/file.txt"
+          grep -q "${{ matrix.arch }}" "$RUNNER_TEMP/file.txt"
+          MEALCIRCUIT_HOME="$RUNNER_TEMP/desktop-smoke" dist/MealCircuit.app/Contents/MacOS/MealCircuit --smoke-test
+      - name: Archive app slice
+        run: tar -C dist -czf "MealCircuit-${{ matrix.arch }}.tar.gz" MealCircuit.app
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-app-${{ matrix.arch }}
+          path: MealCircuit-${{ matrix.arch }}.tar.gz
+
   macos-universal:
-    runs-on: macos-14
+    needs: macos-build
+    runs-on: macos-15
     env:
       APPLE_SIGNING_AVAILABLE: ${{ secrets.APPLE_CERTIFICATE_BASE64 != '' }}
     steps:
@@ -103,35 +146,24 @@ jobs:
           test -n "$APPLE_CERTIFICATE_BASE64" && test -n "$APPLE_CERTIFICATE_PASSWORD"
           test -n "$APPLE_SIGNING_IDENTITY" && test -n "$APPLE_ID"
           test -n "$APPLE_APP_PASSWORD" && test -n "$APPLE_TEAM_ID"
-      - name: Install python.org universal2 Python
-        run: |
-          curl --fail --location --retry 5 -o "$RUNNER_TEMP/python.pkg" https://www.python.org/ftp/python/3.13.5/python-3.13.5-macos11.pkg
-          pkgutil --check-signature "$RUNNER_TEMP/python.pkg" | grep -q "Python Software Foundation"
-          sudo installer -pkg "$RUNNER_TEMP/python.pkg" -target /
-          /Library/Frameworks/Python.framework/Versions/3.13/bin/python3 -c "import platform; print(platform.platform())"
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/download-artifact@v4
         with:
-          version: "0.8.22"
-          enable-cache: true
-      - name: Install locked dependencies
+          pattern: macos-app-*
+          path: slices
+      - name: Merge and verify universal2 app
         run: |
-          PY=/Library/Frameworks/Python.framework/Versions/3.13/bin/python3
-          uv sync --locked --extra desktop --no-dev --python "$PY"
-          ARCHFLAGS="-arch x86_64 -arch arm64" uv pip install --python .venv/bin/python --reinstall --no-binary cffi "cffi==2.1.0"
-          file .venv/lib/python3.13/site-packages/_cffi_backend*.so | tee "$RUNNER_TEMP/cffi-file.txt"
-          grep -q x86_64 "$RUNNER_TEMP/cffi-file.txt"
-          grep -q arm64 "$RUNNER_TEMP/cffi-file.txt"
-      - name: Build universal2 app
-        env:
-          MEALCIRCUIT_TARGET_ARCH: universal2
-        run: .venv/bin/pyinstaller --noconfirm --clean packaging/mealcircuit.spec
-      - name: Verify slices and smoke test
-        run: |
+          mkdir -p "$RUNNER_TEMP/arm" "$RUNNER_TEMP/intel" dist
+          tar -C "$RUNNER_TEMP/arm" -xzf slices/macos-app-arm64/MealCircuit-arm64.tar.gz
+          tar -C "$RUNNER_TEMP/intel" -xzf slices/macos-app-x86_64/MealCircuit-x86_64.tar.gz
+          python3 packaging/macos/merge_universal.py "$RUNNER_TEMP/arm/MealCircuit.app" "$RUNNER_TEMP/intel/MealCircuit.app" dist/MealCircuit.app
           file dist/MealCircuit.app/Contents/MacOS/MealCircuit | tee "$RUNNER_TEMP/file.txt"
           grep -q x86_64 "$RUNNER_TEMP/file.txt"
           grep -q arm64 "$RUNNER_TEMP/file.txt"
-          MEALCIRCUIT_HOME="$RUNNER_TEMP/desktop-smoke" dist/MealCircuit.app/Contents/MacOS/MealCircuit --smoke-test
-      - name: Codesign and notarize when Apple secrets are available
+      - name: Sign universal app
+        run: |
+          codesign --deep --force --sign - dist/MealCircuit.app
+          MEALCIRCUIT_HOME="$RUNNER_TEMP/universal-smoke" dist/MealCircuit.app/Contents/MacOS/MealCircuit --smoke-test
+      - name: Codesign with release identity when configured
         if: env.APPLE_SIGNING_AVAILABLE == 'true'
         env:
           APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
