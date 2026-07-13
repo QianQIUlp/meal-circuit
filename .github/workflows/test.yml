@@ -52,7 +52,7 @@ jobs:
         with:
           version: "0.8.22"
           enable-cache: true
-      - run: uv sync --locked --extra server --group dev
+      - run: uv sync --locked --extra server --extra sync --group dev
       - run: uv run alembic -c sync_server/alembic.ini upgrade head
       - run: uv run python -m unittest discover -s tests -v
       - run: uv run python tools/generate_openapi.py --check
@@ -95,7 +95,7 @@ jobs:
         with:
           version: "0.8.22"
           enable-cache: true
-      - run: uv sync --locked --extra server --group dev
+      - run: uv sync --locked --extra server --extra sync --group dev
       - name: Start real sync service and seed Python desktop revision
         run: |
           export MEALCIRCUIT_SYNC_DATABASE_URL="sqlite+pysqlite:///$RUNNER_TEMP/cross-client-server.db"
