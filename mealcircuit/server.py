@@ -1435,6 +1435,10 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 self.send_html("初始化", render_setup_step(session, step))
             elif path == "/":
+                status = personalization.onboarding_status()
+                if status["status"] == "setup_required":
+                    self.send_html("初始化", render_setup_start(status))
+                    return
                 legacy_snapshot = re.sub(
                     r"<h1(\b[^>]*)>", r"<h2\1>", render_dashboard(service.dashboard_snapshot())
                 ).replace("</h1>", "</h2>")

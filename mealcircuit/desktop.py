@@ -6,8 +6,8 @@ import webbrowser
 from http.server import ThreadingHTTPServer
 from urllib.request import urlopen
 
-from .db import init_db
-from .server import Handler
+from mealcircuit.db import init_db
+from mealcircuit.server import Handler
 
 
 def main() -> None:
@@ -23,7 +23,7 @@ def main() -> None:
     worker.start()
     try:
         if args.smoke_test:
-            with urlopen(address, timeout=10) as response:
+            with urlopen(f"{address}/setup", timeout=10) as response:
                 if response.status != 200 or b"MealCircuit" not in response.read():
                     raise RuntimeError("desktop smoke test failed")
             return

@@ -958,6 +958,40 @@ class MealCircuitTest(unittest.TestCase):
             self.assertIn("forbidden_private_directory", reasons)
 
 
+class FirstRunWebAppTest(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.home = Path(self.temp.name)
+        self.old_environment = {
+            key: os.environ.get(key) for key in ("MEALCIRCUIT_HOME", "MEALCIRCUIT_DB")
+        }
+        os.environ["MEALCIRCUIT_HOME"] = str(self.home)
+        os.environ["MEALCIRCUIT_DB"] = str(self.home / "mealcircuit.db")
+        init_db()
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+        restore_environment(self.old_environment)
+        self.temp.cleanup()
+
+    def test_brand_new_home_renders_onboarding_without_settings(self):
+        conn = http.client.HTTPConnection("127.0.0.1", self.server.server_address[1], timeout=5)
+        try:
+            conn.request("GET", "/")
+            response = conn.getresponse()
+            body = response.read().decode("utf-8")
+        finally:
+            conn.close()
+        self.assertEqual(200, response.status)
+        self.assertIn("初始化", body)
+        self.assertFalse((self.home / "settings.json").exists())
+
+
 class WebAppTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()

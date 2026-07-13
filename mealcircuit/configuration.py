@@ -163,7 +163,14 @@ def load_resolved_settings() -> dict:
 
 
 def configured_today(settings: dict | None = None) -> date:
-    value = settings or load_settings(allow_missing_protein=True)
+    if settings is not None:
+        value = settings
+    elif settings_path().is_file():
+        value = load_settings(allow_missing_protein=True)
+    else:
+        # A brand-new installation must be able to render onboarding before
+        # private settings exist. Invalid existing settings still fail above.
+        value = {"timezone": "UTC"}
     timezone_name = str(value.get("timezone") or "UTC")
     # UTC is part of the standard library and must keep source checkouts usable on
     # Windows even before the package-managed ``tzdata`` dependency is installed.

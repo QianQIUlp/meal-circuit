@@ -117,6 +117,10 @@ jobs:
         run: |
           PY=/Library/Frameworks/Python.framework/Versions/3.13/bin/python3
           uv sync --locked --extra desktop --no-dev --python "$PY"
+          ARCHFLAGS="-arch x86_64 -arch arm64" uv pip install --python .venv/bin/python --reinstall --no-binary cffi "cffi==2.1.0"
+          file .venv/lib/python3.13/site-packages/_cffi_backend*.so | tee "$RUNNER_TEMP/cffi-file.txt"
+          grep -q x86_64 "$RUNNER_TEMP/cffi-file.txt"
+          grep -q arm64 "$RUNNER_TEMP/cffi-file.txt"
       - name: Build universal2 app
         env:
           MEALCIRCUIT_TARGET_ARCH: universal2
