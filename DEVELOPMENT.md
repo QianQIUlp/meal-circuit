@@ -2,6 +2,16 @@
 
 > 项目于 2026-07-02 从 DietOS 更名为 MealCircuit（食回路）。以下旧名称保留为真实历史记录。
 
+## 2026-07-13：现实的开源发布签名策略
+
+- 目标：让正式 `v*` tag 在缺少商业桌面签名凭据时仍能发布完整开源产物，同时继续把 Android release key 作为正式发布硬门禁。
+- 改动文件：仅调整 `.github/workflows/release.yml`、`docs/releases/v0.3.0.md`、发布工作流静态检查与对应单测，并记录本轮过程；未修改业务代码、Android 应用逻辑、同步协议或产物结构。
+- 核心功能：Android signing availability 必须同时具备 keystore、keystore 密码、alias 和 key 密码，正式 tag 继续逐项硬校验；Windows Authenticode availability 必须同时具备证书和密码，Apple availability 必须同时具备全部六项 Developer ID/notarization 凭据。桌面凭据完整时沿用现有正式签名流程，缺失或部分配置时发布未签名 Windows ZIP/installer 与仅 ad-hoc signed、未 notarize 的 macOS DMG，并在 tagged run 输出明确 warning 而不失败。
+- 验证：release workflow YAML 解析通过；新增 6 项策略静态测试通过，覆盖桌面硬门禁拒绝、Windows/Apple 部分凭据、Android 四项凭据和四平台 release 依赖；`python tools/dependency_check.py`、`python tools/release_check.py` 通过；完整 `.\test.ps1` 124 项通过（26 项可选依赖测试按设计跳过）；`git diff --check` 通过。
+- 仍未实现：未配置或修改任何 GitHub secret，未创建 tag 或 Release；Android 正式发布仍需要仓库所有者提供四项签名 secrets。Windows Authenticode 与 Apple Developer ID/notarization 继续是可选的分发信任增强项，不在本轮生成或代管商业证书。
+- 下一最小任务：仓库所有者配置四项 Android secrets 并在合并后从受保护的最新 main 创建正式 tag；发布后按 `SHA256SUMS.txt` 复核全部资产。
+- 用户用法：下载 `v0.3.0` 资产后先使用 `SHA256SUMS.txt` 校验；Windows 在未配置 Authenticode 时可能显示 Unknown Publisher，macOS 在未配置完整 Apple 凭据时需要按未 notarize 应用处理。
+
 ## 2026-07-12：单日逐餐安排覆盖长期默认
 
 - 目标：用户明确说明“明天午餐外食、晚餐自炊”时，复盘与执行计划直接显示这一有效安排，而不是先生成虚假自炊菜单再用救场修正。
