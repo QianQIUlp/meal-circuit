@@ -85,6 +85,60 @@ def check_release_tools() -> None:
         raise SystemExit("AppImage build tool SHA-256 is not pinned")
     if "sha256sum --check --strict" not in workflow:
         raise SystemExit("AppImage build tool checksum is not enforced")
+    check_release_workflow(workflow)
+
+
+def check_release_workflow(workflow: str) -> None:
+    forbidden_desktop_gates = (
+        "Require Authenticode secrets for tagged releases",
+        "Require Apple signing secrets for tagged releases",
+    )
+    for name in forbidden_desktop_gates:
+        if name in workflow:
+            raise SystemExit(f"Desktop tagged releases must not hard-fail on missing signing credentials: {name}")
+
+    availability = {
+        "WINDOWS_SIGNING_AVAILABLE": (
+            "WINDOWS_SIGNING_AVAILABLE: ${{ secrets.WINDOWS_CERTIFICATE_BASE64 != '' "
+            "&& secrets.WINDOWS_CERTIFICATE_PASSWORD != '' }}"
+        ),
+        "APPLE_SIGNING_AVAILABLE": (
+            "APPLE_SIGNING_AVAILABLE: ${{ secrets.APPLE_CERTIFICATE_BASE64 != '' "
+            "&& secrets.APPLE_CERTIFICATE_PASSWORD != '' && secrets.APPLE_SIGNING_IDENTITY != '' "
+            "&& secrets.APPLE_ID != '' && secrets.APPLE_APP_PASSWORD != '' "
+            "&& secrets.APPLE_TEAM_ID != '' }}"
+        ),
+        "ANDROID_SIGNING_AVAILABLE": (
+            "ANDROID_SIGNING_AVAILABLE: ${{ secrets.ANDROID_KEYSTORE_BASE64 != '' "
+            "&& secrets.ANDROID_KEYSTORE_PASSWORD != '' && secrets.ANDROID_KEY_ALIAS != '' "
+            "&& secrets.ANDROID_KEY_PASSWORD != '' }}"
+        ),
+    }
+    for variable, expression in availability.items():
+        if workflow.count(f"{variable}:") != 1 or expression not in workflow:
+            raise SystemExit(f"{variable} must require its complete credential set")
+
+    required_snippets = {
+        "Windows unsigned tagged-release warning": (
+            "- name: Warn when Windows tagged release is unsigned",
+            "if: startsWith(github.ref, 'refs/tags/v') && env.WINDOWS_SIGNING_AVAILABLE != 'true'",
+        ),
+        "Apple unsigned tagged-release warning": (
+            "- name: Warn when macOS tagged release lacks Developer ID signing",
+            "if: startsWith(github.ref, 'refs/tags/v') && env.APPLE_SIGNING_AVAILABLE != 'true'",
+        ),
+        "Android tagged-release signing gate": (
+            "- name: Require Android signing secrets for tagged releases",
+            "test -n \"$ANDROID_KEYSTORE_BASE64\" && test -n \"$ANDROID_KEYSTORE_PASSWORD\"",
+            "test -n \"$ANDROID_KEY_ALIAS\" && test -n \"$ANDROID_KEY_PASSWORD\"",
+        ),
+        "release build dependencies": (
+            "needs: [windows, macos-universal, linux, android]",
+        ),
+    }
+    for policy, snippets in required_snippets.items():
+        if any(snippet not in workflow for snippet in snippets):
+            raise SystemExit(f"Release workflow is missing required policy: {policy}")
 
 
 def main() -> None:
