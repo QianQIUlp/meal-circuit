@@ -5,9 +5,9 @@
 ## 2026-07-13：稳定 main 的 Android 模拟器验收
 
 - 目标：修复 PR #17 全绿但合并到 main 后 `android-instrumentation` 偶发失败的问题，确保正式发布前的 Python ↔ Android E2EE 验收可重复运行。
-- 改动文件：仅调整 `.github/workflows/test.yml` 的 instrumentation runner，并记录本轮过程；不改变 Android、同步协议、服务端或业务逻辑。
+- 改动文件：仅调整 `.github/workflows/test.yml` 的 instrumentation runner 与临时恢复字符串日志掩码，并记录本轮过程；不改变 Android、同步协议、服务端或业务逻辑。
 - 根因：普通 Android 编译、单测和 lint 均通过；失败发生在 Ubuntu 无 KVM 模拟器已经报告 `sys.boot_completed=1` 后，Android `input/settings` 服务仍返回 `Broken pipe`，`reactivecircus/android-emulator-runner` 因而在执行项目测试脚本前退出。PR 成功而 main 失败是同一工作流的基础设施时序抖动，不是 PR #17 的业务回归。
-- 核心功能：把真实 instrumentation job 移到 `macos-15-intel`，使用 GitHub 托管 macOS 的硬件加速虚拟化；保留 API 35、完整 Gradle instrumentation、真实同步服务、Python → Android → 新 Python 双向验证和服务端明文扫描。
+- 核心功能：把真实 instrumentation job 移到 `macos-15-intel`，使用 GitHub 托管 macOS 的硬件加速虚拟化；保留 API 35、完整 Gradle instrumentation、真实同步服务、Python → Android → 新 Python 双向验证和服务端明文扫描。写入 `GITHUB_ENV` 前使用 `add-mask` 隐藏合成恢复字符串，避免失败日志的环境摘要回显测试凭据。
 - 验证：工作流 YAML 解析、`git diff --check`、`python tools/release_check.py` 和基础 `.\test.ps1` 118 项通过（26 项可选依赖测试按设计跳过）；Android `testDebugUnitTest lintDebug compileDebugAndroidTestKotlin` 通过。最终以草稿 PR 的 macOS instrumentation、PostgreSQL 18、Android build 和发行矩阵为准。
 - 仍未实现：此修复不改变正式 APK/AAB 签名配置；正式 tag 仍要求仓库提供 Android、Apple 和 Windows 签名 secrets。
 - 下一最小任务：让草稿 PR CI 全绿后，由仓库所有者审阅合并，再从合并后的 main 创建正式签名 tag 和 GitHub Release。
