@@ -116,13 +116,7 @@ jobs:
           disable-animations: true
           script: |
             adb reverse tcp:18080 tcp:18080
-            RECOVERY=$(uv run python -c "import json,os; print(json.load(open(os.environ['RUNNER_TEMP'] + '/cross-client-state.json'))['recovery_key'])")
-            cd android
-            ./gradlew --no-daemon connectedDebugAndroidTest \
-              -Pandroid.testInstrumentationRunnerArguments.syncServerUrl=http://127.0.0.1:18080 \
-              -Pandroid.testInstrumentationRunnerArguments.syncLogin=cross-client \
-              -Pandroid.testInstrumentationRunnerArguments.syncPassword=synthetic-cross-client-password \
-              -Pandroid.testInstrumentationRunnerArguments.syncRecovery="$RECOVERY"
+            ./android/gradlew --no-daemon -p android connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.syncServerUrl=http://127.0.0.1:18080 -Pandroid.testInstrumentationRunnerArguments.syncLogin=cross-client -Pandroid.testInstrumentationRunnerArguments.syncPassword=synthetic-cross-client-password -Pandroid.testInstrumentationRunnerArguments.syncRecovery="$(uv run python -c \"import json,os; print(json.load(open(os.environ['RUNNER_TEMP'] + '/cross-client-state.json'))['recovery_key'])\")"
       - name: Verify Android revision from Python desktop client
         if: always()
         run: |
