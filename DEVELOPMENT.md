@@ -12,6 +12,19 @@
 - 下一最小任务：推送当前原子提交并确认 Draft PR 的双 Python 版本 CI 绿色。
 - 用户用法：进入“目标与边界”重新确认或首次初始化，在“现实限制”中分别选择三餐准备方式；午餐和晚餐都选“在家下厨”后，次日菜单会输出两张独立执行卡。
 
+## 2026-07-12：多端独立运行、E2EE 同步与发行基线
+
+- 目标：把 MealCircuit 从桌面 local-only 工作台升级为 Android 与桌面均可完整离线运行、可连接用户自选同步地址、远端只持有密文的 local-first 产品；保持账户、网络和模型 API 全部可选。
+- 改动文件：新增 `protocol/` 语言无关契约与夹具、`mealcircuit/domain*.py`、显式数据库迁移、Portable Data、桌面同步和安全存储、`sync_server/` 参考服务、完整原生 `android/` 工程、三平台桌面与 Android 发行配置、CI、威胁模型、备份恢复和协议文档；扩展现有服务、CLI、Web 同步/冲突界面和测试。
+- 领域与迁移：Domain v1 使用不可变 revision、完整 UUIDv4、父 revision 图、UTC RFC 3339 时间点和用户 IANA 时区；旧短 ID 继续读取。SQLite schema v1→v6 每步显式迁移并在修改前用 Backup API 留快照，失败恢复最初快照；真正旧表结构测试确认备份先于补列。配置文件作为版本实体同步并保持原子镜像，图片迁为内容寻址资产，缺失外部路径保留并由 doctor/同步状态提示。实现已语义合并主分支最新的自适应闭环、安全门、逐餐准备方式和计划投影，原有 Web/CLI 行为与 provenance 均继续通过回归。
+- Portable Data：桌面和 Android 均实现加密 `.mcx`、风险确认后的明文 ZIP、restore/merge preview+apply、领域级 round-trip、资产 SHA-256、revision 图合并，以及路径逃逸、重复项、压缩炸弹、截断、篡改、缺失引用和中途失败防护。Python 导入先在同卷兄弟目录完成全量 staging、验证和二次导出比较，再用恢复日志原子提升；进程中断后会回滚旧目录或确认已完整提升的新目录，不在正式目录补偿式写入。
+- 同步与安全：Sync v1 实现 HMAC 不透明实体 ID、HKDF 派生、AES-256-GCM、AAD 绑定、幂等 op、CAS、单调游标、90 天压缩/完整快照、三方合并、冲突 sibling、墓碑、4 MiB 加密附件分块、设备确认、恢复字符串、10 分钟一次性二维码、刷新令牌轮换、设备撤销和分阶段全量密钥轮换；未知新 schema 密文会完整保留但不被旧客户端物化或重写。FastAPI/PostgreSQL 18 参考服务只保存账户/设备元数据、密文状态、密文日志和加密 blob，提供 first-user 注册、配额、Alembic、Docker Compose、Caddy、可注入 `BlobStorage` 边界与无解密能力的管理 CLI。
+- 客户端：Python 保留浏览器和 Agent CLI，新增交互式同步 CLI、Web 冲突/设备/状态、keyring 与 pywebview/PyInstaller；Android 使用 Kotlin、Compose、Room、WorkManager、OkHttp 和系统相机/Photo Picker，实现记录、状态、任务、食品库、复盘、记忆、调整、配置、AI provider、导入导出、同步、设备、二维码、冲突和密钥轮换，Room 是所有 UI 的唯一读源。
+- 验证：合并最新主分支后，基础 `.\test.ps1` 共 113 项通过（未安装可选依赖时 26 项按设计跳过）；完整依赖环境 113 项中 112 项通过，仅本机未提供 PostgreSQL URL 的真实 PostgreSQL 项跳过。新增全新空目录首启回归，确认没有 `settings.json` 时直接显示初始化而不创建虚假配置；源码与 Windows PyInstaller 清洁包都在唯一临时目录通过 `--smoke-test`。11 项 Android JVM 测试、Android release lint、debug instrumentation 编译和模拟器 instrumentation 通过；另有 10 项连接真实参考服务的 instrumentation 全通过，并完成 Python 离线任务 → Android、Android 离线记录 → 新 Python 客户端的双向 E2EE 验收，同时扫描服务端数据库/WAL/备份、blob 和日志确认合成饮食明文、密码、恢复字符串及 API Key 零命中。Domain/OpenAPI/release/dependency 检查、Python compileall、`git diff --check`、通用 `uv.lock` 与 Android Gradle lock、Python 锁定依赖漏洞扫描、Alembic fresh/legacy 升级均通过。Android unsigned release APK/AAB 清洁构建通过；模拟器冷启动、总览、更多与同步设置页面无崩溃且关键文本/布局可见。CI 的测试与发行工作流会分别在 PR 上执行 PostgreSQL 18、双 Python、Android 模拟器和 Windows/macOS/Linux/Android 产物矩阵，并自动取消同一 PR 的旧运行。
+- 仍未实现：不包含 iOS、官方托管云、同设备快速账户切换、多人共享或服务器代理 AI。密码学未经过第三方审计；本机数据库不做 SQLCipher。macOS/Windows 正式签名、notarization、Play 发布需要用户提供平台账号与 CI secrets；tagged release 已设置硬门禁。桌面标准库无法可靠判断当前连接是否为 Wi-Fi/非计费网络，因此手动同步把 `all_wifi` 视为允许，Android 会按网络计费状态执行。
+- 下一最小任务：确认草稿 PR 的测试与四平台发行构建矩阵全部通过；任何平台失败都在同一 PR 内修复，不跳过签名账户之外的门禁。
+- 用户用法：不登录时照常本地使用。加密备份运行 `python -m mealcircuit.agent_cli export-data --output backup.mcx`；自托管服务按 `sync_server/README.md` 部署，再用 `sync-configure` 交互输入密码和恢复字符串。Android 直接安装 APK，本地功能无需服务器；进入“更多 → 同步”后填写兼容的 HTTPS Sync v1 地址才启用同步。
+
 ## 2026-07-09：CI 拒绝请求测试稳定性
 
 - 目标：修复 GitHub Actions Windows / Python 3.13 上 origin-policy 拒绝请求测试偶发 `ConnectionAbortedError` 的 CI 红灯。

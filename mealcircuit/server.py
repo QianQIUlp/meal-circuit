@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import html
 import io
 import ipaddress
@@ -8,7 +9,10 @@ import json
 import mimetypes
 import os
 import re
+import secrets
 import sys
+import threading
+import time
 import urllib.parse
 from datetime import date
 from email.parser import BytesParser
@@ -17,15 +21,17 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from . import adaptive, ai, checkins, personalization, portability, service
+from . import adaptive, ai, checkins, personalization, portability, service, sync
 from .configuration import initialize_private_home
-from .db import init_db
-from .storage import exports_root, port_value, upload_root
+from .db import connect, init_db
+from .storage import exports_root, managed_asset_root, port_value, upload_root
 from .validation import ValidationError, nutrition_number
 
 
 LOOPBACK_NAMES = {"localhost", "127.0.0.1", "::1"}
 STATIC_ROOT = Path(__file__).with_name("static")
+_PENDING_RECOVERY: dict[str, dict] = {}
+_PENDING_RECOVERY_LOCK = threading.Lock()
 
 
 def is_loopback_host(host_name: str | None) -> bool:
@@ -441,7 +447,7 @@ def render_rescue_page(rescue_id: str) -> str:
 
 
 def layout(title: str, body: str) -> bytes:
-    today = date.today()
+    today = service.configured_today()
     checkin_path = f"/check-ins/{today.isoformat()}"
     nav_groups = (
         ("工作台", (
@@ -461,6 +467,7 @@ def layout(title: str, body: str) -> bytes:
             ("/tasks/material", "原材料", "material", title == "原材料分析"),
             ("/tasks", "全部任务", "tasks", title == "任务列表"),
             ("/ai", "API 接入", "settings", title == "API 接入"),
+            ("/sync", "同步与设备", "sync", title == "同步与设备"),
             ("/foods", "食品营养库", "foods", title in {"食品营养库", "新增食品", "编辑食品"}),
             ("/history", "历史建议", "history", title == "历史建议"),
             ("/overview", "记录与记忆", "memory", title == "记录与记忆"),
@@ -484,7 +491,7 @@ def layout(title: str, body: str) -> bytes:
         "今日建议与明日菜单": "今日建议", "每日复盘": "每日复盘",
         "今日状态": "今日状态", "状态问答": "状态问答", "状态设置": "状态设置",
         "上传食物照片": "照片任务", "原材料分析": "原材料分析", "任务列表": "全部任务",
-        "任务详情": "任务详情", "API 接入": "API 接入", "食品营养库": "食品营养库", "新增食品": "新增食品",
+        "任务详情": "任务详情", "API 接入": "API 接入", "同步与设备": "同步与设备", "食品营养库": "食品营养库", "新增食品": "新增食品",
         "编辑食品": "编辑食品", "历史建议": "历史建议", "记录与记忆": "记录与记忆",
         "操作失败": "操作失败", "未找到": "未找到",
     }
@@ -492,11 +499,16 @@ def layout(title: str, body: str) -> bytes:
         f'<a class="button" href="/capture" aria-label="记录真实情况" title="记录真实情况">{icon("checkin")}记录</a>'
     )
     date_label = f"{today.month}月{today.day}日 周{'一二三四五六日'[today.weekday()]}"
+    try:
+        sync_enabled = bool(sync.sync_status().get("enabled"))
+    except Exception:
+        sync_enabled = False
+    storage_label = "本地优先 · 同步已启用" if sync_enabled else "仅存于本机"
     page = f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{esc(title)} · MealCircuit</title><link rel="icon" href="/assets/ui/favicon.svg" type="image/svg+xml"><script src="/assets/ui/theme-init.js?v=20260711a"></script><link rel="stylesheet" href="/assets/ui/app.css?v=20260711a"><script src="/assets/ui/app.js?v=20260711a" defer></script></head><body>
     <a class="skip-link" href="#main-content">跳到主要内容</a>
     <div class="app-shell"><aside class="app-sidebar" id="app-sidebar" aria-label="主导航"><a class="sidebar-brand" href="/">MealCircuit</a><nav class="sidebar-nav">{"".join(nav_sections)}</nav><div class="sidebar-footer"><button class="icon-button" type="button" data-nav-collapse aria-label="收起侧栏" title="收起侧栏">{icon("collapse")}</button></div></aside>
     <button class="nav-scrim" type="button" data-nav-close aria-label="关闭导航"></button>
-    <header class="app-topbar"><div class="topbar-start"><button class="icon-button mobile-menu" type="button" data-nav-open aria-controls="app-sidebar" aria-expanded="false" aria-label="打开导航">{icon("menu")}</button><p class="topbar-title">{esc(page_titles.get(title, title))}</p></div><div class="topbar-end"><button class="icon-button theme-toggle" type="button" data-theme-toggle aria-label="切换到浅色主题" title="切换到浅色主题" hidden><span class="icon icon-sun theme-target-light" aria-hidden="true"></span><span class="icon icon-moon theme-target-dark" aria-hidden="true"></span></button><span class="utility muted">{date_label}</span><span class="local-status">{icon("local")}<span>仅存于本机</span></span>{top_action}</div></header>
+    <header class="app-topbar"><div class="topbar-start"><button class="icon-button mobile-menu" type="button" data-nav-open aria-controls="app-sidebar" aria-expanded="false" aria-label="打开导航">{icon("menu")}</button><p class="topbar-title">{esc(page_titles.get(title, title))}</p></div><div class="topbar-end"><button class="icon-button theme-toggle" type="button" data-theme-toggle aria-label="切换到浅色主题" title="切换到浅色主题" hidden><span class="icon icon-sun theme-target-light" aria-hidden="true"></span><span class="icon icon-moon theme-target-dark" aria-hidden="true"></span></button><span class="utility muted">{date_label}</span><span class="local-status">{icon("local")}<span>{esc(storage_label)}</span></span>{top_action}</div></header>
     <main class="app-content" id="main-content" tabindex="-1">{body}</main></div></body></html>"""
     return page.encode("utf-8")
 
@@ -545,6 +557,15 @@ def render_task_generate_controls(task_id: str) -> str:
     return (
         f'<form method="post" action="/tasks/{esc(task_id)}/generate">'
         '<div class="form-actions"><button type="submit">用 API Key 生成</button></div></form>'
+    )
+
+
+def render_provenance_warning(provenance: dict | None) -> str:
+    if not provenance or not provenance.get("stale"):
+        return ""
+    return (
+        '<aside class="panel error" role="status"><strong>结果基于旧来源版本</strong>'
+        '<p>原结果已保留且不会静默覆盖；请按需重新生成。</p></aside>'
     )
 
 
@@ -875,7 +896,7 @@ def render_checkin_settings() -> str:
     return (
         '<section class="card"><div class="section-header"><div><p class="eyebrow">Signal preferences</p>'
         '<h1>每日状态设置</h1><p class="muted">隐藏、排序或把模块改为按需记录。</p></div>'
-        f'<a class="button secondary" href="/check-ins/{date.today().isoformat()}">返回今日状态</a></div>'
+        f'<a class="button secondary" href="/check-ins/{service.configured_today().isoformat()}">返回今日状态</a></div>'
         f'<form method="post" action="/check-ins/settings"><div class="settings-list">{"".join(rows)}</div>'
         '<div class="form-actions"><button type="submit">保存设置</button></div></form></section>'
     )
@@ -913,6 +934,115 @@ def render_ai_settings() -> str:
 <div class="grid two"><div><label for="ai-timeout">超时秒数</label><input id="ai-timeout" name="timeout_seconds" type="number" min="1" value="{esc(status["timeout_seconds"])}"></div>
 <div><label for="ai-max-output">最大输出 token</label><input id="ai-max-output" name="max_output_tokens" type="number" min="1" value="{esc(status["max_output_tokens"])}"></div></div>
 <div class="form-actions"><button type="submit">启用本次运行的 API Key 模式</button></div></form>{disable}</section>'''
+
+
+def render_sync_settings() -> str:
+    state = sync.sync_status()
+    conflicts = sync.list_conflicts()
+    if state["enabled"]:
+        try:
+            devices = sync.list_sync_devices()
+            device_cards = "".join(
+                '<article class="panel"><div class="section-header"><div>'
+                f'<h3>{esc(item.get("name") or "未命名设备")}</h3>'
+                f'<p class="muted">{esc("当前设备" if item.get("current") else "已撤销" if item.get("revoked") else "已授权")}</p>'
+                '</div>'
+                + (
+                    f'<form method="post" action="/sync/devices/{esc(item.get("id"))}/revoke" onsubmit="return confirm(\'立即撤销此设备？\')"><button class="danger" type="submit">撤销</button></form>'
+                    if not item.get("current") and not item.get("revoked") else ""
+                )
+                + '</div></article>'
+                for item in devices
+            ) or '<p class="muted">没有设备记录。</p>'
+        except ValidationError as exc:
+            device_cards = f'<p class="muted">同步服务当前不可达；本机功能不受影响。{esc(exc)}</p>'
+        conflict_cards = "".join(
+            '<article class="panel error">'
+            f'<h3>{esc(item["entity_kind"])} · {esc(item["entity_id"])}</h3>'
+            f'<p>冲突字段：{esc(", ".join(item["conflicting_paths"]))}</p>'
+            f'<details><summary>查看两个保留版本</summary><div class="grid two">'
+            f'<div><h4>本机版本</h4><pre>{esc(json.dumps(item["local_revision"]["payload"], ensure_ascii=False, indent=2))}</pre></div>'
+            f'<div><h4>远端版本</h4><pre>{esc(json.dumps(item["remote_revision"]["payload"], ensure_ascii=False, indent=2))}</pre></div>'
+            '</div></details><div class="actions">'
+            f'<form method="post" action="/sync/conflicts/{esc(item["id"])}/resolve"><button name="choice" value="local">保留本机版本</button></form>'
+            f'<form method="post" action="/sync/conflicts/{esc(item["id"])}/resolve"><button class="secondary" name="choice" value="remote">保留远端版本</button></form>'
+            '</div></article>'
+            for item in conflicts
+        ) or '<p class="muted">当前没有待解决冲突。</p>'
+        warning = (
+            '<p class="error">有当前客户端无法理解的新 schema 实体。密文已保留，请升级客户端后再处理。</p>'
+            if state["unknown_schema_entities"] else ""
+        )
+        if state.get("unresolved_assets"):
+            warning += (
+                f'<p class="error">有 {esc(state["unresolved_assets"])} 个照片资产尚未落到本机；'
+                '可能是按需照片，也可能是迁移时缺失的外部路径。请执行照片同步或用 doctor 检查。</p>'
+            )
+        media_policy = state.get("media_policy") or "all_wifi"
+        media_options = "".join(
+            f'<option value="{value}" {"selected" if media_policy == value else ""}>{label}</option>'
+            for value, label in (("all", "全部网络"), ("all_wifi", "仅非计费网络 / 手动桌面同步"), ("on_demand", "按需下载"))
+        )
+        on_demand_action = (
+            '<form method="post" action="/sync/now"><input type="hidden" name="include_on_demand_media" value="1">'
+            '<button class="secondary" type="submit">本次下载全部缺失照片</button></form>'
+            if media_policy == "on_demand" else ""
+        )
+        return f'''<section class="card"><div class="section-header"><div><p class="eyebrow">Optional E2EE sync</p>
+<h1>同步与设备</h1><p class="muted">本机数据库始终是读写源；同步服务只保存端到端加密的实体与照片分块。</p></div>
+<span class="status completed">已启用</span></div>
+<dl class="summary-list"><div><dt>服务</dt><dd>{esc(state["server_url"])}</dd></div><div><dt>账户</dt><dd>{esc(state["account_id"])}</dd></div>
+<div><dt>待上传</dt><dd>{esc(state["pending"])}</dd></div><div><dt>游标</dt><dd>{esc(state["cursor"])}</dd></div>
+<div><dt>冲突</dt><dd>{esc(state["conflicts"])}</dd></div><div><dt>照片策略</dt><dd>{esc(media_policy)}</dd></div></dl>{warning}
+<div class="actions"><form method="post" action="/sync/now"><button type="submit">立即同步</button></form>
+{on_demand_action}<form method="post" action="/sync/unlink" onsubmit="return confirm('取消本机同步关联？本地数据会完整保留。')"><button class="secondary" type="submit">取消本机同步</button></form></div>
+<form method="post" action="/sync/media-policy"><label for="sync-media-policy">照片同步策略</label>
+<select id="sync-media-policy" name="media_policy">{media_options}</select><div class="form-actions"><button class="secondary" type="submit">保存照片策略</button></div></form></section>
+<section class="card"><h2>冲突中心</h2><p class="muted">同字段并发值和删除对编辑不会按时间覆盖；两个版本会一直保留到你选择。</p>{conflict_cards}</section>
+<section class="card"><h2>设备</h2><p class="muted">撤销会立即使该设备的服务端令牌失效。</p>{device_cards}</section>
+<section class="card"><h2>安全轮换</h2><p>重新加密全部远端 revision 与照片，生成新恢复密钥，并撤销其他所有设备。轮换前必须解决冲突和未知 schema。</p>
+<form method="post" action="/sync/rotate/prepare" onsubmit="return confirm('开始安全轮换？确认后其他设备必须重新加入。')"><button class="danger" type="submit">开始安全轮换</button></form></section>
+<section class="card error"><h2>删除远端同步账户</h2><p>永久删除服务端账户、密文与附件；本机数据保留并自动转为仅本地模式。</p>
+<form method="post" action="/sync/delete-account" onsubmit="return confirm('永久删除远端同步账户？此操作无法撤销。')">
+<label for="sync-delete-password">账户密码</label><input id="sync-delete-password" name="password" type="password" autocomplete="current-password" required>
+<div class="form-actions"><button class="danger" type="submit">永久删除远端账户</button></div></form></section>'''
+    return '''<section class="card"><div class="section-header"><div><p class="eyebrow">Optional E2EE sync</p>
+<h1>同步与设备</h1><p class="muted">不登录也能永久离线使用。启用后可连接任意兼容的自托管同步 URL。</p></div><span class="status pending">未启用</span></div>
+<div class="grid two"><form method="post" action="/sync/configure"><h2>登录已有账户</h2><input type="hidden" name="action" value="login">
+<label for="sync-login-url">同步服务 URL</label><input id="sync-login-url" name="server_url" type="url" placeholder="https://sync.example.com" required>
+<label for="sync-login-name">登录名</label><input id="sync-login-name" name="login_name" autocomplete="username" required>
+<label for="sync-login-device">设备名称</label><input id="sync-login-device" name="device_name" required>
+<label for="sync-login-password">账户密码</label><input id="sync-login-password" name="password" type="password" autocomplete="current-password" required>
+<label for="sync-recovery">恢复密钥</label><input id="sync-recovery" name="recovery_key" type="password" autocomplete="off" required>
+<label><input type="checkbox" name="allow_insecure_localhost" value="1"> 仅本机调试允许 HTTP localhost</label>
+<div class="form-actions"><button type="submit">登录并解锁同步</button></div></form>
+<form method="post" action="/sync/configure"><h2>创建新账户</h2><input type="hidden" name="action" value="register">
+<label for="sync-register-url">同步服务 URL</label><input id="sync-register-url" name="server_url" type="url" placeholder="https://sync.example.com" required>
+<label for="sync-register-name">登录名</label><input id="sync-register-name" name="login_name" autocomplete="username" required>
+<label for="sync-register-device">设备名称</label><input id="sync-register-device" name="device_name" required>
+<label for="sync-register-password">账户密码（至少 12 字符）</label><input id="sync-register-password" name="password" type="password" autocomplete="new-password" minlength="12" required>
+<label for="sync-register-confirm">再次输入密码</label><input id="sync-register-confirm" name="password_confirm" type="password" autocomplete="new-password" minlength="12" required>
+<label><input type="checkbox" name="allow_insecure_localhost" value="1"> 仅本机调试允许 HTTP localhost</label>
+<div class="form-actions"><button type="submit">创建账户并生成恢复密钥</button></div></form></div></section>'''
+
+
+def render_recovery_confirmation(recovery_key: str, token: str) -> str:
+    return f'''<section class="card"><p class="eyebrow">One-time recovery key</p><h1>保存恢复密钥</h1>
+<p class="error">此密钥只显示一次。丢失全部设备且没有恢复密钥时，服务端无法恢复你的数据。</p>
+<pre>{esc(recovery_key)}</pre><form method="post" action="/sync/confirm-recovery">
+<input type="hidden" name="token" value="{esc(token)}"><label for="recovery-confirmation">完整重新输入恢复密钥</label>
+<input id="recovery-confirmation" name="recovery_key" type="password" autocomplete="off" required>
+<div class="form-actions"><button type="submit">我已保存，启用同步</button></div></form></section>'''
+
+
+def render_rotation_confirmation(recovery_key: str) -> str:
+    return f'''<section class="card"><p class="eyebrow">Account key rotation</p><h1>确认新的恢复密钥</h1>
+<p class="error">在完整重新输入前，旧密钥仍有效且轮换不会提交。确认后全部远端数据会重新加密，其他设备立即撤销。</p>
+<pre>{esc(recovery_key)}</pre><form method="post" action="/sync/rotate/confirm">
+<label for="rotation-recovery-confirmation">完整重新输入新的恢复密钥</label>
+<input id="rotation-recovery-confirmation" name="recovery_key" type="password" autocomplete="off" required>
+<div class="form-actions"><button type="submit">确认保存并完成轮换</button></div></form>
+<form method="post" action="/sync/rotate/abort"><button class="secondary" type="submit">中止轮换</button></form></section>'''
 
 
 def food_form(item: dict | None = None) -> str:
@@ -1305,6 +1435,10 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 self.send_html("初始化", render_setup_step(session, step))
             elif path == "/":
+                status = personalization.onboarding_status()
+                if status["status"] == "setup_required":
+                    self.send_html("初始化", render_setup_start(status))
+                    return
                 legacy_snapshot = re.sub(
                     r"<h1(\b[^>]*)>", r"<h2\1>", render_dashboard(service.dashboard_snapshot())
                 ).replace("</h1>", "</h2>")
@@ -1346,7 +1480,7 @@ class Handler(BaseHTTPRequestHandler):
                 daily = service.daily_state()
                 if daily["status"] == "completed":
                     review = daily["review"]
-                    content = render_daily_review_result(review["result_json"])
+                    content = render_provenance_warning(review.get("result_provenance_json")) + render_daily_review_result(review["result_json"])
                     state = f'<p><span class="status completed">completed</span> · 版本 {esc(review["result_version"])}</p>'
                 elif daily["status"] == "pending":
                     state = '<p><span class="status pending">pending</span></p>'
@@ -1372,7 +1506,7 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 self.send_html("历史建议", body)
             elif path == "/check-ins":
-                self.redirect(f"/check-ins/{date.today().isoformat()}")
+                self.redirect(f"/check-ins/{service.configured_today().isoformat()}")
             elif path == "/check-ins/settings":
                 self.send_html("状态设置", render_checkin_settings())
             elif path.startswith("/check-ins/"):
@@ -1392,12 +1526,14 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_html("任务列表", f'<section class="card"><h1>全部任务</h1>{task_table(service.list_tasks())}</section>')
             elif path == "/ai":
                 self.send_html("API 接入", render_ai_settings())
+            elif path == "/sync":
+                self.send_html("同步与设备", render_sync_settings())
             elif path.startswith("/tasks/"):
                 task_id = path.split("/")[2]
                 task = service.get_task(task_id)
                 media = f'<img class="photo" src="/media/{Path(task["image_path"]).name}" alt="上传的食物照片">' if task.get("image_path") else ""
                 if task["result_json"]:
-                    result = render_result(task["type"], task["result_json"])
+                    result = render_provenance_warning(task.get("result_provenance_json")) + render_result(task["type"], task["result_json"])
                 else:
                     result = (
                         f'<p>等待 Agent 处理。</p><pre>python -m mealcircuit.agent_cli context {esc(task_id)} --output context.json\n'
@@ -1426,13 +1562,13 @@ class Handler(BaseHTTPRequestHandler):
                 memories = "".join(f'<li><strong>{esc(m["kind"])}</strong> {esc(m["content"])} <span class="muted">{esc(m["evidence"])}</span></li>' for m in info["memories"]) or '<li class="muted">暂无长期记忆</li>'
                 adjustments = "".join(f'<li>{esc(a["content"])} <span class="muted">{esc(a["reason"])}</span></li>' for a in info["adjustments"]) or '<li class="muted">暂无当前调整</li>'
                 recent_reviews = info["daily_reviews"][:6]
-                body = f'''<div class="grid"><section class="card"><h1>新增每日记录</h1><form method="post" action="/records"><label for="record-date">日期</label><input id="record-date" type="date" name="record_date" value="{date.today().isoformat()}" required><label for="record-input">自然语言记录</label><textarea id="record-input" name="raw_input" required></textarea><div class="form-actions"><button>保存</button></div></form></section><section class="card"><h2>新增长期记忆</h2><form method="post" action="/memories"><label for="memory-kind">类型</label><select id="memory-kind" name="kind"><option value="preference">已验证偏好</option><option value="gut_trigger">肠胃触发</option><option value="constraint">约束</option><option value="other">其他</option></select><label for="memory-content">内容</label><textarea id="memory-content" name="content" required></textarea><label for="memory-evidence">证据</label><input id="memory-evidence" name="evidence"><div class="form-actions"><button>保存</button></div></form></section><section class="card"><h2>新增当前有效调整</h2><form method="post" action="/adjustments"><label for="adjustment-content">调整内容</label><textarea id="adjustment-content" name="content" required></textarea><label for="adjustment-reason">原因</label><input id="adjustment-reason" name="reason"><div class="form-actions"><button>保存</button></div></form></section></div><section class="card"><div class="section-header"><div><p class="eyebrow">Advice archive</p><h2>最近建议</h2></div><a class="button secondary" href="/history">查看全部</a></div>{render_review_cards(recent_reviews)}</section><section class="card"><h2>长期记忆</h2><ul>{memories}</ul></section><section class="card"><h2>当前有效调整</h2><ul>{adjustments}</ul></section>'''
+                body = f'''<div class="grid"><section class="card"><h1>新增每日记录</h1><form method="post" action="/records"><label for="record-date">日期</label><input id="record-date" type="date" name="record_date" value="{service.configured_today().isoformat()}" required><label for="record-input">自然语言记录</label><textarea id="record-input" name="raw_input" required></textarea><div class="form-actions"><button>保存</button></div></form></section><section class="card"><h2>新增长期记忆</h2><form method="post" action="/memories"><label for="memory-kind">类型</label><select id="memory-kind" name="kind"><option value="preference">已验证偏好</option><option value="gut_trigger">肠胃触发</option><option value="constraint">约束</option><option value="other">其他</option></select><label for="memory-content">内容</label><textarea id="memory-content" name="content" required></textarea><label for="memory-evidence">证据</label><input id="memory-evidence" name="evidence"><div class="form-actions"><button>保存</button></div></form></section><section class="card"><h2>新增当前有效调整</h2><form method="post" action="/adjustments"><label for="adjustment-content">调整内容</label><textarea id="adjustment-content" name="content" required></textarea><label for="adjustment-reason">原因</label><input id="adjustment-reason" name="reason"><div class="form-actions"><button>保存</button></div></form></section></div><section class="card"><div class="section-header"><div><p class="eyebrow">Advice archive</p><h2>最近建议</h2></div><a class="button secondary" href="/history">查看全部</a></div>{render_review_cards(recent_reviews)}</section><section class="card"><h2>长期记忆</h2><ul>{memories}</ul></section><section class="card"><h2>当前有效调整</h2><ul>{adjustments}</ul></section>'''
                 self.send_html("记录与记忆", body)
             elif path.startswith("/reviews/"):
                 review_date = path.split("/")[2]
                 review = service.get_daily_review(review_date)
                 if review["status"] == "completed":
-                    result = render_daily_review_result(review["result_json"])
+                    result = render_provenance_warning(review.get("result_provenance_json")) + render_daily_review_result(review["result_json"])
                 else:
                     result = (
                         '<p>等待 Agent 生成核心建议和次日菜单。</p>'
@@ -1452,8 +1588,20 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_html("每日复盘", body)
             elif path.startswith("/media/"):
                 filename = Path(path).name
-                target = (upload_root() / filename).resolve()
-                if target.parent != upload_root().resolve() or not target.is_file():
+                candidates = [
+                    (upload_root() / filename).resolve(),
+                    (managed_asset_root() / filename).resolve(),
+                ]
+                target = next(
+                    (
+                        item
+                        for item in candidates
+                        if item.is_file()
+                        and item.parent in {upload_root().resolve(), managed_asset_root().resolve()}
+                    ),
+                    None,
+                )
+                if target is None:
                     raise FileNotFoundError(filename)
                 data = target.read_bytes()
                 self.send_response(200)
@@ -1678,6 +1826,105 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/ai/disable":
                 ai.clear_runtime()
                 self.redirect("/ai")
+            elif path == "/sync/configure":
+                form = self.read_urlencoded()
+                allow_insecure = form.get("allow_insecure_localhost") == "1"
+                if form.get("action") == "login":
+                    sync.login_sync(
+                        server_url=form.get("server_url", ""),
+                        login_name=form.get("login_name", ""),
+                        password=form.get("password", ""),
+                        device_name=form.get("device_name", ""),
+                        recovery_key=form.get("recovery_key", ""),
+                        allow_insecure_localhost=allow_insecure,
+                    )
+                    self.redirect("/sync")
+                elif form.get("action") == "register":
+                    if form.get("password") != form.get("password_confirm"):
+                        raise ValidationError("两次输入的账户密码不一致")
+                    captured: list[str] = []
+                    sync.register_sync(
+                        server_url=form.get("server_url", ""),
+                        login_name=form.get("login_name", ""),
+                        password=form.get("password", ""),
+                        device_name=form.get("device_name", ""),
+                        confirm_recovery_key=lambda value: not captured.append(value),
+                        allow_insecure_localhost=allow_insecure,
+                    )
+                    if len(captured) != 1:
+                        raise ValidationError("恢复密钥生成失败")
+                    with connect() as connection:
+                        connection.execute(
+                            "UPDATE sync_configuration SET enabled=0,updated_at=? WHERE singleton=1",
+                            (service.now(),),
+                        )
+                    pending_token = secrets.token_urlsafe(32)
+                    with _PENDING_RECOVERY_LOCK:
+                        _PENDING_RECOVERY[pending_token] = {
+                            "digest": hashlib.sha256(captured[0].encode("utf-8")).hexdigest(),
+                            "expires_at": time.monotonic() + 15 * 60,
+                        }
+                    self.send_html(
+                        "同步与设备",
+                        render_recovery_confirmation(captured[0], pending_token),
+                    )
+                else:
+                    raise ValidationError("未知同步配置操作")
+            elif path == "/sync/confirm-recovery":
+                form = self.read_urlencoded()
+                token = form.get("token", "")
+                with _PENDING_RECOVERY_LOCK:
+                    pending = _PENDING_RECOVERY.get(token)
+                if not pending or pending["expires_at"] < time.monotonic():
+                    raise ValidationError("恢复密钥确认已过期，请重新登录")
+                normalized = form.get("recovery_key", "").strip().upper()
+                digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+                if not secrets.compare_digest(digest, pending["digest"]):
+                    raise ValidationError("恢复密钥不匹配；同步仍未启用")
+                with connect() as connection:
+                    connection.execute(
+                        "UPDATE sync_configuration SET enabled=1,updated_at=? WHERE singleton=1",
+                        (service.now(),),
+                    )
+                with _PENDING_RECOVERY_LOCK:
+                    _PENDING_RECOVERY.pop(token, None)
+                self.redirect("/sync")
+            elif path == "/sync/now":
+                form = self.read_urlencoded()
+                sync.sync_now(include_on_demand_media=form.get("include_on_demand_media") == "1")
+                self.redirect("/sync")
+            elif path == "/sync/media-policy":
+                sync.set_media_policy(self.read_urlencoded().get("media_policy", ""))
+                self.redirect("/sync")
+            elif path == "/sync/rotate/prepare":
+                prepared = sync.prepare_account_key_rotation()
+                self.send_html("同步与设备", render_rotation_confirmation(prepared["recovery_key"]))
+            elif path == "/sync/rotate/confirm":
+                form = self.read_urlencoded()
+                sync.confirm_account_key_rotation(form.get("recovery_key", ""))
+                self.redirect("/sync")
+            elif path == "/sync/rotate/abort":
+                sync.abort_account_key_rotation()
+                self.redirect("/sync")
+            elif path.startswith("/sync/devices/") and path.endswith("/revoke"):
+                parts = path.strip("/").split("/")
+                if len(parts) != 4:
+                    raise ValidationError("设备撤销路径无效")
+                sync.revoke_sync_device(urllib.parse.unquote(parts[2]))
+                self.redirect("/sync")
+            elif path == "/sync/delete-account":
+                sync.delete_sync_account(self.read_urlencoded().get("password", ""))
+                self.redirect("/sync")
+            elif path == "/sync/unlink":
+                sync.unlink_sync()
+                self.redirect("/sync")
+            elif path.startswith("/sync/conflicts/") and path.endswith("/resolve"):
+                parts = path.strip("/").split("/")
+                if len(parts) != 4:
+                    raise ValidationError("同步冲突路径无效")
+                choice = self.read_urlencoded().get("choice", "")
+                sync.resolve_conflict(parts[2], choice)
+                self.redirect("/sync")
             elif path.startswith("/check-ins/"):
                 parts = path.strip("/").split("/")
                 if len(parts) != 4:

@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .meal_modes import legacy_home_meal_modes
+from .secret_store import backend_status, delete_secret, get_secret, set_secret
 from .validation import ValidationError
 
 
@@ -41,8 +42,8 @@ Transport = Callable[[str, dict[str, str], dict, int], dict]
 
 
 def ai_status() -> dict:
-    provider = (os.environ.get("MEALCIRCUIT_AI_PROVIDER") or "").strip().lower()
-    model = (os.environ.get("MEALCIRCUIT_AI_MODEL") or "").strip()
+    provider = _configured_value("MEALCIRCUIT_AI_PROVIDER", "ai.provider").lower()
+    model = _configured_value("MEALCIRCUIT_AI_MODEL", "ai.model")
     key_name = _key_name(provider) if provider in SUPPORTED_PROVIDERS else None
     return {
         "provider": provider or None,
@@ -50,25 +51,28 @@ def ai_status() -> dict:
         "provider_valid": provider in SUPPORTED_PROVIDERS,
         "model_configured": bool(model),
         "key_name": key_name,
-        "key_configured": bool(key_name and os.environ.get(key_name)),
+        "key_configured": bool(
+            key_name and (os.environ.get(key_name) or get_secret(f"ai.key.{provider}"))
+        ),
+        "secure_storage": backend_status(),
         "timeout_seconds": _int_environment("MEALCIRCUIT_AI_TIMEOUT_SECONDS", DEFAULT_TIMEOUT_SECONDS),
         "max_output_tokens": _int_environment("MEALCIRCUIT_AI_MAX_OUTPUT_TOKENS", DEFAULT_MAX_OUTPUT_TOKENS),
     }
 
 
 def load_config() -> AIConfig:
-    provider = (os.environ.get("MEALCIRCUIT_AI_PROVIDER") or "").strip().lower()
+    provider = _configured_value("MEALCIRCUIT_AI_PROVIDER", "ai.provider").lower()
     if not provider:
         raise ValidationError("缺少 MEALCIRCUIT_AI_PROVIDER；可选 openai、anthropic 或 deepseek")
     if provider not in SUPPORTED_PROVIDERS:
         raise ValidationError("MEALCIRCUIT_AI_PROVIDER 只能是 openai、anthropic 或 deepseek")
-    model = (os.environ.get("MEALCIRCUIT_AI_MODEL") or "").strip()
+    model = _configured_value("MEALCIRCUIT_AI_MODEL", "ai.model")
     if not model:
         raise ValidationError("缺少 MEALCIRCUIT_AI_MODEL；请明确填写要使用的模型名")
     key_name = _key_name(provider)
-    api_key = (os.environ.get(key_name) or "").strip()
+    api_key = (os.environ.get(key_name) or get_secret(f"ai.key.{provider}") or "").strip()
     if not api_key:
-        raise ValidationError(f"缺少 {key_name}；MealCircuit 不保存 API Key，只从环境变量读取")
+        raise ValidationError(f"缺少 {key_name}；请使用环境变量或系统安全存储")
     return AIConfig(
         provider=provider,
         model=model,
@@ -124,6 +128,31 @@ def clear_runtime() -> dict:
     ):
         os.environ.pop(key, None)
     return ai_status()
+
+
+def store_secure_config(provider: str, model: str, api_key: str) -> dict:
+    clean_provider = str(provider or "").strip().lower()
+    clean_model = str(model or "").strip()
+    clean_key = str(api_key or "").strip()
+    if clean_provider not in SUPPORTED_PROVIDERS or not clean_model or not clean_key:
+        raise ValidationError("供应商、模型名和 API Key 都必须有效")
+    backends = {
+        set_secret("ai.provider", clean_provider),
+        set_secret("ai.model", clean_model),
+        set_secret(f"ai.key.{clean_provider}", clean_key),
+    }
+    return {"stored": True, "backend": "system" if backends == {"system"} else "session", **ai_status()}
+
+
+def clear_secure_config() -> dict:
+    provider = str(get_secret("ai.provider") or "")
+    for name in ("ai.provider", "ai.model", *(f"ai.key.{item}" for item in SUPPORTED_PROVIDERS)):
+        delete_secret(name)
+    return {"cleared": True, "previous_provider": provider or None, **ai_status()}
+
+
+def _configured_value(environment: str, secret: str) -> str:
+    return str(os.environ.get(environment) or get_secret(secret) or "").strip()
 
 
 def generate_json(context: dict, kind: str, client: "AIProvider | None" = None) -> dict:

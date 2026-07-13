@@ -958,6 +958,40 @@ class MealCircuitTest(unittest.TestCase):
             self.assertIn("forbidden_private_directory", reasons)
 
 
+class FirstRunWebAppTest(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.home = Path(self.temp.name)
+        self.old_environment = {
+            key: os.environ.get(key) for key in ("MEALCIRCUIT_HOME", "MEALCIRCUIT_DB")
+        }
+        os.environ["MEALCIRCUIT_HOME"] = str(self.home)
+        os.environ["MEALCIRCUIT_DB"] = str(self.home / "mealcircuit.db")
+        init_db()
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+        restore_environment(self.old_environment)
+        self.temp.cleanup()
+
+    def test_brand_new_home_renders_onboarding_without_settings(self):
+        conn = http.client.HTTPConnection("127.0.0.1", self.server.server_address[1], timeout=5)
+        try:
+            conn.request("GET", "/")
+            response = conn.getresponse()
+            body = response.read().decode("utf-8")
+        finally:
+            conn.close()
+        self.assertEqual(200, response.status)
+        self.assertIn("初始化", body)
+        self.assertFalse((self.home / "settings.json").exists())
+
+
 class WebAppTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -996,10 +1030,12 @@ class WebAppTest(unittest.TestCase):
         raise AssertionError("unreachable")
 
     def test_pages_and_material_form(self):
-        for path in ("/", "/daily", "/history", "/tasks/photo", "/tasks/material", "/tasks", "/ai", "/foods", "/overview"):
+        for path in ("/", "/daily", "/history", "/tasks/photo", "/tasks/material", "/tasks", "/ai", "/sync", "/foods", "/overview"):
             status, _, body = self.request("GET", path)
             self.assertEqual(status, 200)
             self.assertIn(b"MealCircuit", body)
+            if path == "/sync":
+                self.assertIn("同步服务 URL", body.decode("utf-8"))
         status, home_headers, home = self.request("GET", "/")
         decoded_home = home.decode("utf-8")
         for label in ("今日结论", "今日状态", "明日计划", "处理队列", "照片任务", "原材料"):

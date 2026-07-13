@@ -1,0 +1,63 @@
+{
+  "schema_version": 1,
+  "modules": [
+    {
+      "key": "weight",
+      "label": "体重",
+      "description": "记录今天的体重和测量条件",
+      "questions": [
+        {"id": "measured", "label": "今天测体重了吗？", "type": "single", "options": [{"value": "yes", "label": "测了"}, {"value": "no", "label": "今天没测"}]},
+        {"id": "weight_kg", "label": "今天的体重是多少？", "type": "number", "suffix": "kg", "min": 20, "max": 400, "step": 0.1, "when": {"question_id": "measured", "values": ["yes"]}},
+        {"id": "measurement_context", "label": "这次是在什么情况下测的？", "type": "single", "allow_other_text": true, "options": [{"value": "morning_fasted", "label": "晨起空腹"}, {"value": "before_meal", "label": "饭前"}, {"value": "after_meal", "label": "饭后"}, {"value": "other", "label": "其他时间"}], "when": {"question_id": "measured", "values": ["yes"]}}
+      ]
+    },
+    {
+      "key": "training",
+      "label": "训练",
+      "description": "记录训练内容、时长和主观状态",
+      "questions": [
+        {"id": "trained", "label": "今天训练了吗？", "type": "single", "options": [{"value": "yes", "label": "训练了"}, {"value": "no", "label": "没有训练"}]},
+        {"id": "rest_reason", "label": "今天没有训练的情况是？", "type": "single", "options": [{"value": "rest_day", "label": "计划休息"}, {"value": "planned_not_done", "label": "原本计划但没完成"}, {"value": "recovery", "label": "身体不适或恢复中"}], "when": {"question_id": "trained", "values": ["no"]}},
+        {"id": "training_types", "label": "今天做了哪些训练？", "type": "multi", "options": [{"value": "strength", "label": "力量训练"}, {"value": "cardio", "label": "有氧"}, {"value": "sport", "label": "球类或其他运动"}, {"value": "mobility", "label": "拉伸或活动度"}], "when": {"question_id": "trained", "values": ["yes"]}},
+        {"id": "body_parts", "label": "力量训练覆盖了哪些部位？", "type": "multi", "allow_other_text": true, "options": [{"value": "chest", "label": "胸"}, {"value": "back", "label": "背"}, {"value": "shoulders", "label": "肩"}, {"value": "biceps", "label": "肱二头"}, {"value": "triceps", "label": "肱三头"}, {"value": "legs", "label": "腿"}, {"value": "core", "label": "核心"}, {"value": "full_body", "label": "全身"}, {"value": "other", "label": "其他"}], "when_contains": {"question_id": "training_types", "value": "strength"}},
+        {"id": "duration", "label": "训练了多长时间？", "type": "single", "options": [{"value": "under_30", "label": "30 分钟以内"}, {"value": "30_60", "label": "30–60 分钟"}, {"value": "60_90", "label": "60–90 分钟"}, {"value": "over_90", "label": "90 分钟以上"}], "when": {"question_id": "trained", "values": ["yes"]}},
+        {"id": "effort", "label": "今天训练时的状态如何？", "type": "single", "options": [{"value": "easy", "label": "比平时轻松"}, {"value": "normal", "label": "和平时差不多"}, {"value": "hard", "label": "明显更吃力"}, {"value": "poor", "label": "状态明显较差"}], "when": {"question_id": "trained", "values": ["yes"]}}
+      ]
+    },
+    {
+      "key": "hunger",
+      "label": "饥饿与饱腹",
+      "description": "记录全天饥饿、餐后饱腹和食欲信号",
+      "questions": [
+        {"id": "hunger_level", "label": "今天整体的饥饿感如何？", "type": "single", "options": [{"value": "1", "label": "1 · 几乎不饿"}, {"value": "2", "label": "2 · 偏低"}, {"value": "3", "label": "3 · 合适"}, {"value": "4", "label": "4 · 偏高"}, {"value": "5", "label": "5 · 很强"}]},
+        {"id": "hunger_time", "label": "饥饿最明显在什么时候？", "type": "single", "options": [{"value": "none", "label": "没有明显时段"}, {"value": "morning", "label": "上午或早餐前"}, {"value": "before_lunch", "label": "午餐前"}, {"value": "afternoon", "label": "下午"}, {"value": "before_dinner", "label": "晚餐前"}, {"value": "late_night", "label": "晚间或睡前"}]},
+        {"id": "satiety", "label": "餐后的饱腹感更接近哪种？", "type": "single", "options": [{"value": "comfortable", "label": "大多舒适"}, {"value": "still_hungry", "label": "吃完仍饿"}, {"value": "too_full", "label": "吃得过饱"}, {"value": "mixed", "label": "不同餐差异较大"}]},
+        {"id": "satiety_meals", "label": "主要出现在哪一餐？", "type": "multi", "options": [{"value": "breakfast", "label": "早餐"}, {"value": "lunch", "label": "午餐"}, {"value": "dinner", "label": "晚餐"}, {"value": "snack", "label": "加餐后"}], "when": {"question_id": "satiety", "values": ["still_hungry", "too_full", "mixed"]}},
+        {"id": "cravings", "label": "今天有没有明显食欲或失控感？", "type": "single", "options": [{"value": "none", "label": "没有"}, {"value": "mild", "label": "轻微想吃特定食物"}, {"value": "strong", "label": "食欲很强"}, {"value": "loss_of_control", "label": "出现失控感"}]}
+      ]
+    },
+    {
+      "key": "sleep",
+      "label": "睡眠",
+      "description": "记录睡眠时长、质量和恢复感",
+      "questions": [
+        {"id": "sleep_duration", "label": "昨晚大约睡了多久？", "type": "duration", "options": [{"value": "under_5", "label": "少于 5 小时"}, {"value": "5_6", "label": "5–6 小时"}, {"value": "6_7", "label": "6–7 小时"}, {"value": "7_8", "label": "7–8 小时"}, {"value": "8_9", "label": "8–9 小时"}, {"value": "over_9", "label": "超过 9 小时"}]},
+        {"id": "sleep_quality", "label": "整体睡眠质量如何？", "type": "single", "options": [{"value": "1", "label": "1 · 很差"}, {"value": "2", "label": "2 · 偏差"}, {"value": "3", "label": "3 · 一般"}, {"value": "4", "label": "4 · 较好"}, {"value": "5", "label": "5 · 很好"}]},
+        {"id": "awakenings", "label": "夜里醒来了几次？", "type": "single", "options": [{"value": "none", "label": "没有"}, {"value": "once", "label": "1 次"}, {"value": "twice", "label": "2 次"}, {"value": "three_plus", "label": "3 次或更多"}, {"value": "unknown", "label": "不记得"}]},
+        {"id": "morning_energy", "label": "起床后的恢复感如何？", "type": "single", "options": [{"value": "refreshed", "label": "精神恢复得好"}, {"value": "okay", "label": "基本正常"}, {"value": "tired", "label": "仍然疲倦"}, {"value": "exhausted", "label": "非常疲惫"}]}
+      ]
+    },
+    {
+      "key": "gut",
+      "label": "肠胃反应",
+      "description": "记录实际症状，不根据跳过推断正常",
+      "questions": [
+        {"id": "gut_state", "label": "今天有肠胃异常吗？", "type": "single", "options": [{"value": "none", "label": "没有明显异常"}, {"value": "symptoms", "label": "有一些症状"}]},
+        {"id": "symptoms", "label": "出现了哪些症状？", "type": "multi", "allow_other_text": true, "options": [{"value": "bloating", "label": "腹胀"}, {"value": "gas", "label": "胀气"}, {"value": "reflux", "label": "反酸"}, {"value": "stomach_pain", "label": "胃痛"}, {"value": "nausea", "label": "恶心"}, {"value": "diarrhea", "label": "腹泻"}, {"value": "constipation", "label": "便秘"}, {"value": "burning", "label": "灼烧感"}, {"value": "other", "label": "其他"}], "when": {"question_id": "gut_state", "values": ["symptoms"]}},
+        {"id": "severity", "label": "症状对今天的影响有多大？", "type": "single", "options": [{"value": "mild", "label": "轻微，不影响活动"}, {"value": "moderate", "label": "中等，需要调整饮食或活动"}, {"value": "severe", "label": "严重，明显影响活动"}], "when": {"question_id": "gut_state", "values": ["symptoms"]}},
+        {"id": "timing", "label": "症状主要在什么时候出现？", "type": "multi", "options": [{"value": "morning", "label": "早晨"}, {"value": "after_meal", "label": "餐后"}, {"value": "afternoon", "label": "下午"}, {"value": "evening", "label": "晚间"}, {"value": "ongoing", "label": "全天持续"}], "when": {"question_id": "gut_state", "values": ["symptoms"]}},
+        {"id": "bowel_state", "label": "今天的排便情况更接近哪种？", "type": "single", "options": [{"value": "normal", "label": "正常"}, {"value": "loose", "label": "偏稀"}, {"value": "hard", "label": "偏硬"}, {"value": "none", "label": "今天没有排便"}, {"value": "not_relevant", "label": "不确定或不相关"}], "when": {"question_id": "gut_state", "values": ["symptoms"]}}
+      ]
+    }
+  ]
+}

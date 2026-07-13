@@ -7,7 +7,7 @@ import subprocess
 from pathlib import Path
 
 
-FORBIDDEN_PARTS = {"data", "tmp", "exports", "backups"}
+FORBIDDEN_ROOTS = {"data", "tmp", "exports", "backups"}
 FORBIDDEN_NAMES = {"doctrine.private.md", "profile.md", "settings.private.json", "减脂增肌饮食系统总纲.md"}
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".heic"}
 ALLOWED_IMAGE_ROOTS = {("docs", "assets"), ("tests", "fixtures")}
@@ -41,8 +41,9 @@ def scan(root: str | Path) -> list[dict[str, str]]:
     home_text = str(Path.home()).lower()
     for path in candidate_files(root):
         relative = path.relative_to(root)
-        lower_parts = {part.lower() for part in relative.parts}
-        if lower_parts & FORBIDDEN_PARTS:
+        # Private runtime roots are forbidden at the repository boundary. A
+        # conventional source package named ``data`` is not itself a leak.
+        if relative.parts[0].lower() in FORBIDDEN_ROOTS:
             findings.append({"path": str(relative), "reason": "forbidden_private_directory"})
             continue
         lower_name = relative.name.lower()

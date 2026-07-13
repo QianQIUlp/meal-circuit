@@ -54,6 +54,10 @@ def food_label_root() -> Path:
     return app_home() / "food-labels"
 
 
+def managed_asset_root() -> Path:
+    return app_home() / "assets"
+
+
 def profile_path() -> Path:
     return app_home() / "profile.md"
 
