@@ -23,16 +23,10 @@ def macho_paths(root: Path) -> set[Path]:
 def merge(arm_app: Path, intel_app: Path, output_app: Path) -> None:
     arm_paths = macho_paths(arm_app)
     intel_paths = macho_paths(intel_app)
-    if arm_paths != intel_paths:
-        missing_intel = sorted(str(path) for path in arm_paths - intel_paths)
-        missing_arm = sorted(str(path) for path in intel_paths - arm_paths)
-        raise RuntimeError(
-            f"Mach-O layout mismatch; missing Intel={missing_intel}, missing ARM={missing_arm}"
-        )
     if output_app.exists():
         shutil.rmtree(output_app)
     shutil.copytree(arm_app, output_app, symlinks=True)
-    for relative in sorted(arm_paths, key=str):
+    for relative in sorted(arm_paths & intel_paths, key=str):
         arm_binary = arm_app / relative
         intel_binary = intel_app / relative
         output_binary = output_app / relative
@@ -51,6 +45,15 @@ def merge(arm_app: Path, intel_app: Path, output_app: Path) -> None:
         ).stdout.split()
         if not {"x86_64", "arm64"}.issubset(archs):
             raise RuntimeError(f"universal merge failed for {relative}: {archs}")
+    # Native dependency resolvers may include optional modules on only one
+    # architecture (for example OpenSSL's Intel-only legacy provider). Each
+    # native slice has already passed its smoke test, so preserve those files
+    # without pretending that they are shared universal binaries.
+    for relative in sorted(intel_paths - arm_paths, key=str):
+        source = intel_app / relative
+        target = output_app / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target)
 
 
 def main() -> None:
