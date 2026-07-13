@@ -109,6 +109,8 @@ jobs:
           uv run python -m tools.cross_client_sync_test prepare \
             --home "$RUNNER_TEMP/python-prepare" \
             --state "$RUNNER_TEMP/cross-client-state.json"
+          SYNC_RECOVERY=$(uv run python -c 'import json,os; print(json.load(open(os.path.join(os.environ["RUNNER_TEMP"], "cross-client-state.json")))["recovery_key"])')
+          echo "SYNC_RECOVERY=$SYNC_RECOVERY" >> "$GITHUB_ENV"
       - uses: reactivecircus/android-emulator-runner@v2
         with:
           api-level: 35
@@ -116,7 +118,7 @@ jobs:
           disable-animations: true
           script: |
             adb reverse tcp:18080 tcp:18080
-            ./android/gradlew --no-daemon -p android connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.syncServerUrl=http://127.0.0.1:18080 -Pandroid.testInstrumentationRunnerArguments.syncLogin=cross-client -Pandroid.testInstrumentationRunnerArguments.syncPassword=synthetic-cross-client-password -Pandroid.testInstrumentationRunnerArguments.syncRecovery="$(uv run python -c \"import json,os; print(json.load(open(os.environ['RUNNER_TEMP'] + '/cross-client-state.json'))['recovery_key'])\")"
+            ./android/gradlew --no-daemon -p android connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.syncServerUrl=http://127.0.0.1:18080 -Pandroid.testInstrumentationRunnerArguments.syncLogin=cross-client -Pandroid.testInstrumentationRunnerArguments.syncPassword=synthetic-cross-client-password -Pandroid.testInstrumentationRunnerArguments.syncRecovery="$SYNC_RECOVERY"
       - name: Verify Android revision from Python desktop client
         if: always()
         run: |
