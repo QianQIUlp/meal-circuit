@@ -150,6 +150,10 @@ def build_parser() -> argparse.ArgumentParser:
     day_generate = sub.add_parser("day-generate", help="使用用户环境变量中的模型 API Key 生成并提交每日复盘")
     day_generate.add_argument("date")
     day_generate.add_argument("--output", "-o")
+    cleanup = sub.add_parser("review-cleanup", help="预览或执行单个未执行复盘的生成历史清理")
+    cleanup.add_argument("date")
+    cleanup.add_argument("--expected-version", type=int)
+    cleanup.add_argument("--apply", action="store_true", help="通过证据门后执行；默认仅预览")
 
     setup = sub.add_parser("setup", help="管理可恢复的目标与安全初始化")
     setup_sub = setup.add_subparsers(dest="setup_command", required=True)
@@ -422,6 +426,12 @@ def main() -> None:
             emit(service.submit_daily_review(args.date, load_json(args.file)), args.output)
         elif args.command == "day-generate":
             emit(service.generate_daily_review(args.date), args.output)
+        elif args.command == "review-cleanup":
+            emit(service.cleanup_generated_review_history(
+                args.date,
+                apply=args.apply,
+                expected_current_version=args.expected_version,
+            ))
         elif args.command == "setup":
             if args.setup_command == "status":
                 emit(personalization.onboarding_status())
