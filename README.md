@@ -98,7 +98,7 @@ Pending work is read from the CLI. Photos and raw ingredients use task context; 
 
 The adaptive loop is available in both Web and CLI. First use creates a resumable, versioned goal and safety contract. The Today page then runs a longitudinal case workflow: capture what changed, formulate the person's current situation, ask at most three decision-changing questions, design a draft, and review it independently. A draft is replaceable and invisible to formal history until the user accepts it. Published plan items receive stable IDs; actual execution is appended as versioned feedback.
 
-Low-risk user-model hypotheses may affect ranking, portion, flavor, complexity, communication and alternatives after one explicit user correction or two independent real-world signals. A model's own repeated guess is never evidence. Goals, safety mode, allergies, health states, nutrition targets and other restrictive rules still require explicit confirmation in the profile. See [Agent Workbench v2](docs/agent-workbench-v2.md) for the button-to-outcome flow, context boundaries, learning lifecycle and failure behavior.
+Low-risk user-model hypotheses may affect ranking, portion, flavor, complexity, communication and alternatives after one explicit user correction or two independent real-world signals. A model's own repeated guess is never evidence. Goals, safety mode, allergies, health states, nutrition targets and other restrictive rules still require explicit confirmation in the profile. See [Agent Workbench](docs/agent-workbench.md) for the button-to-outcome flow, context boundaries, learning lifecycle and failure behavior.
 
 ```powershell
 # 1. List pending photo, ingredient, and daily review work
@@ -304,7 +304,7 @@ python -m mealcircuit.agent_cli sync-now
 
 自适应闭环同时提供 Web 与 CLI。首次使用建立可恢复、带版本的目标与安全契约。此后“今天”按连续个案流程工作：记录变化 → 理解当前这个人 → 最多追问三条真正会改变方案的问题 → 设计草案 → 独立审查。草案可替换且不进入正式历史，用户接受后才发布成稳定计划项，真实执行继续以可追溯事件追加。
 
-低风险用户模型只有在一次用户明确纠正或两个独立真实信号后，才能影响排序、份量、风味、复杂度、沟通方式和备选方案；模型重复自己的猜测不算证据。目标、安全模式、过敏、健康状态、营养目标及其他强限制仍必须在档案中明确确认。按钮会触发什么、上下文如何选择、学习怎样回滚及失败时保留什么，见 [Agent 工作台 v2](docs/agent-workbench-v2.md)。
+低风险用户模型只有在一次用户明确纠正或两个独立真实信号后，才能影响排序、份量、风味、复杂度、沟通方式和备选方案；模型重复自己的猜测不算证据。目标、安全模式、过敏、健康状态、营养目标及其他强限制仍必须在档案中明确确认。按钮会触发什么、上下文如何选择、学习怎样回滚及失败时保留什么，见 [Agent 工作台](docs/agent-workbench.md)。
 
 ```powershell
 # 1. 查看照片、原材料与每日复盘待办
