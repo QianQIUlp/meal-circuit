@@ -439,6 +439,10 @@ summary { width: fit-content; color: var(--accent-strong); font-weight: 650; cur
 /* Simplified product surface */
 .subtle-label { display: inline-block; margin-bottom: 6px; color: var(--muted); font-size: 12px; font-weight: 700; }
 .today-primary { border-left: 3px solid var(--accent); }
+.today-advice { border-left: 3px solid var(--accent); }
+.today-advice .section-header { align-items: flex-start; }
+.today-advice .lede { margin: 6px 0 0; }
+.today-advice .structured-list { margin-bottom: 0; }
 .secondary-actions { display: flex; flex-wrap: wrap; gap: 8px 16px; margin-top: 14px; }
 .secondary-actions a { color: var(--muted); font-size: 13px; font-weight: 650; }
 .today-state-next { display: flex; align-items: center; justify-content: space-between; gap: 18px; margin-top: 18px; padding-top: 16px; border-top: 1px solid var(--border); }

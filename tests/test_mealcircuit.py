@@ -561,6 +561,10 @@ class MealCircuitTest(unittest.TestCase):
         self.assertEqual(completed["status"], "completed")
         self.assertEqual(payloads[0]["tool_choice"], {"type": "tool", "name": "submit_mealcircuit_result"})
         self.assertEqual(payloads[0]["tools"][0]["input_schema"]["type"], "object")
+        self.assertIn("core_advice", payloads[0]["system"])
+        self.assertIn("训练、饥饿、睡眠、肠胃", payloads[0]["system"])
+        advice_schema = payloads[0]["tools"][0]["input_schema"]["properties"]["core_advice"]
+        self.assertIn("执行良好时应明确肯定", advice_schema["description"])
 
     def test_deepseek_generate_material_uses_chat_json_mode_and_rejects_photo(self):
         task = service.create_material_task("鸡蛋 2 个")

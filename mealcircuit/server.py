@@ -365,6 +365,32 @@ def _render_draft_meals(result: dict) -> str:
     return "".join(cards)
 
 
+def _render_today_core_advice(work_date: str, draft: dict | None = None) -> str:
+    result = {}
+    detail_link = ""
+    try:
+        review = service.get_daily_review(work_date)
+    except KeyError:
+        review = None
+    if review and review.get("status") == "completed":
+        result = review.get("result_json") or {}
+        detail_link = f'<a href="/reviews/{esc(work_date)}">看看我是怎么判断的</a>'
+    elif draft and draft.get("status") == "ready_draft":
+        result = draft.get("result_json") or {}
+    advice = [str(item).strip() for item in result.get("core_advice") or [] if str(item).strip()][:3]
+    if not advice:
+        return ""
+    summary = str(result.get("one_line_review") or "").strip()
+    summary_html = f'<p class="lede">{esc(summary)}</p>' if summary else ""
+    items = "".join(f'<li>{esc(item)}</li>' for item in advice)
+    return (
+        '<section class="panel today-advice" aria-labelledby="today-advice-title">'
+        '<div class="section-header"><div><h2 id="today-advice-title">今天的核心建议</h2>'
+        f'{summary_html}</div>{detail_link}</div>'
+        f'<ul class="structured-list">{items}</ul></section>'
+    )
+
+
 def render_today_workspace(work_date: str) -> str:
     current = personalization.active_personalization()
     if current["status"] == "setup_required":
@@ -378,6 +404,7 @@ def render_today_workspace(work_date: str) -> str:
     goal = (current.get("goals") or [{}])[0].get("goal_json") or {}
     goal_label = goal.get("custom_label") or GOAL_LABELS.get(goal.get("type"), goal.get("type") or "你的目标")
     current_plan = adaptive.get_plan_for_date(work_date)
+    today_advice = _render_today_core_advice(work_date, draft)
 
     if current_plan:
         hero_title = "今天按这份安排来"
@@ -506,6 +533,7 @@ def render_today_workspace(work_date: str) -> str:
     return (
         f'<section class="today-hero"><div><h1>{esc(hero_title)}</h1><p class="lede">{esc(hero_text)}</p></div></section>'
         f'{active_plan}'
+        f'{today_advice}'
         f'<section class="panel agent-intake" id="record"><div><h2>今天有什么变化？</h2>'
         '<p>吃了什么、训练感受、食欲、日程和临时安排都可以直接说。</p></div>'
         f'<div class="agent-intake-entry">{intake_forms}<div class="secondary-actions"><a href="/tasks/photo">上传照片</a>'

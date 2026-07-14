@@ -528,7 +528,14 @@ def _daily_json_schema(nutrition: dict, home_cooking: bool, meal_modes: dict | N
         "system_status": {"type": "string", "enum": ["stable", "observe", "adjust", "risk"]},
         "facts": _string_array(min_items=1),
         "inferences": _string_array(),
-        "core_advice": _string_array(min_items=1, max_items=3),
+        "core_advice": {
+            "type": "array", "minItems": 1, "maxItems": 3,
+            "description": (
+                "基于今天的实际执行、计划偏差、个人目标和身体状态，给用户的1至3条优先调整方向；"
+                "每条都要具体、可执行。执行良好时应明确肯定并说明继续保持什么。"
+            ),
+            "items": {"type": "string"},
+        },
         "do_not_adjust": _string_array(),
         "risk_signals": _string_array(),
         "priority_food_decisions": {
@@ -550,7 +557,10 @@ def _daily_json_schema(nutrition: dict, home_cooking: bool, meal_modes: dict | N
             "required": menu_required,
             "properties": menu_properties,
         },
-        "one_line_review": {"type": "string"},
+        "one_line_review": {
+            "type": "string",
+            "description": "用自然中文概括今天最重要的判断，不夸大未知信息，也不把偏离计划自动等同于失败。",
+        },
     }
     root_required = [
         "system_status", "facts", "inferences", "core_advice", "do_not_adjust",
@@ -631,7 +641,10 @@ def _system_prompt(kind: str) -> str:
             "什么、与全天如何配合，并给出克数范围、生熟或上桌口径、生活量具、估算置信度及加减条件。"
             "汇总 day_nutrition，并让三餐范围与全天范围交叉一致；有已确认目标时覆盖其下界，没有可靠能量数据时保持 null。"
             "同时考虑训练、饱腹、食欲、肠胃、时间、厨具、库存、口味和人的接受度。外食、自炊和快速组装必须"
-            "严格服从 effective_meal_modes。未知保持区间或未知，不能用伪精确补齐。"
+            "严格服从 effective_meal_modes。未知保持区间或未知，不能用伪精确补齐。core_advice 必须先比较今天"
+            "真实执行与原计划和个人目标，再结合训练、饥饿、睡眠、肠胃、日程和执行反馈，只保留影响最大的1至3个"
+            "改变方向；不要把合理的临时调整当作失败。若整体执行良好且状态没有异常，要具体肯定有效做法，并说明"
+            "接下来继续保持什么，不要为了显得有建议而制造问题。"
         ),
         "daily_plan_v3_revision": (
             "你正在根据独立审查修订 DailyPlanV3。只修复审查指出的问题，保留已经满足用户需求的部分；"
@@ -651,6 +664,13 @@ def _system_prompt(kind: str) -> str:
         "longitudinal_reflection": (
             "你正在做纵向反思。只从多次真实执行、明确纠正和反证中提出可回滚的用户模型 claim；"
             "不得修改目标、安全、过敏、疾病、药物、营养目标或专业指导。"
+        ),
+        "daily": (
+            "你正在完成当天复盘并准备次日安排。先比较今天的真实执行与原计划和个人目标，再结合训练、饥饿、"
+            "睡眠、肠胃、日程、临时变化和近期执行反馈，判断偏差是否真的需要改变。core_advice 只保留影响最大的"
+            "1至3个方向，每条都要让刚开始使用系统的人知道下一步具体做什么以及为什么；不要用空泛的‘均衡饮食’"
+            "代替个案判断，也不要把合理的临时调整当作失败。若整体执行良好且状态没有异常，要先具体肯定用户做对了"
+            "什么，再说明继续保持什么；信息不足时明确边界，不臆造问题。"
         ),
     }.get(kind, "")
     photo = (
