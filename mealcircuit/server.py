@@ -413,19 +413,21 @@ def render_today_workspace(work_date: str) -> str:
         )
 
     saved_records = service.list_daily_records(work_date)
-    saved_record_cards = "".join(
-        f'<article class="saved-intake"><div class="saved-intake-label">已记下</div>'
-        f'<p>{esc(record["raw_input"])}</p><details><summary>修改这条内容</summary>'
-        f'<form method="post" action="/agent/intake/{esc(record["id"])}/edit">'
+    intake_forms = "".join(
+        f'<form class="agent-intake-form is-saved" method="post" action="/agent/intake/{esc(record["id"])}/edit">'
         f'<input type="hidden" name="record_date" value="{esc(work_date)}">'
-        f'<label>修改内容<textarea name="text" maxlength="4000" required>{esc(record["raw_input"])}</textarea></label>'
-        '<button class="secondary">保存修改</button></form></details></article>'
+        f'<label>记一笔<textarea class="agent-intake-text" name="text" maxlength="4000" required>{esc(record["raw_input"])}</textarea></label>'
+        '<button>记下来</button></form>'
         for record in saved_records
     )
-    saved_records_html = (
-        f'<section class="saved-intakes" aria-label="今天已记下的内容"><h3>今天已记下</h3>{saved_record_cards}</section>'
-        if saved_record_cards else ""
-    )
+    if not intake_forms:
+        intake_forms = (
+            f'<form class="agent-intake-form" method="post" action="/agent/intake">'
+            f'<input type="hidden" name="record_date" value="{esc(work_date)}">'
+            '<label>记一笔<textarea class="agent-intake-text" name="text" maxlength="4000" required '
+            'placeholder="例如：明天中午外食，晚上自己做；今天训练后特别饿。"></textarea></label>'
+            '<button>记下来</button></form>'
+        )
 
     question_cards = []
     for question in state.get("questions") or []:
@@ -506,10 +508,8 @@ def render_today_workspace(work_date: str) -> str:
         f'{active_plan}'
         f'<section class="panel agent-intake" id="record"><div><h2>今天有什么变化？</h2>'
         '<p>吃了什么、训练感受、食欲、日程和临时安排都可以直接说。</p></div>'
-        f'<div class="agent-intake-entry">{saved_records_html}<form method="post" action="/agent/intake"><input type="hidden" name="record_date" value="{esc(work_date)}">'
-        '<label>记一笔<textarea name="text" maxlength="4000" required placeholder="例如：明天中午外食，晚上自己做；今天训练后特别饿。"></textarea></label>'
-        '<button>记下来</button><div class="secondary-actions"><a href="/tasks/photo">上传照片</a>'
-        '<a href="/tasks/material">补充食材</a><a href="/inventory">更新库存</a></div></form></div></section>'
+        f'<div class="agent-intake-entry">{intake_forms}<div class="secondary-actions"><a href="/tasks/photo">上传照片</a>'
+        '<a href="/tasks/material">补充食材</a><a href="/inventory">更新库存</a></div></div></section>'
         f'{_render_today_state(work_date)}{clarification}{draft_html}'
     )
 

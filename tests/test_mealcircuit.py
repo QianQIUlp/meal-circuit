@@ -1493,10 +1493,18 @@ class WebAppTest(unittest.TestCase):
         status, _, raw = self.request("GET", "/")
         page = raw.decode("utf-8")
         self.assertEqual(200, status)
-        self.assertIn("今天已记下", page)
+        self.assertNotIn("今天已记下", page)
         self.assertIn(original_text, page)
-        self.assertIn("修改这条内容", page)
-        self.assertIn(f'action="/agent/intake/{record["id"]}/edit"', page)
+        self.assertNotIn("修改这条内容", page)
+        self.assertIn(
+            f'<form class="agent-intake-form is-saved" method="post" action="/agent/intake/{record["id"]}/edit">',
+            page,
+        )
+        self.assertIn(
+            f'<textarea class="agent-intake-text" name="text" maxlength="4000" required>{original_text}</textarea>',
+            page,
+        )
+        self.assertEqual(1, page.count('name="text"'))
 
         revised_text = "午餐改为在家吃，训练后加了一份主食。"
         revision_payload = urllib.parse.urlencode({
