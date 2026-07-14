@@ -1,6 +1,8 @@
 (() => {
   const body = document.body;
   const sidebar = document.getElementById("app-sidebar");
+  const sidebarNav = sidebar?.querySelector(".sidebar-nav");
+  const currentNavLink = sidebar?.querySelector('[aria-current="page"]');
   const menuButton = document.querySelector("[data-nav-open]");
   const scrim = document.querySelector("[data-nav-close]");
   const main = document.getElementById("main-content");
@@ -8,6 +10,15 @@
   const themeButton = document.querySelector("[data-theme-toggle]");
   const desktopQuery = window.matchMedia("(min-width: 768px)");
   let returnFocus = null;
+
+  const revealCurrentNavLink = () => {
+    if (!sidebarNav || !currentNavLink) return;
+    const navRect = sidebarNav.getBoundingClientRect();
+    const linkRect = currentNavLink.getBoundingClientRect();
+    if (linkRect.top < navRect.top || linkRect.bottom > navRect.bottom) {
+      currentNavLink.scrollIntoView({ block: "nearest" });
+    }
+  };
 
   const updateThemeButton = () => {
     if (!themeButton) return;
@@ -36,8 +47,29 @@
     if (localStorage.getItem("mealcircuit.sidebarCollapsed") === "true") {
       body.classList.add("sidebar-collapsed");
     }
+    const savedScroll = Number(sessionStorage.getItem("mealcircuit.sidebarScrollTop") || "0");
+    if (sidebarNav && Number.isFinite(savedScroll)) sidebarNav.scrollTop = savedScroll;
   } catch (_error) {
     // Layout preference is optional; the app remains fully usable without storage.
+  }
+  revealCurrentNavLink();
+  if (sidebarNav) {
+    let scrollFrame = null;
+    const saveSidebarScroll = () => {
+      try {
+        sessionStorage.setItem("mealcircuit.sidebarScrollTop", String(sidebarNav.scrollTop));
+      } catch (_error) {
+        // The current page still works when layout preferences cannot be stored.
+      }
+    };
+    sidebarNav.addEventListener("scroll", () => {
+      if (scrollFrame !== null) cancelAnimationFrame(scrollFrame);
+      scrollFrame = requestAnimationFrame(() => {
+        saveSidebarScroll();
+        scrollFrame = null;
+      });
+    }, { passive: true });
+    window.addEventListener("pagehide", saveSidebarScroll);
   }
   if (collapseButton) {
     const collapsed = body.classList.contains("sidebar-collapsed");
@@ -54,7 +86,8 @@
     if (scrim) scrim.tabIndex = open ? 0 : -1;
     if (open) {
       returnFocus = document.activeElement;
-      sidebar?.querySelector("a")?.focus();
+      revealCurrentNavLink();
+      (currentNavLink || sidebar?.querySelector("a"))?.focus();
     } else if (returnFocus instanceof HTMLElement) {
       returnFocus.focus();
     }

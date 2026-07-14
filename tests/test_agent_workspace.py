@@ -224,9 +224,15 @@ class AgentWorkspaceTest(unittest.TestCase):
         self.assertIsNotNone(__import__("mealcircuit.adaptive", fromlist=["get_plan_for_date"]).get_plan_for_date(plan_date))
         self.assertEqual("accepted", agent_workspace.get_draft(self.review_date)["status"])
         workspace_html = server.render_today_workspace(self.review_date)
-        self.assertIn("草案已经成为正式执行计划", workspace_html)
+        self.assertIn("明天的安排已经准备好", workspace_html)
         self.assertIn(f'/plans/{plan_date}', workspace_html)
         self.assertNotIn("未配置模型；可以查看和导出", workspace_html)
+        self.assertNotIn("AgentContextV2", workspace_html)
+        self.assertNotIn("Three-stage planning", workspace_html)
+        plan_html = server.render_plan_page(plan_date)
+        self.assertIn("为什么这样安排", plan_html)
+        self.assertIn("这次参考了什么", plan_html)
+        self.assertNotIn("source_manifest", plan_html)
 
     def test_decision_changing_questions_stop_before_planning(self):
         provider = ScriptedProvider(self.review_date, plan=self._provider().plan, questions=[{

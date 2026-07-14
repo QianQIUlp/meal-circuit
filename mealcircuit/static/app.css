@@ -111,6 +111,7 @@ code { color: var(--accent-strong); }
 .sidebar-brand:hover { color: var(--text); }
 .sidebar-nav { flex: 1; overflow-y: auto; padding: 18px 0; }
 .nav-group { margin-bottom: 20px; }
+.primary-nav { margin: 0; }
 .nav-group-label {
   margin: 0 18px 8px; color: var(--muted); font-size: 11px; font-weight: 650; text-transform: uppercase;
 }
@@ -440,6 +441,35 @@ summary { width: fit-content; color: var(--accent-strong); font-weight: 650; cur
 .quiet-success { border-left: 3px solid var(--accent); }
 .link-button { padding-inline: 0; color: var(--muted); background: transparent; border: 0; }
 
+/* Simplified product surface */
+.subtle-label { display: inline-block; margin-bottom: 6px; color: var(--muted); font-size: 12px; font-weight: 700; }
+.today-primary { border-left: 3px solid var(--accent); }
+.secondary-actions { display: flex; flex-wrap: wrap; gap: 8px 16px; margin-top: 14px; }
+.secondary-actions a { color: var(--muted); font-size: 13px; font-weight: 650; }
+.today-state-next { display: flex; align-items: center; justify-content: space-between; gap: 18px; margin-top: 18px; padding-top: 16px; border-top: 1px solid var(--border); }
+.today-state-next strong { display: block; }
+.plain-summary, .profile-summary { display: grid; gap: 8px; margin: 14px 0 0; padding: 0; list-style: none; }
+.plain-summary li, .profile-summary li { display: flex; justify-content: space-between; gap: 16px; padding: 10px 0; border-bottom: 1px solid var(--border); }
+.plain-summary li:last-child, .profile-summary li:last-child { border-bottom: 0; }
+.quiet-progress { border-left: 3px solid var(--accent); }
+.quiet-progress h2, .quiet-note h2 { margin-bottom: 6px; }
+.plan-overview, .me-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; margin-bottom: 14px; }
+.plan-overview-card { display: flex; align-items: center; justify-content: space-between; gap: 20px; margin: 0; }
+.plan-overview-card h2 { margin-bottom: 6px; }
+.plan-overview-card p { margin-bottom: 0; }
+.plan-explanation { display: grid; gap: 10px; }
+.plan-explanation details + details { padding-top: 10px; border-top: 1px solid var(--border); }
+.me-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.me-card { display: block; min-height: 150px; padding: 20px; color: var(--text); text-decoration: none; background: var(--surface); border: 1px solid var(--border); }
+.me-card:hover { color: var(--text); background: var(--surface-raised); border-color: var(--accent); }
+.me-card h2 { margin-bottom: 8px; font-size: 19px; }
+.me-card p { margin: 0; color: var(--muted); }
+.advanced-settings { margin-top: 14px; }
+.settings-links { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin-top: 16px; }
+.settings-links a { display: grid; gap: 4px; padding: 14px 16px; color: var(--text); text-decoration: none; background: var(--surface-subtle); border: 1px solid var(--border); }
+.settings-links a:hover { color: var(--text); border-color: var(--accent); }
+.settings-links span { color: var(--muted); font-size: 13px; }
+
 /* Longitudinal case Agent */
 .agent-hero { border-left: 3px solid var(--accent); }
 .agent-intake { display: grid; grid-template-columns: minmax(240px, .7fr) minmax(340px, 1.3fr); gap: 28px; align-items: start; }
@@ -560,10 +590,11 @@ summary { width: fit-content; color: var(--accent-strong); font-weight: 650; cur
   .table-scroll { margin-inline: -8px; padding-inline: 8px; }
   th, td { padding: 10px 9px; }
   .queue-table th:nth-child(3), .queue-table td:nth-child(3) { display: none; }
-  .setup-principles, .quick-actions, .capture-grid, .metric-grid, .today-grid, .learning-grid, .contract-summary, .context-grid { grid-template-columns: 1fr; }
+  .setup-principles, .quick-actions, .capture-grid, .metric-grid, .today-grid, .learning-grid, .contract-summary, .context-grid, .plan-overview, .me-grid, .settings-links { grid-template-columns: 1fr; }
   .agent-intake, .draft-meal, .user-claim form { grid-template-columns: 1fr; }
   .agent-understanding > ul > li { align-items: stretch; flex-direction: column; }
   .reflection-status { align-items: stretch; flex-direction: column; }
+  .today-state-next, .plan-overview-card { align-items: stretch; flex-direction: column; }
   .agent-progress > ol { grid-template-columns: 1fr; }
   .agent-progress > ol > li { border-right: 1px solid var(--border); border-bottom: 0; }
   .agent-progress > ol > li:last-child { border-bottom: 1px solid var(--border); }
