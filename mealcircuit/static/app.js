@@ -132,6 +132,35 @@
     }
   });
 
+  document.querySelectorAll("form[data-plan-feedback]").forEach((form) => {
+    const status = form.querySelector('[name="status"]');
+    const reasons = [...form.querySelectorAll('[name="reason_codes"]')];
+    const reasonFieldset = reasons[0]?.closest("fieldset");
+    const errorSlot = form.querySelector("[data-feedback-error-slot]");
+    const clearError = () => {
+      form.querySelector("[data-feedback-error]")?.remove();
+      reasonFieldset?.removeAttribute("aria-invalid");
+    };
+
+    status?.addEventListener("change", clearError);
+    reasons.forEach((reason) => reason.addEventListener("change", clearError));
+    form.addEventListener("submit", (event) => {
+      const needsReason = status?.value === "modified" || status?.value === "skipped";
+      if (!needsReason || reasons.some((reason) => reason.checked)) return;
+      event.preventDefault();
+      clearError();
+      const error = document.createElement("div");
+      error.className = "form-error";
+      error.dataset.feedbackError = "";
+      error.setAttribute("role", "alert");
+      error.tabIndex = -1;
+      error.innerHTML = "<strong>还差一项</strong><p>请选择这顿发生变化的原因。</p>";
+      errorSlot?.append(error);
+      reasonFieldset?.setAttribute("aria-invalid", "true");
+      error.focus();
+    });
+  });
+
   const agentProgress = document.querySelector("[data-agent-state-url]");
   if (agentProgress) {
     const initialStatus = agentProgress.dataset.agentStatus || "collecting";

@@ -1321,6 +1321,89 @@ class WebAppTest(unittest.TestCase):
                     raise
         raise AssertionError("unreachable")
 
+    @staticmethod
+    def multipart_form(fields, files=()):
+        boundary = "----MealCircuitTestBoundary"
+        parts = []
+        for name, value in fields:
+            parts.append(
+                f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n{value}\r\n'.encode()
+            )
+        for name, filename, content_type, data in files:
+            parts.append(
+                f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"; filename="{filename}"\r\n'
+                f'Content-Type: {content_type}\r\n\r\n'.encode() + data + b"\r\n"
+            )
+        parts.append(f"--{boundary}--\r\n".encode())
+        body = b"".join(parts)
+        return body, {
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+            "Content-Length": str(len(body)),
+        }
+
+    def test_plan_feedback_preserves_inputs_and_photo_after_missing_reason(self):
+        review_date = date.today().isoformat()
+        service.add_daily_record(review_date, "今天按计划记录实际饮食。")
+        service.complete_daily_review(review_date, daily_review_result(review_date))
+        plan_date = (date.today() + timedelta(days=1)).isoformat()
+        plan = adaptive.get_plan_for_date(plan_date)
+        meal = plan["menu"]["meals"][0]
+        item_id = meal["plan_item_id"]
+        image = b"\x89PNG\r\n\x1a\nmeal-feedback"
+
+        body, headers = self.multipart_form(
+            [
+                ("expected_version", "0"),
+                ("status", "modified"),
+                ("satiety", "not_enough"),
+                ("actual_text", "临时多吃了一碗饭"),
+            ],
+            [("photo", "actual.png", "image/png", image)],
+        )
+        status, _, raw = self.request(
+            "POST", f"/plans/{plan_date}/{item_id}/feedback", body, headers
+        )
+        page = raw.decode("utf-8")
+        self.assertEqual(400, status)
+        self.assertIn("调整或未执行时必须选择至少一个原因", page)
+        self.assertIn('<option value="modified" selected>', page)
+        self.assertIn('<option value="not_enough" selected>', page)
+        self.assertIn("临时多吃了一碗饭", page)
+        self.assertIn('<details class="feedback-box" open>', page)
+        self.assertIsNone(adaptive.get_plan_for_date(plan_date)["feedback"].get(item_id))
+
+        photo_task = service.list_tasks()[0]
+        self.assertEqual("photo", photo_task["type"])
+        self.assertEqual(image, resolve_data_path(photo_task["image_path"]).read_bytes())
+        self.assertIn(f'name="photo_task_id" value="{photo_task["id"]}"', page)
+        self.assertIn(f'/media/{Path(photo_task["image_path"]).name}', page)
+
+        corrected_body, corrected_headers = self.multipart_form([
+            ("expected_version", "0"),
+            ("status", "modified"),
+            ("satiety", "not_enough"),
+            ("reason_codes", "schedule_change"),
+            ("reason_codes", "hunger_mismatch"),
+            ("actual_text", "临时多吃了一碗饭"),
+            ("photo_task_id", photo_task["id"]),
+        ])
+        status, response_headers, _ = self.request(
+            "POST", f"/plans/{plan_date}/{item_id}/feedback", corrected_body, corrected_headers
+        )
+        self.assertEqual(303, status)
+        self.assertEqual(f"/plans/{plan_date}", response_headers["Location"])
+        feedback = adaptive.get_plan_for_date(plan_date)["feedback"][item_id]
+        self.assertEqual(["schedule_change", "hunger_mismatch"], feedback["reason_codes_json"])
+        self.assertEqual("not_enough", feedback["outcome_json"]["satiety"])
+        self.assertEqual(photo_task["id"], feedback["outcome_json"]["photo_task_id"])
+        links = adaptive.task_evidence_links(photo_task["id"])
+        self.assertEqual("consumed", links[0]["role"])
+        self.assertEqual(plan_date, links[0]["observed_date"])
+
+        status, _, app_script = self.request("GET", "/assets/ui/app.js")
+        self.assertEqual(200, status)
+        self.assertIn("请选择这顿发生变化的原因", app_script.decode("utf-8"))
+
     def test_pages_and_material_form(self):
         for path in ("/", "/plans", "/me", "/history", "/tasks/photo", "/tasks/material", "/tasks", "/ai", "/sync", "/foods", "/overview"):
             status, _, body = self.request("GET", path)
