@@ -2099,7 +2099,9 @@ class WebAppTest(unittest.TestCase):
             {"Content-Type": "application/x-www-form-urlencoded"},
         )
         self.assertEqual(status, 303)
-        self.assertEqual(response_headers["Location"], "/#today-state")
+        self.assertEqual(
+            response_headers["Location"], f"/check-ins/{today}/weight?return_to=today"
+        )
         status, _, question = self.request("GET", f"/check-ins/{today}/weight")
         self.assertEqual(status, 200)
         self.assertIn("今天测体重了吗", question.decode("utf-8"))
@@ -2124,7 +2126,7 @@ class WebAppTest(unittest.TestCase):
         self.assertIn("72.4 kg", completed_hub.decode("utf-8"))
         status, _, settings = self.request("GET", "/check-ins/settings")
         self.assertEqual(status, 200)
-        self.assertIn("每日状态设置", settings.decode("utf-8"))
+        self.assertIn("今天状态的提问设置", settings.decode("utf-8"))
         rejected = urllib.parse.urlencode({"expected_version": "0"}).encode()
         status, _, response = self.request(
             "POST", f"/check-ins/{today}/gut/skip", rejected,
@@ -2132,6 +2134,63 @@ class WebAppTest(unittest.TestCase):
         )
         self.assertEqual(status, 400)
         self.assertIn("拒绝跨来源写入请求", response.decode("utf-8"))
+
+    def test_today_checkin_continues_through_questions_and_modules(self):
+        today = date.today().isoformat()
+        service.skip_checkin_module(today, "weight", 0)
+        headers = {"Content-Type": "application/x-www-form-urlencoded"}
+
+        trained = urllib.parse.urlencode({
+            "question_id": "trained",
+            "expected_version": "0",
+            "value": "no",
+            "return_to": "today",
+        }).encode()
+        status, response_headers, _ = self.request(
+            "POST", f"/check-ins/{today}/training/answer", trained, headers
+        )
+        self.assertEqual(303, status)
+        self.assertEqual(
+            f"/check-ins/{today}/training?q=rest_reason&return_to=today",
+            response_headers["Location"],
+        )
+
+        rest_reason = urllib.parse.urlencode({
+            "question_id": "rest_reason",
+            "expected_version": "0",
+            "value": "rest_day",
+            "return_to": "today",
+        }).encode()
+        status, response_headers, _ = self.request(
+            "POST", f"/check-ins/{today}/training/answer", rest_reason, headers
+        )
+        self.assertEqual(303, status)
+        self.assertEqual(
+            f"/check-ins/{today}/hunger?return_to=today",
+            response_headers["Location"],
+        )
+
+        for module_key, next_module in (("hunger", "sleep"), ("sleep", "gut")):
+            skip = urllib.parse.urlencode({
+                "expected_version": "0", "return_to": "today",
+            }).encode()
+            status, response_headers, _ = self.request(
+                "POST", f"/check-ins/{today}/{module_key}/skip", skip, headers
+            )
+            self.assertEqual(303, status)
+            self.assertEqual(
+                f"/check-ins/{today}/{next_module}?return_to=today",
+                response_headers["Location"],
+            )
+
+        final_skip = urllib.parse.urlencode({
+            "expected_version": "0", "return_to": "today",
+        }).encode()
+        status, response_headers, _ = self.request(
+            "POST", f"/check-ins/{today}/gut/skip", final_skip, headers
+        )
+        self.assertEqual(303, status)
+        self.assertEqual("/#today-state", response_headers["Location"])
 
     def test_loopback_origin_policy_and_real_post_actions(self):
         port = self.port

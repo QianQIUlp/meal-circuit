@@ -1199,6 +1199,21 @@ def _question_value(module: dict, question_id: str):
     return (module.get("active_answers") or {}).get(question_id)
 
 
+def _next_checkin_step(checkin_date: str) -> str:
+    state = service.get_checkin_state(checkin_date)
+    pending = next(
+        (
+            module for module in state["modules"]
+            if module["enabled"]
+            and (module["status"] not in {"completed", "skipped"} or module.get("has_draft"))
+        ),
+        None,
+    )
+    if pending:
+        return f'/check-ins/{checkin_date}/{pending["module_key"]}?return_to=today'
+    return "/#today-state"
+
+
 def render_checkin_question(
     checkin_date: str,
     module_key: str,
@@ -1287,10 +1302,12 @@ def render_checkin_question(
             f'<input id="sleep-exact" type="number" name="exact_value" min="0" max="24" step="0.1" value="{esc(exact)}"></div>'
             f'<div class="quiz-actions"><span></span><button type="submit">下一题</button></div></form>'
         )
-    back_href = (
-        '/#today-state' if return_to_today else
-        (f'/check-ins/{checkin_date}/{module_key}?q={previous}' if previous else f'/check-ins/{checkin_date}')
-    )
+    if previous:
+        back_href = f'/check-ins/{checkin_date}/{module_key}?q={previous}'
+        if return_to_today:
+            back_href += "&return_to=today"
+    else:
+        back_href = "/#today-state" if return_to_today else f"/check-ins/{checkin_date}"
     severe = '<p class="danger-note" role="note">严重或持续症状需要停止自行加压并寻求医疗判断；这里仅记录信号，不做诊断。</p>' if module_key == "gut" and active.get("severity") == "severe" else ""
     history = (
         '<details><summary>查看之前的回答</summary><p class="muted">以前填写的内容仍然保留，今天的安排只使用你最近确认的回答。</p></details>'
@@ -2547,17 +2564,20 @@ class Handler(BaseHTTPRequestHandler):
                     current_index = question_ids.index(question_id)
                     if current_index == len(question_ids) - 1:
                         service.complete_checkin_module(checkin_date, module_key, expected_version)
-                        self.redirect("/#today-state" if return_to_today else f"/check-ins/{checkin_date}")
+                        self.redirect(_next_checkin_step(checkin_date) if return_to_today else f"/check-ins/{checkin_date}")
                     elif return_to_today:
-                        self.redirect("/#today-state")
+                        self.redirect(
+                            f"/check-ins/{checkin_date}/{module_key}"
+                            f"?q={question_ids[current_index + 1]}&return_to=today"
+                        )
                     else:
                         self.redirect(f"/check-ins/{checkin_date}/{module_key}?q={question_ids[current_index + 1]}")
                 elif action == "complete":
                     service.complete_checkin_module(checkin_date, module_key, expected_version)
-                    self.redirect("/#today-state" if return_to_today else f"/check-ins/{checkin_date}")
+                    self.redirect(_next_checkin_step(checkin_date) if return_to_today else f"/check-ins/{checkin_date}")
                 elif action == "skip":
                     service.skip_checkin_module(checkin_date, module_key, expected_version)
-                    self.redirect("/#today-state" if return_to_today else f"/check-ins/{checkin_date}")
+                    self.redirect(_next_checkin_step(checkin_date) if return_to_today else f"/check-ins/{checkin_date}")
                 elif action == "discard-draft":
                     service.discard_checkin_draft(checkin_date, module_key, expected_version)
                     self.redirect("/#today-state" if return_to_today else f"/check-ins/{checkin_date}")
