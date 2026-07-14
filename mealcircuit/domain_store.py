@@ -250,6 +250,14 @@ def snapshot_payload(connection: sqlite3.Connection, entity_kind: str, entity_id
                 "kind": "checkin_settings",
                 "content": json.dumps(rows, ensure_ascii=False, sort_keys=True),
             }, False
+        if entity_id == preference_entity_id("agent_user_model"):
+            row = connection.execute(
+                "SELECT content FROM config_documents WHERE kind='agent_user_model'"
+            ).fetchone()
+            return {
+                "kind": "agent_user_model",
+                "content": str(row["content"] if row else '{"schema_version":1,"claims":[]}'),
+            }, False
         if entity_id not in expected:
             raise KeyError(entity_id)
         kind, path = expected[entity_id]
@@ -562,7 +570,7 @@ def seed_current_entities(connection: sqlite3.Connection) -> int:
 
 def refresh_configuration_entities(connection: sqlite3.Connection) -> int:
     count = 0
-    for kind in ("profile", "settings", "doctrine", "checkin_settings"):
+    for kind in ("profile", "settings", "doctrine", "checkin_settings", "agent_user_model"):
         if capture_entity(connection, "preferences", preference_entity_id(kind)) is not None:
             count += 1
     return count

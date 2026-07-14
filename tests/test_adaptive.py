@@ -12,7 +12,7 @@ from datetime import date, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
-from mealcircuit import adaptive, personalization, portability, service
+from mealcircuit import adaptive, agent_workspace, personalization, portability, server, service
 from mealcircuit.configuration import initialize_private_home, load_resolved_settings
 from mealcircuit.db import CURRENT_SCHEMA_VERSION, connect, init_db, row_dict
 from mealcircuit.validation import ValidationError
@@ -79,6 +79,25 @@ class AdaptiveDomainTest(unittest.TestCase):
             else:
                 os.environ[key] = value
         self.temp.cleanup()
+
+    def test_feedback_fact_survives_agent_learning_failure(self):
+        self._complete_standard_profile()
+        review_date = date.today().isoformat()
+        plan = self._publish_plan(review_date)
+        meal = plan["menu"]["meals"][0]
+
+        with patch("mealcircuit.agent_workspace.note_feedback_signal", side_effect=RuntimeError("learning unavailable")):
+            feedback = adaptive.save_plan_feedback(
+                plan["plan_date"], meal["plan_item_id"], "followed"
+            )
+
+        self.assertEqual("followed", feedback["status"])
+        self.assertEqual(1, len(adaptive.list_plan_feedback(plan["plan_date"])))
+        with connect() as conn:
+            diagnostic = conn.execute(
+                "SELECT * FROM agent_workspace_events WHERE event_kind='feedback_learning_failed'"
+            ).fetchone()
+        self.assertIsNotNone(diagnostic)
 
     def _fill_session(
         self,
@@ -190,7 +209,7 @@ class AdaptiveDomainTest(unittest.TestCase):
         with closing(sqlite3.connect(legacy)) as conn:
             conn.execute("ALTER TABLE adaptive_rules DROP COLUMN version")
             conn.execute("ALTER TABLE adaptive_experiments DROP COLUMN version")
-            conn.execute("DELETE FROM schema_migrations WHERE version=4")
+            conn.execute("DELETE FROM schema_migrations WHERE version>=4")
             conn.commit()
         init_db(legacy)
         with closing(sqlite3.connect(legacy)) as conn:
@@ -200,7 +219,7 @@ class AdaptiveDomainTest(unittest.TestCase):
         self.assertIn("version", rule_columns)
         self.assertIn("version", experiment_columns)
         self.assertEqual(CURRENT_SCHEMA_VERSION, schema_version)
-        self.assertEqual(1, len(list((self.home / "backups").glob("pre-schema-v4-*.db"))))
+        self.assertEqual(1, len(list((self.home / "backups").glob(f"pre-schema-v{CURRENT_SCHEMA_VERSION}-*.db"))))
 
     def test_standard_onboarding_creates_versioned_profile_goal_and_strategy(self):
         session = self._fill_session()
@@ -529,6 +548,22 @@ class AdaptiveDomainTest(unittest.TestCase):
         self.assertEqual(["web", "cli"], [item["actor_source"] for item in history])
         self.assertEqual(2, second["version"])
 
+    def test_satiety_feedback_is_restored_in_form_and_enters_user_model(self):
+        self._complete_standard_profile()
+        plan = self._publish_plan("2026-07-09")
+        breakfast = next(item for item in plan["menu"]["meals"] if item["name"] == "早餐")
+        feedback = adaptive.save_plan_feedback(
+            plan["plan_date"], breakfast["plan_item_id"], "followed",
+            outcome={"satiety": "not_enough"}, actual_text="吃完仍没吃饱，早餐总体积偏少。",
+            actor_source="web",
+        )
+        self.assertEqual("not_enough", feedback["outcome_json"]["satiety"])
+        claims = [item for item in agent_workspace.list_claims()
+                  if item["claim_type"] == "body_response_hypothesis"]
+        self.assertEqual("active", claims[0]["status"])
+        html = server.render_plan_page(plan["plan_date"])
+        self.assertIn('<option value="not_enough" selected>没吃饱</option>', html)
+
     def test_adaptive_feedback_question_updates_the_plan_event(self):
         self._complete_standard_profile()
         plan = self._publish_plan("2026-07-09")
@@ -652,6 +687,11 @@ class AdaptiveDomainTest(unittest.TestCase):
         self.assertEqual("completed", run("setup", "status")["status"])
         self.assertEqual(plan["plan_version_id"], run("plan", plan["plan_date"])["plan_version_id"])
         self.assertEqual("豆腐", run("inventory", "list")[0]["name"])
+        agent_date = date.today().isoformat()
+        intake = run("agent-intake", agent_date, "--text", "今天训练后更饿，明天晚饭仍自己做。")
+        self.assertEqual(agent_date, intake["record"]["record_date"])
+        self.assertEqual("AgentContextV2", run("agent-context", agent_date)["context_schema"])
+        self.assertIn("due", run("user-model", "reflection-status"))
         bundle = self.home / "exports" / "cli.zip"
         self.assertTrue(Path(run("export-bundle", "--output", str(bundle))["path"]).samefile(bundle))
         self.assertEqual("ok", run("import-bundle", str(bundle))["database_integrity"])

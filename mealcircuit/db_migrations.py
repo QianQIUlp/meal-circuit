@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
-CURRENT_SCHEMA_VERSION = 6
+CURRENT_SCHEMA_VERSION = 7
 
 
 def _timestamp() -> str:
@@ -153,7 +153,7 @@ def _migrate_1_to_2(connection: sqlite3.Connection) -> None:
         );
 
         CREATE TABLE IF NOT EXISTS config_documents (
-            kind TEXT PRIMARY KEY CHECK (kind IN ('profile','settings','doctrine','checkin_settings')),
+            kind TEXT PRIMARY KEY CHECK (kind IN ('profile','settings','doctrine','checkin_settings','agent_user_model')),
             content TEXT NOT NULL,
             content_sha256 TEXT NOT NULL,
             revision_id TEXT,
@@ -268,12 +268,38 @@ def _migrate_5_to_6(connection: sqlite3.Connection) -> None:
             connection.execute(f"ALTER TABLE {table} ADD COLUMN result_provenance_json TEXT")
 
 
+def _migrate_6_to_7(connection: sqlite3.Connection) -> None:
+    table_sql = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='config_documents'"
+    ).fetchone()
+    if table_sql and "agent_user_model" in str(table_sql[0]):
+        return
+    connection.execute("ALTER TABLE config_documents RENAME TO config_documents_v6")
+    connection.execute(
+        """CREATE TABLE config_documents (
+               kind TEXT PRIMARY KEY CHECK (kind IN (
+                   'profile','settings','doctrine','checkin_settings','agent_user_model'
+               )),
+               content TEXT NOT NULL,
+               content_sha256 TEXT NOT NULL,
+               revision_id TEXT,
+               updated_at TEXT NOT NULL
+           )"""
+    )
+    connection.execute(
+        """INSERT INTO config_documents(kind,content,content_sha256,revision_id,updated_at)
+           SELECT kind,content,content_sha256,revision_id,updated_at FROM config_documents_v6"""
+    )
+    connection.execute("DROP TABLE config_documents_v6")
+
+
 MIGRATIONS = {
     1: _migrate_1_to_2,
     2: _migrate_2_to_3,
     3: _migrate_3_to_4,
     4: _migrate_4_to_5,
     5: _migrate_5_to_6,
+    6: _migrate_6_to_7,
 }
 
 

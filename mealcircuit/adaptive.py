@@ -131,9 +131,16 @@ def _string_list(value: object, name: str, allowed: set[str] | None = None) -> l
 
 
 def _queue_changed_date(record_date: str, reason: str) -> None:
-    from . import service
+    from . import agent_workspace, service
 
     service.queue_review_for_external_change(record_date, reason)
+    agent_workspace.schedule_auto_draft(record_date)
+
+
+def _invalidate_agent_drafts(reason: str) -> None:
+    from . import agent_workspace
+
+    agent_workspace.mark_all_drafts_stale(reason)
 
 
 def _scope_snapshot() -> dict:
@@ -465,7 +472,30 @@ def save_plan_feedback(
             ),
         )
     recompute_candidates(plan_date)
-    return row_dict(row)
+    result = row_dict(row)
+    from . import agent_workspace
+
+    postprocessors = (
+        ("feedback_learning_failed", lambda: agent_workspace.note_feedback_signal(result)),
+        (
+            "execution_state_update_failed",
+            lambda: agent_workspace.update_execution_state(
+                plan["review_id"], plan["result_version"], len(plan["menu"].get("meals") or [])
+            ),
+        ),
+        ("reflection_schedule_failed", agent_workspace.schedule_reflection_if_due),
+    )
+    for event_kind, operation in postprocessors:
+        try:
+            operation()
+        except Exception as exc:
+            agent_workspace.record_diagnostic_event(
+                plan_date,
+                event_kind,
+                str(exc),
+                {"feedback_id": result["id"], "review_id": plan["review_id"]},
+            )
+    return result
 
 
 def plan_feedback_history(feedback_id: str) -> list[dict]:
@@ -763,6 +793,8 @@ def decide_candidate(candidate_id: str, decision: str, *, statement: str | None 
         updated = conn.execute("SELECT * FROM adaptation_candidates WHERE id=?", (candidate_id,)).fetchone()
     result = row_dict(updated)
     result["rule_id"] = rule_id
+    if rule_id:
+        _invalidate_agent_drafts("新的正式规则已确认")
     return result
 
 
@@ -795,7 +827,9 @@ def create_rule(statement: str, kind: str = "constraint", scope: dict | None = N
             ),
         )
         row = conn.execute("SELECT * FROM adaptive_rules WHERE id=?", (rule_id,)).fetchone()
-    return row_dict(row)
+    result = row_dict(row)
+    _invalidate_agent_drafts("正式规则已新增")
+    return result
 
 
 def list_rules(active_only: bool = True) -> list[dict]:
@@ -833,7 +867,9 @@ def set_rule_status(rule_id: str, status: str) -> dict:
         if updated.rowcount != 1:
             raise KeyError(rule_id)
         row = conn.execute("SELECT * FROM adaptive_rules WHERE id=?", (rule_id,)).fetchone()
-    return row_dict(row)
+    result = row_dict(row)
+    _invalidate_agent_drafts("正式规则状态已变化")
+    return result
 
 
 def active_adaptations(as_of: str | None = None) -> dict:
@@ -882,7 +918,9 @@ def create_inventory_item(
             (_id("inventory_event"), item_id, "create", json.dumps(payload, ensure_ascii=False), timestamp),
         )
         row = conn.execute("SELECT * FROM inventory_items WHERE id=?", (item_id,)).fetchone()
-    return row_dict(row)
+    result = row_dict(row)
+    _invalidate_agent_drafts("库存已变化")
+    return result
 
 
 def update_inventory_status(inventory_id: str, status: str, expected_version: int, amount_text: str | None = None) -> dict:
@@ -911,7 +949,9 @@ def update_inventory_status(inventory_id: str, status: str, expected_version: in
             ),
         )
         updated = conn.execute("SELECT * FROM inventory_items WHERE id=?", (inventory_id,)).fetchone()
-    return row_dict(updated)
+    result = row_dict(updated)
+    _invalidate_agent_drafts("库存已变化")
+    return result
 
 
 def list_inventory(active_only: bool = True) -> list[dict]:
@@ -1069,8 +1109,14 @@ def answer_question(question_id: str, answer: object, expected_version: int, *, 
             requeue_meal_modes = service.get_daily_review(item["question_date"])["status"] == "completed"
         except KeyError:
             requeue_meal_modes = False
-    if requeue_meal_modes:
-        _queue_changed_date(item["question_date"], "明日逐餐准备方式已修订")
+    if schema.get("kind") == "meal_mode_overrides":
+        reason = "明日逐餐准备方式已修订" if requeue_meal_modes else "明日逐餐准备方式已确认"
+        try:
+            _queue_changed_date(item["question_date"], reason)
+        except ValidationError:
+            from . import agent_workspace
+
+            agent_workspace.mark_draft_stale(item["question_date"], reason)
     return result
 
 
@@ -1153,7 +1199,9 @@ def activate_experiment(experiment_id: str, starts_on: str, days: int) -> dict:
             (starts.isoformat(), ends.isoformat(), _now(), experiment_id),
         )
         updated = conn.execute("SELECT * FROM adaptive_experiments WHERE id=?", (experiment_id,)).fetchone()
-    return row_dict(updated)
+    result = row_dict(updated)
+    _invalidate_agent_drafts("实验已开始")
+    return result
 
 
 def finish_experiment(experiment_id: str, result: dict, *, cancel: bool = False) -> dict:
@@ -1171,7 +1219,9 @@ def finish_experiment(experiment_id: str, result: dict, *, cancel: bool = False)
             (status, json.dumps(result, ensure_ascii=False), _now(), experiment_id),
         )
         updated = conn.execute("SELECT * FROM adaptive_experiments WHERE id=?", (experiment_id,)).fetchone()
-    return row_dict(updated)
+    item = row_dict(updated)
+    _invalidate_agent_drafts("实验状态已变化")
+    return item
 
 
 def active_experiment() -> dict | None:

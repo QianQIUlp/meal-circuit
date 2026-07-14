@@ -22,6 +22,7 @@ MIGRATIONS = {
     2: "safety policy, target provenance, scoped learning, and append-only feedback",
     3: "published plan projections and constrained rescue provenance",
     4: "versioned rule and experiment provenance",
+    5: "longitudinal agent drafts, case formulation, and reversible user model",
 }
 CURRENT_SCHEMA_VERSION = max(MIGRATIONS)
 
@@ -552,6 +553,120 @@ def init_db(path: Path | None = None) -> None:
                 started_at TEXT NOT NULL,
                 completed_at TEXT
             );
+            CREATE TABLE IF NOT EXISTS agent_workspace_events (
+                id TEXT PRIMARY KEY,
+                event_date TEXT NOT NULL,
+                input_text TEXT NOT NULL,
+                event_kind TEXT NOT NULL DEFAULT 'unclassified',
+                classification_json TEXT NOT NULL DEFAULT '{}',
+                affects_plan INTEGER NOT NULL DEFAULT 1 CHECK (affects_plan IN (0,1)),
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS agent_planning_runs (
+                id TEXT PRIMARY KEY,
+                review_date TEXT NOT NULL,
+                status TEXT NOT NULL CHECK (status IN (
+                    'collecting','needs_clarification','formulating','planning','reviewing',
+                    'ready_draft','stale','accepted','active','completed','failed','interrupted'
+                )),
+                provider TEXT,
+                model TEXT,
+                context_hash TEXT NOT NULL,
+                source_manifest_json TEXT NOT NULL DEFAULT '{}',
+                formulation_json TEXT,
+                review_json TEXT,
+                clarification_json TEXT NOT NULL DEFAULT '[]',
+                attempts_json TEXT NOT NULL DEFAULT '[]',
+                error_summary TEXT NOT NULL DEFAULT '',
+                started_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                completed_at TEXT
+            );
+            CREATE TABLE IF NOT EXISTS agent_drafts (
+                id TEXT PRIMARY KEY,
+                review_date TEXT NOT NULL UNIQUE,
+                run_id TEXT NOT NULL REFERENCES agent_planning_runs(id),
+                status TEXT NOT NULL CHECK (status IN (
+                    'collecting','needs_clarification','formulating','planning','reviewing',
+                    'ready_draft','stale','accepted','active','completed','failed','interrupted'
+                )),
+                formulation_json TEXT NOT NULL DEFAULT '{}',
+                result_json TEXT,
+                review_json TEXT NOT NULL DEFAULT '{}',
+                context_hash TEXT NOT NULL,
+                source_manifest_json TEXT NOT NULL DEFAULT '{}',
+                stale_reason TEXT NOT NULL DEFAULT '',
+                version INTEGER NOT NULL DEFAULT 1,
+                accepted_review_id TEXT,
+                accepted_result_version INTEGER,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                accepted_at TEXT
+            );
+            CREATE TABLE IF NOT EXISTS agent_clarifications (
+                id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL REFERENCES agent_planning_runs(id),
+                review_date TEXT NOT NULL,
+                question_key TEXT NOT NULL,
+                prompt TEXT NOT NULL,
+                reason TEXT NOT NULL DEFAULT '',
+                expected_impact TEXT NOT NULL DEFAULT '',
+                answer_schema_json TEXT NOT NULL DEFAULT '{}',
+                status TEXT NOT NULL DEFAULT 'pending'
+                    CHECK (status IN ('pending','answered','skipped','expired')),
+                answer_json TEXT,
+                version INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(run_id,question_key)
+            );
+            CREATE TABLE IF NOT EXISTS user_model_claims (
+                id TEXT PRIMARY KEY,
+                claim_type TEXT NOT NULL CHECK (claim_type IN (
+                    'confirmed_fact','stable_preference','soft_need_hypothesis',
+                    'friction_hypothesis','body_response_hypothesis','causal_hypothesis',
+                    'interaction_preference','temporary_state'
+                )),
+                statement TEXT NOT NULL,
+                scope_json TEXT NOT NULL DEFAULT '{}',
+                status TEXT NOT NULL DEFAULT 'pending_confirmation'
+                    CHECK (status IN ('pending_confirmation','active','paused','refuted','forgotten','expired')),
+                confidence REAL NOT NULL DEFAULT 0 CHECK (confidence BETWEEN 0 AND 1),
+                risk_level TEXT NOT NULL DEFAULT 'low' CHECK (risk_level IN ('low','high')),
+                effect_json TEXT NOT NULL DEFAULT '{}',
+                support_count INTEGER NOT NULL DEFAULT 0,
+                counter_count INTEGER NOT NULL DEFAULT 0,
+                first_observed_at TEXT NOT NULL,
+                last_observed_at TEXT NOT NULL,
+                valid_until TEXT,
+                source TEXT NOT NULL DEFAULT 'agent_inference',
+                version INTEGER NOT NULL DEFAULT 1,
+                rollback_parent_id TEXT,
+                last_used_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS user_model_claim_versions (
+                id TEXT PRIMARY KEY,
+                claim_id TEXT NOT NULL REFERENCES user_model_claims(id),
+                version INTEGER NOT NULL,
+                payload_json TEXT NOT NULL,
+                change_reason TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(claim_id,version)
+            );
+            CREATE TABLE IF NOT EXISTS user_model_evidence (
+                id TEXT PRIMARY KEY,
+                claim_id TEXT NOT NULL REFERENCES user_model_claims(id),
+                evidence_type TEXT NOT NULL,
+                evidence_id TEXT NOT NULL,
+                stance TEXT NOT NULL CHECK (stance IN ('support','counterexample')),
+                explicit INTEGER NOT NULL DEFAULT 0 CHECK (explicit IN (0,1)),
+                excerpt TEXT NOT NULL DEFAULT '',
+                observed_at TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(claim_id,evidence_type,evidence_id,stance)
+            );
             CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status, created_at);
             CREATE INDEX IF NOT EXISTS idx_task_input_history ON task_input_history(task_id, version);
             CREATE INDEX IF NOT EXISTS idx_records_date ON daily_records(record_date);
@@ -575,6 +690,12 @@ def init_db(path: Path | None = None) -> None:
             CREATE INDEX IF NOT EXISTS idx_inventory_status ON inventory_items(status, updated_at);
             CREATE INDEX IF NOT EXISTS idx_candidates_status ON adaptation_candidates(status, created_at);
             CREATE INDEX IF NOT EXISTS idx_rules_status ON adaptive_rules(status, updated_at);
+            CREATE INDEX IF NOT EXISTS idx_agent_events_date ON agent_workspace_events(event_date,created_at);
+            CREATE INDEX IF NOT EXISTS idx_agent_runs_date ON agent_planning_runs(review_date,started_at);
+            CREATE INDEX IF NOT EXISTS idx_agent_drafts_status ON agent_drafts(status,review_date);
+            CREATE INDEX IF NOT EXISTS idx_agent_questions ON agent_clarifications(review_date,status,created_at);
+            CREATE INDEX IF NOT EXISTS idx_user_claims_status ON user_model_claims(status,claim_type,updated_at);
+            CREATE INDEX IF NOT EXISTS idx_user_evidence_claim ON user_model_evidence(claim_id,observed_at);
             """
         )
         migration_columns = {row["name"] for row in conn.execute("PRAGMA table_info(schema_migrations)")}
@@ -789,6 +910,8 @@ def row_dict(row: sqlite3.Row | None) -> dict | None:
         "planned_snapshot_json",
         "scope_json", "evidence_summary_json", "proposed_effect_json", "effect_json",
         "plan_json", "menu_json", "item_json", "usage_json", "source_manifest_json", "validation_attempts_json",
+        "classification_json", "formulation_json", "review_json", "clarification_json", "attempts_json",
+        "answer_schema_json",
     ):
         if key in result and result[key]:
             result[key] = json.loads(result[key])

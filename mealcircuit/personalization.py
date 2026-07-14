@@ -911,7 +911,11 @@ def complete_onboarding(session_id: str, expected_version: int, confirmation: di
                    completed_at=?,updated_at=? WHERE id=?""",
             (timestamp, timestamp, session_id),
         )
-    return active_personalization()
+    result = active_personalization()
+    from . import agent_workspace
+
+    agent_workspace.mark_all_drafts_stale("目标、策略或安全档案已更新")
+    return result
 
 
 def active_personalization() -> dict:
@@ -1093,7 +1097,11 @@ def record_metric(metric_key: str, observed_date: str, value: object, source: st
             (item_id, metric_key, observed_date, json.dumps(value, ensure_ascii=False), source, timestamp),
         )
         row = conn.execute("SELECT * FROM metric_observations WHERE id=?", (item_id,)).fetchone()
-    return row_dict(row)
+    result = row_dict(row)
+    from . import agent_workspace
+
+    agent_workspace.mark_all_drafts_stale("新的长期指标可能影响计划")
+    return result
 
 
 def list_metrics(metric_key: str | None = None, limit: int = 100) -> list[dict]:
