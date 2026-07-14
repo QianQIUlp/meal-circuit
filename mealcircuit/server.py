@@ -698,7 +698,7 @@ def render_plan_page(
         )
         cards.append(f'''<article class="plan-card"><div class="section-header"><div><span class="subtle-label">{esc(slot_label)}</span><h2>{esc(meal.get('name') or '这一餐')}</h2></div>{f'<span class="status completed">{esc(FEEDBACK_LABELS.get(current_status,current_status))}</span>' if feedback else ''}</div>
         {purpose_html}{f'<p><strong>方式：</strong>{esc(MEAL_MODE_LABELS.get(meal.get("mode"), meal.get("mode") or ""))}</p>' if meal.get('mode') else ''}{f'<p><strong>份量：</strong>{esc(meal.get("portion_guidance"))}</p>' if meal.get('portion_guidance') else ''}{f'<h3>具体吃多少</h3><ul class="portion-list">{portion_contract_html}</ul>' if portion_contract_html else ''}{eat_out_html}{f'<p class="muted">{esc(execution_html)}</p>' if execution_html else ''}{f'<h3>{"可选食物" if meal.get("mode")=="eat_out" else "食材"}</h3><ul>{detail}</ul>' if detail else ''}{f'<h3>执行步骤</h3><ol>{step_html}</ol>' if step_html else ''}
-        {feedback_photo_html}<details class="feedback-box"{' open' if not feedback or draft else ''}><summary>{'修改这次记录' if feedback else '吃得怎么样？'}</summary><form method="post" enctype="multipart/form-data" action="/plans/{esc(plan_date)}/{esc(meal['plan_item_id'])}/feedback" data-plan-feedback><input type="hidden" name="expected_version" value="{version}">{photo_task_field}<div data-feedback-error-slot>{inline_error}</div><label>实际情况<select name="status" required><option value="">请选择</option>{status_options}</select></label><label>份量感觉<select name="satiety"><option value="">未记录</option>{satiety_options}</select></label><fieldset><legend>如果有变化，原因是什么？</legend><div class="option-grid">{reason_checks}</div></fieldset><label>实际怎么吃的（可选）<textarea name="actual_text">{esc(actual_text)}</textarea></label><label for="feedback-photo-{esc(meal['plan_item_id'])}">{'更换实际照片（可选）' if feedback_photo_html else '实际照片（可选）'}</label><input id="feedback-photo-{esc(meal['plan_item_id'])}" type="file" name="photo" accept="image/jpeg,image/png,image/gif,image/webp" capture="environment"><p class="muted small">可以直接拍照或选择已有图片，照片会和这顿的实际情况一起保存。</p><button type="submit">记下来</button></form></details>
+        {feedback_photo_html}<details class="feedback-box"{' open' if not feedback or draft else ''}><summary>{'修改这次记录' if feedback else '吃得怎么样？'}</summary><form method="post" enctype="multipart/form-data" action="/plans/{esc(plan_date)}/{esc(meal['plan_item_id'])}/feedback" data-plan-feedback><input type="hidden" name="expected_version" value="{version}">{photo_task_field}<div data-feedback-error-slot>{inline_error}</div><label>实际情况<select name="status" required><option value="">请选择</option>{status_options}</select></label><label>份量感觉<select name="satiety"><option value="">未记录</option>{satiety_options}</select></label><fieldset><legend>如果有变化，原因是什么？</legend><div class="option-grid">{reason_checks}</div></fieldset><label>实际怎么吃的（可选）<textarea name="actual_text" maxlength="2000">{esc(actual_text)}</textarea></label><label for="feedback-photo-{esc(meal['plan_item_id'])}">{'更换实际照片（可选）' if feedback_photo_html else '实际照片（可选）'}</label><input id="feedback-photo-{esc(meal['plan_item_id'])}" type="file" name="photo" accept="image/jpeg,image/png,image/gif,image/webp" capture="environment"><p class="muted small">可以直接拍照或选择已有图片，照片会和这顿的实际情况一起保存。</p><button type="submit">记下来</button></form></details>
         {f'<form class="rescue-form" method="post" action="/rescue/start"><input type="hidden" name="plan_date" value="{esc(plan_date)}"><input type="hidden" name="plan_item_id" value="{esc(meal["plan_item_id"])}"><label>临时有变化<select name="issue_code">{"".join(f"<option value={key!r}>{label}</option>" for key,label in RESCUE_LABELS.items())}</select></label><input name="input_text" aria-label="补充当前情况" placeholder="可以补充手边的食材或时间"><button class="secondary" type="submit">帮我调整这一餐</button></form>' if plan.get('scope_current') else ''}</article>''')
     stale = '' if plan.get('scope_current') else '<div class="quiet-note panel" role="note"><strong>这是过去的安排</strong><p>仍可以补记实际情况，但不会再按它调整今天。</p></div>'
     return (
@@ -2215,11 +2215,12 @@ class Handler(BaseHTTPRequestHandler):
                         expected_version=expected or None, actor_source="web",
                     )
                 except ValidationError as exc:
-                    if status_value not in {"modified", "skipped"} or reason_codes:
-                        raise
+                    feedback_error = str(exc)
+                    if feedback_error == "实际执行补充 不能超过 2000 字":
+                        feedback_error = "“实际怎么吃的”最多填写 2000 字，请精简后再保存。"
                     self.send_html(
                         "记录这一餐",
-                        render_plan_page(plan_date, feedback_draft=draft, feedback_error=str(exc)),
+                        render_plan_page(plan_date, feedback_draft=draft, feedback_error=feedback_error),
                         400,
                     )
                     return

@@ -1404,6 +1404,35 @@ class WebAppTest(unittest.TestCase):
         self.assertEqual(200, status)
         self.assertIn("请选择这顿发生变化的原因", app_script.decode("utf-8"))
 
+    def test_plan_feedback_text_limit_stays_on_the_plan_with_inputs(self):
+        review_date = date.today().isoformat()
+        service.add_daily_record(review_date, "今天按计划记录实际饮食。")
+        service.complete_daily_review(review_date, daily_review_result(review_date))
+        plan_date = (date.today() + timedelta(days=1)).isoformat()
+        plan = adaptive.get_plan_for_date(plan_date)
+        meal = plan["menu"]["meals"][0]
+        item_id = meal["plan_item_id"]
+        actual_text = "长" * 2001
+        body, headers = self.multipart_form([
+            ("expected_version", "0"),
+            ("status", "followed"),
+            ("satiety", "too_much"),
+            ("actual_text", actual_text),
+        ])
+
+        status, _, raw = self.request(
+            "POST", f"/plans/{plan_date}/{item_id}/feedback", body, headers
+        )
+        page = raw.decode("utf-8")
+        self.assertEqual(400, status)
+        self.assertIn("“实际怎么吃的”最多填写 2000 字，请精简后再保存。", page)
+        self.assertIn('<option value="followed" selected>', page)
+        self.assertIn('<option value="too_much" selected>', page)
+        self.assertIn(f'<textarea name="actual_text" maxlength="2000">{actual_text}</textarea>', page)
+        self.assertIn('<details class="feedback-box" open>', page)
+        self.assertNotIn('href="/">返回总览', page)
+        self.assertIsNone(adaptive.get_plan_for_date(plan_date)["feedback"].get(item_id))
+
     def test_pages_and_material_form(self):
         for path in ("/", "/plans", "/me", "/history", "/tasks/photo", "/tasks/material", "/tasks", "/ai", "/sync", "/foods", "/overview"):
             status, _, body = self.request("GET", path)
