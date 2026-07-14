@@ -14,7 +14,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from unittest.mock import patch
 from pathlib import Path
 
-from mealcircuit import personalization, service
+from mealcircuit import agent_workspace, personalization, service
 from mealcircuit.configuration import configured_today, configuration_status, initialize_private_home
 from mealcircuit.contracts import load_contract, validate_transition
 from mealcircuit.crypto import format_recovery_key, parse_recovery_key, random_key
@@ -408,6 +408,25 @@ class DomainAndPortableTest(unittest.TestCase):
         restored = service.get_task(task["id"])
         self.assertEqual(restored["original_input"], "合成照片")
         self.assertTrue(resolve_data_path(restored["image_path"]).is_file())
+
+    def test_agent_user_model_projection_round_trips_and_hydrates_locally(self) -> None:
+        root = Path(self.temp.name)
+        source, target, archive = root / "source-agent", root / "target-agent", root / "agent.zip"
+        configure_home(source)
+        init_db()
+        original = agent_workspace.upsert_claim(
+            claim_type="stable_preference", statement="晚餐更喜欢一锅完成",
+            scope={"meal": "晚餐"}, effect={"complexity": "优先一锅菜"},
+            evidence_type="user_correction", evidence_id="portable-proof", explicit=True,
+        )
+        export_data(archive, encrypted=False)
+
+        configure_home(target)
+        apply_import(archive, mode="restore")
+        restored = {item["id"]: item for item in agent_workspace.list_claims()}
+        self.assertIn(original["id"], restored)
+        self.assertEqual("active", restored[original["id"]]["status"])
+        self.assertEqual({"complexity": "优先一锅菜"}, restored[original["id"]]["effect_json"])
 
     def test_portable_archive_excludes_device_keys_tokens_and_api_keys(self) -> None:
         root = Path(self.temp.name)

@@ -1340,6 +1340,7 @@ class WebAppTest(unittest.TestCase):
         self.assertIn('data-theme-toggle', decoded_home)
         self.assertEqual(1, decoded_home.count("<h1"))
         self.assertIn('href="/history"', decoded_home)
+
         self.assertNotIn("最近任务", decoded_home)
         self.assertIn("script-src 'self'", home_headers["Content-Security-Policy"])
         status, headers, css = self.request("GET", "/assets/ui/app.css")
@@ -1378,6 +1379,32 @@ class WebAppTest(unittest.TestCase):
             self.assertIn(label, decoded)
         self.assertIn("&lt;b&gt;鸡胸肉饭&lt;/b&gt;", decoded)
         self.assertNotIn("<b>鸡胸肉饭</b>", decoded)
+
+    def test_agent_context_inspector_has_human_page_json_export_and_poll_state(self):
+        review_date = date.today().isoformat()
+        service.add_daily_record(review_date, "今天完成力量训练，明天午餐外食。")
+        status, _, page = self.request("GET", f"/agent/context/{review_date}")
+        self.assertEqual(200, status)
+        decoded = page.decode("utf-8")
+        self.assertIn("这次模型实际看到了什么", decoded)
+        self.assertIn("为什么选入", decoded)
+        self.assertIn("本次采用的专业原则", decoded)
+        self.assertIn("仍未知：体重、训练、饥饿感、睡眠、肠胃", decoded)
+        self.assertIn("不追求一顿所谓的完美餐", decoded)
+        self.assertNotIn("{'due':", decoded)
+        self.assertIn(f'/agent/context/{review_date}?format=json', decoded)
+
+        status, headers, raw = self.request("GET", f"/agent/context/{review_date}?format=json")
+        self.assertEqual(200, status)
+        self.assertIn("application/json", headers["Content-Type"])
+        context = json.loads(raw)
+        self.assertEqual("AgentContextV2", context["context_schema"])
+
+        status, _, raw_state = self.request("GET", f"/agent/state/{review_date}")
+        self.assertEqual(200, status)
+        state = json.loads(raw_state)
+        self.assertEqual("collecting", state["status"])
+        self.assertEqual(0, state["version"])
 
     def test_adaptive_web_workspace_plan_feedback_inventory_and_setup_revision(self):
         review_date = date.today().isoformat()
@@ -1669,6 +1696,9 @@ class WebAppTest(unittest.TestCase):
             "api_key": "secret-runtime-key",
             "timeout_seconds": "33",
             "max_output_tokens": "444",
+            "case_model": "deepseek-case",
+            "plan_model": "deepseek-plan",
+            "review_model": "deepseek-review",
         }).encode()
         status, headers, _ = self.request(
             "POST", "/ai/configure", form,
@@ -1679,6 +1709,9 @@ class WebAppTest(unittest.TestCase):
         self.assertEqual(os.environ["MEALCIRCUIT_AI_PROVIDER"], "deepseek")
         self.assertEqual(os.environ["MEALCIRCUIT_AI_MODEL"], "deepseek-v4-flash")
         self.assertEqual(os.environ["MEALCIRCUIT_DEEPSEEK_API_KEY"], "secret-runtime-key")
+        self.assertEqual(os.environ["MEALCIRCUIT_AI_CASE_MODEL"], "deepseek-case")
+        self.assertEqual(os.environ["MEALCIRCUIT_AI_PLAN_MODEL"], "deepseek-plan")
+        self.assertEqual(os.environ["MEALCIRCUIT_AI_REVIEW_MODEL"], "deepseek-review")
 
         status, _, configured = self.request("GET", "/ai")
         decoded_configured = configured.decode("utf-8")
@@ -1692,6 +1725,7 @@ class WebAppTest(unittest.TestCase):
         self.assertEqual(headers["Location"], "/ai")
         self.assertNotIn("MEALCIRCUIT_AI_PROVIDER", os.environ)
         self.assertNotIn("MEALCIRCUIT_DEEPSEEK_API_KEY", os.environ)
+        self.assertNotIn("MEALCIRCUIT_AI_CASE_MODEL", os.environ)
 
     def test_daily_review_web_display_and_record_redirect(self):
         review_date = date.today().isoformat()

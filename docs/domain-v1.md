@@ -16,7 +16,7 @@ Unknown future schema versions may be retained as encrypted opaque entities, but
 - `food_item`, including revision history and package-photo asset references
 - `daily_record`, `checkin_day`, `checkin_draft`, `daily_review`
 - `memory`, `adjustment`
-- versioned `preferences` for profile, settings, private doctrine and check-in module configuration
+- versioned `preferences` for profile, settings, private doctrine, check-in module configuration and the compact `agent_user_model` projection; detailed Agent runs and unpublished drafts remain local diagnostics
 - `asset` metadata; bytes are content-addressed and transferred separately
 
 Task input is intentionally separate from task state so edits can evolve without rewriting locked results. Analysis results are derived entities, not authoritative facts.

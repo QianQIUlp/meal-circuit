@@ -676,6 +676,11 @@ def _queue_daily_review(conn, record_date: str, archive_reason: str = "new_daily
         )
         created = conn.execute("SELECT id FROM daily_reviews WHERE review_date=?", (record_date,)).fetchone()
         capture_entity(conn, "daily_review", created["id"], created_at=timestamp)
+        conn.execute(
+            """UPDATE agent_drafts SET status='stale',stale_reason=?,version=version+1,updated_at=?
+               WHERE review_date=? AND status IN ('formulating','planning','reviewing','ready_draft','needs_clarification')""",
+            (archive_reason, timestamp, record_date),
+        )
         return
     policy = _revision_policy_with_connection(conn, review)
     if review["status"] == "completed" and review["result_json"] and policy["mode"] == "locked":
@@ -695,6 +700,11 @@ def _queue_daily_review(conn, record_date: str, archive_reason: str = "new_daily
             (source_json, checkin_versions_json, timestamp, record_date),
         )
     capture_entity(conn, "daily_review", review["id"], created_at=timestamp)
+    conn.execute(
+        """UPDATE agent_drafts SET status='stale',stale_reason=?,version=version+1,updated_at=?
+           WHERE review_date=? AND status IN ('formulating','planning','reviewing','ready_draft','needs_clarification')""",
+        (archive_reason, timestamp, record_date),
+    )
 
 
 def queue_review_for_external_change(record_date: str, reason: str) -> dict:
@@ -906,7 +916,11 @@ def complete_checkin_module(checkin_date: str, module_key: str, expected_version
         conn.execute("UPDATE daily_checkins SET updated_at=? WHERE id=?", (timestamp, row["checkin_id"]))
         capture_entity(conn, "checkin_day", row["checkin_id"], created_at=timestamp)
         _queue_daily_review(conn, checkin_date, "checkin_module_updated")
-    return get_checkin_module(checkin_date, module_key)
+    result = get_checkin_module(checkin_date, module_key)
+    from . import agent_workspace
+
+    agent_workspace.schedule_auto_draft(checkin_date)
+    return result
 
 
 def skip_checkin_module(checkin_date: str, module_key: str, expected_version: int) -> dict:
@@ -934,7 +948,11 @@ def skip_checkin_module(checkin_date: str, module_key: str, expected_version: in
         conn.execute("UPDATE daily_checkins SET updated_at=? WHERE id=?", (timestamp, row["checkin_id"]))
         capture_entity(conn, "checkin_day", row["checkin_id"], created_at=timestamp)
         _queue_daily_review(conn, checkin_date, "checkin_module_skipped")
-    return get_checkin_module(checkin_date, module_key)
+    result = get_checkin_module(checkin_date, module_key)
+    from . import agent_workspace
+
+    agent_workspace.schedule_auto_draft(checkin_date)
+    return result
 
 
 def discard_checkin_draft(checkin_date: str, module_key: str, expected_version: int) -> dict:
@@ -966,7 +984,14 @@ def add_daily_record(record_date: str, raw_input: str, structured: dict | None =
         conn.execute("INSERT INTO daily_records VALUES(?,?,?,?,?)", item)
         capture_entity(conn, "daily_record", item[0], created_at=item[4])
         _queue_daily_review(conn, record_date)
-    return {"id": item[0], "record_date": item[1], "raw_input": item[2], "structured_json": structured, "created_at": item[4]}
+    result = {
+        "id": item[0], "record_date": item[1], "raw_input": item[2],
+        "structured_json": structured, "created_at": item[4],
+    }
+    from . import agent_workspace
+
+    agent_workspace.schedule_auto_draft(record_date)
+    return result
 
 
 def ensure_daily_review(review_date: str) -> dict:
@@ -1524,6 +1549,41 @@ def daily_review_context(review_date: str, days: int = 14) -> dict:
     return context
 
 
+def validate_daily_review_candidate(
+    review_date: str,
+    result: dict,
+    *,
+    provenance_context: dict | None = None,
+) -> dict:
+    """Apply every publish-time content gate without creating product history."""
+    from .personalization import require_generation
+
+    require_generation("daily")
+    context = provenance_context or daily_review_context(review_date)
+    settings = context["settings"]
+    candidate = json.loads(json.dumps(result, ensure_ascii=False))
+    validate_daily_review_result(candidate, settings)
+    _validate_meal_semantics(review_date, candidate, settings, context)
+    expected_priority_ids = {food["id"] for food in list_priority_foods()}
+    submitted_priority_ids = {item["food_id"] for item in candidate["priority_food_decisions"]}
+    if submitted_priority_ids != expected_priority_ids:
+        missing = sorted(expected_priority_ids - submitted_priority_ids)
+        unknown = sorted(submitted_priority_ids - expected_priority_ids)
+        raise ValidationError(f"优先食品裁决不完整；缺少={missing}，未知={unknown}")
+    expected_menu_date = (date.fromisoformat(review_date) + timedelta(days=1)).isoformat()
+    if candidate["tomorrow_menu"]["date"] != expected_menu_date:
+        raise ValidationError(f"次日菜单日期必须是 {expected_menu_date}")
+    home_cooking = settings.get("home_cooking") or {"enabled": False}
+    if home_cooking.get("enabled"):
+        obligations = _ingredient_carryover_obligations(
+            review_date, _recent_review_rows_for_carryover(review_date)
+        )
+        _validate_ingredient_carryover_decisions(candidate, obligations)
+    from .planning import validate_and_enrich_daily_result
+
+    return validate_and_enrich_daily_result(candidate, context)
+
+
 def complete_daily_review(
     review_date: str,
     result: dict,
@@ -1542,27 +1602,9 @@ def complete_daily_review(
     if review["status"] == "completed" and not replacing:
         raise ValidationError("该复盘已因执行事实或日期锁定；请重新排队以追加正式版本")
     context = provenance_context or daily_review_context(review_date)
-    settings = context["settings"]
-    validate_daily_review_result(result, settings)
-    _validate_meal_semantics(review_date, result, settings, context)
-    expected_priority_ids = {food["id"] for food in list_priority_foods()}
-    submitted_priority_ids = {item["food_id"] for item in result["priority_food_decisions"]}
-    if submitted_priority_ids != expected_priority_ids:
-        missing = sorted(expected_priority_ids - submitted_priority_ids)
-        unknown = sorted(submitted_priority_ids - expected_priority_ids)
-        raise ValidationError(f"优先食品裁决不完整；缺少={missing}，未知={unknown}")
-    expected_menu_date = (date.fromisoformat(review_date) + timedelta(days=1)).isoformat()
-    if result["tomorrow_menu"]["date"] != expected_menu_date:
-        raise ValidationError(f"次日菜单日期必须是 {expected_menu_date}")
-    home_cooking = settings.get("home_cooking") or {"enabled": False}
-    if home_cooking.get("enabled"):
-        obligations = _ingredient_carryover_obligations(
-            review_date, _recent_review_rows_for_carryover(review_date)
-        )
-        _validate_ingredient_carryover_decisions(result, obligations)
-    from .planning import validate_and_enrich_daily_result
-
-    result = validate_and_enrich_daily_result(result, context)
+    result = validate_daily_review_candidate(
+        review_date, result, provenance_context=context
+    )
     if source_revisions is None:
         source_revisions = context["source_revisions"]
     portable_provenance = _result_provenance(source_revisions, generator)

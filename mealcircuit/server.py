@@ -21,7 +21,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from . import adaptive, ai, checkins, personalization, portability, service, sync
+from . import adaptive, agent_workspace, ai, checkins, personalization, portability, service, sync
 from .configuration import initialize_private_home
 from .db import connect, init_db
 from .storage import exports_root, managed_asset_root, port_value, upload_root
@@ -250,41 +250,259 @@ def render_today_workspace(work_date: str) -> str:
     current = personalization.active_personalization()
     if current["status"] == "setup_required":
         return render_setup_start(personalization.onboarding_status())
-    plan = adaptive.get_plan_for_date(work_date)
-    questions = adaptive.schedule_questions(work_date)
+    state = agent_workspace.get_workspace_state(work_date)
+    draft = state.get("draft") or {}
+    if draft.get("status") in {None, "stale", "failed", "interrupted"}:
+        agent_workspace.schedule_auto_draft(work_date)
     safety = current["safety"]
     goal = (current.get("goals") or [{}])[0].get("goal_json") or {}
     goal_label = goal.get("custom_label") or GOAL_LABELS.get(goal.get("type"), goal.get("type") or "未设定")
-    if plan:
-        completed = len(plan["feedback"])
-        plan_block = (
-            f'<section class="panel today-plan"><div class="section-header"><div><p class="eyebrow">Today plan</p><h2>今天按这份计划走</h2>'
-            f'<p class="muted">{completed} / {len(plan["menu"]["meals"])} 项已有回执</p></div><a class="button" href="/plans/{esc(work_date)}">打开计划</a></div></section>'
-        ) if plan.get("scope_current") else (
-            '<section class="panel today-plan"><p class="eyebrow">Stale plan</p><h2>旧目标版本的计划不再作为今天指令</h2>'
-            '<p>可以保留历史执行回执，但需要按当前目标与边界重新生成计划。</p><a class="button" href="/daily">重新生成</a></section>'
+    formulation = draft.get("formulation_json") or {}
+    understanding_items = []
+    for text in formulation.get("current_state") or []:
+        understanding_items.append({"kind": "今天", "text": text, "evidence": "来自当天记录与状态"})
+    for item in formulation.get("underlying_needs") or []:
+        if isinstance(item, dict):
+            understanding_items.append({
+                "kind": "深层需求", "text": item.get("need") or item.get("statement") or "",
+                "evidence": item.get("evidence") or "Agent 推断，等待真实结果校准",
+            })
+    if not understanding_items:
+        understanding_items = [
+            {"kind": "目标", "text": goal_label, "evidence": "已确认的个人目标版本", "fixed": True},
+            {"kind": "安全边界", "text": safety["mode"], "evidence": "当前安全策略", "fixed": True},
+        ]
+    understanding_items.extend({
+        "kind": "用户模型", "text": item["statement"],
+        "evidence": f'支持 {item["support_count"]} · 反证 {item["counter_count"]}',
+        "claim_id": item["id"], "risk_level": item["risk_level"],
+    } for item in state["claims"] if item["status"] in {"active", "pending_confirmation"})
+    understanding_rows = []
+    for item in understanding_items:
+        text = item.get("text")
+        if not text:
+            continue
+        if item.get("fixed"):
+            actions = '<a class="small" href="/profile">在目标与边界中修改</a>'
+        elif item.get("claim_id") and item.get("risk_level") != "high":
+            actions = (
+                '<div class="understanding-actions">'
+                f'<form method="post" action="/learning/claims/{esc(item["claim_id"])}/action"><input type="hidden" name="action" value="confirm"><input type="hidden" name="return_to" value="/"><button class="link-button">正确</button></form>'
+                f'<form method="post" action="/learning/claims/{esc(item["claim_id"])}/action"><input type="hidden" name="action" value="today"><input type="hidden" name="return_to" value="/"><button class="link-button">只适用于今天</button></form>'
+                f'<form method="post" action="/learning/claims/{esc(item["claim_id"])}/action"><input type="hidden" name="action" value="stable"><input type="hidden" name="return_to" value="/"><button class="link-button">以后都这样</button></form>'
+                f'<details><summary>不对</summary><form method="post" action="/learning/claims/{esc(item["claim_id"])}/action"><input type="hidden" name="action" value="correct"><input type="hidden" name="return_to" value="/"><textarea name="correction" required aria-label="写下正确理解"></textarea><button>保存纠正</button></form></details></div>'
+            )
+        elif item.get("claim_id"):
+            actions = '<a class="small" href="/profile">高影响信息必须在目标与边界中确认</a>'
+        else:
+            actions = (
+                '<div class="understanding-actions">'
+                f'<form method="post" action="/agent/intake"><input type="hidden" name="record_date" value="{esc(work_date)}"><input type="hidden" name="text" value="{esc("我确认这条理解：" + str(text))}"><button class="link-button">正确</button></form>'
+                f'<details><summary>不对</summary><form method="post" action="/agent/intake"><input type="hidden" name="record_date" value="{esc(work_date)}"><textarea name="text" required aria-label="写下正确情况" placeholder="写下实际情况，旧理解会保留为反证来源"></textarea><button>保存纠正</button></form></details></div>'
+            )
+        understanding_rows.append(
+            f'<li><div><span class="status">{esc(item["kind"])}</span><strong>{esc(text)}</strong>'
+            f'<p class="muted small">{esc(item.get("evidence"))}</p></div>{actions}</li>'
         )
+    understanding_html = "".join(understanding_rows) or '<li class="muted">保存一条今天的情况后，Agent 会先形成个案理解。</li>'
+    question_cards = []
+    for question in state["questions"]:
+        if question["status"] != "pending":
+            continue
+        schema = question.get("answer_schema_json") or {}
+        options = schema.get("options") or []
+        control = (
+            '<div class="option-list">' + "".join(
+                f'<label class="choice-row"><input type="radio" name="answer" value="{esc(value)}" required><span>{esc(value)}</span></label>'
+                for value in options
+            ) + '</div>'
+            if options else '<label>你的回答<textarea name="answer" required></textarea></label>'
+        )
+        question_cards.append(
+            f'<article class="agent-question"><h3>{esc(question["prompt"])}</h3><p>{esc(question["reason"])}</p>'
+            f'<p class="muted small">这个答案会改变：{esc(question["expected_impact"])}</p>'
+            f'<form method="post" action="/agent/questions/{esc(question["id"])}/answer">'
+            f'<input type="hidden" name="version" value="{esc(question["version"])}">{control}<button>保存并继续规划</button></form></article>'
+        )
+    questions_html = "".join(question_cards)
+    status = draft.get("status") or (state.get("latest_run") or {}).get("status") or "collecting"
+    phase_labels = {
+        "collecting": "等待今天的真实情况", "needs_clarification": "需要确认少量关键信息",
+        "formulating": "正在理解情况", "planning": "正在设计方案", "reviewing": "正在独立审查",
+        "ready_draft": "草案可以协商", "stale": "情况已变化，等待重新规划", "accepted": "已接受并发布",
+        "active": "正式计划正在执行", "completed": "正式计划已完成",
+        "failed": "本次运行失败，正式计划没有变化", "interrupted": "新情况打断了旧规划",
+    }
+    phases = (("formulating", "理解情况"), ("planning", "设计方案"), ("reviewing", "独立审查"))
+    active_index = {
+        "formulating": 0, "planning": 1, "reviewing": 2, "ready_draft": 3,
+        "accepted": 3, "active": 3, "completed": 3,
+    }.get(status, -1)
+    polling = (
+        status in {"collecting", "stale", "formulating", "planning", "reviewing"}
+        and agent_workspace.auto_generation_status(work_date)["eligible"]
+    )
+    progress_attributes = (
+        f' data-agent-state-url="/agent/state/{esc(work_date)}" data-agent-status="{esc(status)}"'
+        f' data-agent-version="{esc(draft.get("version") or 0)}"'
+        if polling else ""
+    )
+    phase_html = "".join(
+        f'<li class="{"done" if index < active_index else "active" if index == active_index else ""}"><span>{index + 1}</span>{esc(label)}</li>'
+        for index, (_, label) in enumerate(phases)
+    )
+    current_plan = adaptive.get_plan_for_date(work_date)
+    published_plan_date = ((draft.get("result_json") or {}).get("tomorrow_menu") or {}).get("date")
+    published_plan = adaptive.get_plan_for_date(published_plan_date) if published_plan_date else None
+    draft_html = ""
+    if draft.get("status") == "ready_draft" and draft.get("result_json"):
+        result = draft["result_json"]
+        meal_summaries = []
+        for meal in (result.get("tomorrow_menu") or {}).get("meals") or []:
+            portions = "".join(
+                f'<li><strong>{esc(item.get("item"))}</strong> '
+                f'{esc("–".join(str(v) for v in item["gram_range"]) + "g" if item.get("gram_range") else "克数未知")} · '
+                f'{esc(item.get("measurement_basis"))} · {esc(item.get("household_measure"))}'
+                f'<br><span class="muted small">吃不饱：{esc(item.get("increase_if"))}；食欲低：{esc(item.get("decrease_if"))}</span></li>'
+                for item in meal.get("portion_contracts") or []
+            )
+            meal_summaries.append(
+                f'<article class="draft-meal"><div><span class="status">{esc(MEAL_MODE_LABELS.get(meal.get("mode"),meal.get("mode")))}</span>'
+                f'<h3>{esc(meal.get("name"))}</h3><p>{esc(meal.get("purpose") or meal.get("why_today") or "")}</p>'
+                f'<p class="muted">{esc(meal.get("why_today") or "")}</p></div><ul class="portion-list">{portions}</ul></article>'
+            )
+        rationale = "".join(f'<li>{esc(item)}</li>' for item in result.get("planning_rationale") or [])
+        draft_html = (
+            '<section class="panel agent-draft"><div class="section-header"><div><p class="eyebrow">Negotiable draft</p>'
+            f'<h2>今日复盘与明日草案</h2><p class="lede">{esc(result.get("case_summary") or result.get("one_line_review"))}</p></div>'
+            f'<span class="status">草案 v{esc(draft["version"])}</span></div><ol class="rationale-list">{rationale}</ol>'
+            f'<div class="draft-meals">{"".join(meal_summaries)}</div>'
+            f'<details><summary>为什么这样安排</summary>{render_daily_review_result(result)}</details>'
+            f'<details><summary>本次模型看到了什么</summary><p>上下文哈希：<code>{esc(draft["context_hash"][:16])}</code></p>'
+            f'<a href="/agent/context/{esc(work_date)}">查看 AgentContextV2 与选择理由</a></details>'
+            f'<form class="agent-revision" method="post" action="/agent/drafts/{esc(work_date)}/revise"><label>只修改你不满意的部分'
+            '<textarea name="instruction" required placeholder="例如：午饭改外食；晚饭保留。或：菜量太少，增加蔬菜和吃不饱时的加量条件。"></textarea></label>'
+            '<button class="secondary">局部重算</button></form>'
+            f'<form method="post" action="/agent/drafts/{esc(work_date)}/accept"><button>接受并开始执行</button>'
+            '<p class="muted small">接受后才进入正式计划、执行回执和学习证据。</p></form></section>'
+        )
+    elif status in {"accepted", "active", "completed"} and published_plan:
+        draft_html = (
+            '<section class="panel quiet-success"><div class="section-header"><div>'
+            '<p class="eyebrow">Published plan</p><h2>草案已经成为正式执行计划</h2>'
+            f'<p>{esc(published_plan["plan_date"])} · '
+            f'{len(published_plan["feedback"])} / {len(published_plan["menu"].get("meals") or [])} 餐已有回执。'
+            '接下来只记录真实执行或处理临时变化，不会再把它显示成待生成草案。</p></div>'
+            f'<a class="button" href="/plans/{esc(published_plan["plan_date"])}">打开执行计划</a></div></section>'
+        )
+    elif status in {"failed", "stale", "interrupted"}:
+        reason = draft.get("stale_reason") or (state.get("latest_run") or {}).get("error_summary") or "本次没有生成可发布草案"
+        draft_html = f'<section class="panel form-error"><h2>{esc(status_labels(status))}</h2><p>{esc(reason)}</p><form method="post" action="/agent/drafts/{esc(work_date)}/generate"><button>按最新情况重新规划</button></form></section>'
+    elif status == "needs_clarification":
+        draft_html = f'<section class="panel"><p class="eyebrow">Decision-changing questions</p><h2>还需要确认</h2><div class="agent-questions">{questions_html}</div></section>'
     else:
-        policy = personalization.generation_policy("daily")
-        plan_block = (
-            '<section class="panel today-plan"><p class="eyebrow">Next action</p><h2>先记录今天，再生成下一份正式计划</h2>'
-            f'<p>{esc(policy["reason"] or "记录会进入证据层；只有正式发布的计划才会进入执行学习。")}</p>'
-            f'<div class="actions"><a class="button" href="/capture">记录真实情况</a><a class="button secondary" href="/daily">查看建议状态</a></div></section>'
+        eligibility = agent_workspace.auto_generation_status(work_date)
+        action = (
+            f'<form method="post" action="/agent/drafts/{esc(work_date)}/generate"><button>现在生成草案</button></form>'
+            if eligibility["eligible"] else f'<p class="muted">{esc(eligibility["reason"])}</p><a class="button secondary" href="/ai">配置模型</a>'
         )
-    question_block = (
-        f'<section class="panel"><div class="section-header"><div><p class="eyebrow">Low-friction check</p><h2>只问最有用的问题</h2><p class="muted">今天还有 {len(questions)} 个问题</p></div>'
-        f'<a class="button secondary" href="/questions/{esc(work_date)}">回答</a></div></section>' if questions else
-        '<section class="panel quiet-success"><h2>今天不需要再回答问题</h2><p class="muted">MealCircuit 会继续从执行回执中积累证据。</p></section>'
+        draft_html = f'<section class="panel"><h2>今日复盘与明日草案</h2><p>保存真实情况后默认等待 30 秒合并变化，再自动开始三阶段规划。</p>{action}</section>'
+    plan = current_plan
+    active_plan = (
+        f'<section class="panel quiet-success"><div class="section-header"><div><p class="eyebrow">Active plan</p><h2>今天已有正式执行计划</h2>'
+        f'<p>{len(plan["feedback"])} / {len(plan["menu"]["meals"])} 餐已有回执</p></div><a class="button" href="/plans/{esc(work_date)}">打开执行计划</a></div></section>'
+        if plan else ""
     )
     return (
-        f'<section class="today-hero"><div><p class="eyebrow">Adaptive workspace · {esc(work_date)}</p><h1>今天只处理下一步</h1>'
-        f'<p class="lede">当前目标：{esc(goal_label)}。安全模式：{esc(safety["mode"])}。</p></div><a class="button secondary" href="/profile">目标与边界</a></section>'
-        f'<div class="today-grid">{plan_block}{question_block}</div>'
-        '<section class="quick-actions" aria-label="快速操作"><a class="quick-card" href="/capture"><strong>记录事实</strong><span>饮食、照片、原材料和状态</span></a>'
-        f'<a class="quick-card" href="/plans/{esc(work_date)}"><strong>执行计划</strong><span>查看步骤、反馈或临时救场</span></a>'
-        '<a class="quick-card" href="/inventory"><strong>管理库存</strong><span>临期、用完和未购买都保留事件</span></a>'
-        '<a class="quick-card" href="/learning"><strong>确认学习</strong><span>候选规则不会静默生效</span></a></section>'
+        f'<section class="today-hero agent-hero"><div><p class="eyebrow">Longitudinal case agent · {esc(work_date)}</p>'
+        f'<h1>先理解你今天真正需要什么</h1><p class="lede">今天只处理下一步：当前目标是{esc(goal_label)}。安全模式：{esc(safety["mode"])}。草案只有接受后才成为正式计划。</p></div>'
+        '<a class="button secondary" href="/profile">目标与边界</a></section>'
+        f'{active_plan}<section class="panel agent-intake"><div><p class="eyebrow">1 · Tell me what changed</p><h2>告诉我今天发生了什么</h2>'
+        '<p>饮食、训练、食欲、日程、库存和临时计划都可以直接说；Agent 会在一次规划中一起理解。</p></div>'
+        f'<form method="post" action="/agent/intake"><input type="hidden" name="record_date" value="{esc(work_date)}">'
+        '<label>今天的情况<textarea name="text" required placeholder="例如：明天中午会外食，晚上自己做；今天训练后很饿，而且上次晚饭菜量太少。"></textarea></label><button>保存并更新理解</button></form></section>'
+        f'<section class="panel agent-understanding"><div class="section-header"><div><p class="eyebrow">2 · Case formulation</p><h2>我目前对你的理解</h2></div><a href="/learning">查看全部用户模型</a></div><ul>{understanding_html}</ul></section>'
+        f'<section class="panel agent-progress" aria-live="polite"{progress_attributes}><div class="section-header"><div><p class="eyebrow">3 · Three-stage planning</p><h2>{esc(status_labels(status))}</h2><p class="muted">{esc(phase_labels.get(status,status))}</p></div><span class="status">{esc(status)}</span></div><ol>{phase_html}</ol></section>'
+        f'{draft_html}'
     )
+
+
+def render_agent_context_page(work_date: str) -> str:
+    context = agent_workspace.build_agent_context(work_date)
+    inspector = context["context_inspector"]
+    included = "".join(
+        f'<li><strong>{esc(item["section"])}</strong><span>{esc(item["reason"])}</span></li>'
+        for item in inspector["included"]
+    )
+    excluded = "".join(
+        f'<li><strong>{esc(item["kind"])}</strong><span>{esc(item["reason"])}</span></li>'
+        for item in inspector["excluded"]
+    )
+    person = context["person"]
+    goals = "".join(
+        f'<li>{esc((item.get("goal_json") or {}).get("custom_label") or (item.get("goal_json") or {}).get("type") or "未命名目标")}</li>'
+        for item in person.get("goals") or []
+    ) or '<li class="muted">没有生效目标</li>'
+    claims = "".join(
+        f'<li><strong>{esc(item["statement"])}</strong><span>置信度 {esc(item["confidence"])} · v{esc(item["version"])}</span></li>'
+        for item in person.get("active_user_model") or []
+    ) or '<li class="muted">本次没有使用软性用户模型</li>'
+    today = context["today"]
+    records = "".join(
+        f'<li><strong>{esc(item["created_at"])}</strong><span>{esc(item["raw_input"])}</span></li>'
+        for item in today.get("records") or []
+    ) or '<li class="muted">没有当天文字记录</li>'
+    modes = context["decision_task"]["immutable_constraints"].get("effective_meal_modes") or {}
+    mode_text = "、".join(
+        f'{name}：{MEAL_MODE_LABELS.get(modes.get(key), modes.get(key) or "未知")}'
+        for key, name in (("breakfast", "早餐"), ("lunch", "午餐"), ("dinner", "晚餐"))
+    )
+    coverage = today.get("checkin_coverage") or {}
+    module_labels = {
+        "weight": "体重", "training": "训练", "hunger": "饥饿感",
+        "sleep": "睡眠", "gut": "肠胃",
+    }
+    missing_text = "、".join(module_labels.get(value, value) for value in coverage.get("missing") or [])
+    skipped_text = "、".join(module_labels.get(value, value) for value in coverage.get("skipped") or [])
+    coverage_bits = [f'已处理 {coverage.get("handled", 0)} / {coverage.get("due", 0)}']
+    if missing_text:
+        coverage_bits.append(f"仍未知：{missing_text}")
+    if skipped_text:
+        coverage_bits.append(f"已跳过：{skipped_text}")
+    coverage_text = "；".join(coverage_bits)
+    principles = "".join(
+        f'<article class="context-principle"><h3>{esc(item["principle"])}</h3>'
+        f'<p>{esc(item["planning_use"])}</p><p class="muted">边界：{esc(item["boundary"])}</p>'
+        f'<a href="{esc(item["source"]["url"])}" target="_blank" rel="noreferrer">{esc(item["source"]["organization"])} · {esc(item["source"]["title"])}</a></article>'
+        for item in context["professional_basis"]["principles"]
+    ) or '<p class="muted">当前安全范围没有可用于处方型规划的知识片段。</p>'
+    longitudinal = context["longitudinal"]
+    manifest = json.dumps(context["source_manifest"], ensure_ascii=False, indent=2, default=str)
+    return (
+        f'<section class="section-header"><div><p class="eyebrow">AgentContextV2 · {esc(context["context_hash"][:16])}</p>'
+        f'<h1>这次模型实际看到了什么</h1><p class="muted">不是把全部历史倾倒给模型，而是只选择会改变 {esc(work_date)} 判断的事实、模式和专业边界。</p></div>'
+        f'<a class="button secondary" href="/agent/context/{esc(work_date)}?format=json">导出原始 JSON</a></section>'
+        f'<div class="context-grid"><section class="panel"><h2>为什么选入</h2><ul class="context-list">{included}</ul></section>'
+        f'<section class="panel"><h2>为什么没有选入</h2><ul class="context-list">{excluded}</ul></section></div>'
+        f'<section class="panel"><p class="eyebrow">Person</p><h2>已经确认的人与目标</h2><p><strong>安全模式：</strong>{esc((person.get("safety") or {}).get("mode"))}</p>'
+        f'<h3>目标</h3><ul>{goals}</ul><h3>本次生效的用户模型</h3><ul class="context-list">{claims}</ul></section>'
+        f'<section class="panel"><p class="eyebrow">Today</p><h2>当天事实与不可改变项</h2><p><strong>最终逐餐方式：</strong>{esc(mode_text)}</p>'
+        f'<p><strong>状态覆盖：</strong>{esc(coverage_text)}</p><ul class="context-list">{records}</ul></section>'
+        f'<section class="panel"><p class="eyebrow">Longitudinal</p><h2>被选中的纵向证据</h2><p>执行回执 {len(longitudinal.get("selected_execution_feedback") or [])} 条；'
+        f'近期菜单语义 {len(longitudinal.get("recent_meal_semantics") or [])} 条；承接食材 {len(longitudinal.get("ingredient_carryover") or [])} 条。</p></section>'
+        f'<section class="panel"><p class="eyebrow">Professional basis · {esc(context["professional_basis"]["version"])}</p><h2>本次采用的专业原则</h2>'
+        f'<div class="context-principles">{principles}</div></section>'
+        f'<details class="panel"><summary>来源清单与版本</summary><pre class="json-box">{esc(manifest)}</pre></details>'
+    )
+
+
+def status_labels(status: str) -> str:
+    return {
+        "collecting": "等待真实情况", "needs_clarification": "还需要确认", "formulating": "正在理解情况",
+        "planning": "正在设计方案", "reviewing": "正在独立审查", "ready_draft": "草案已准备好",
+        "stale": "旧草案已过期", "accepted": "计划已接受", "active": "计划执行中",
+        "completed": "计划已完成", "failed": "本次规划失败", "interrupted": "规划被新情况打断",
+    }.get(status, status)
 
 
 def _plan_step_text(item: str | dict) -> str:
@@ -330,13 +548,34 @@ def render_plan_page(plan_date: str) -> str:
             f'<p>酱汁：{esc(eat_out.get("sauce_rule"))}；备选：{esc(eat_out.get("fallback"))}</p></div>'
             if eat_out else ""
         )
+        purpose_html = (
+            f'<div class="meal-purpose"><strong>这顿要解决什么</strong><p>{esc(meal.get("purpose"))}</p>'
+            f'<p class="muted">{esc(meal.get("why_today") or meal.get("whole_day_role") or "")}</p></div>'
+            if meal.get("purpose") else ""
+        )
+        portion_contract_html = "".join(
+            f'<li><strong>{esc(item.get("item"))}</strong> · '
+            f'{esc("–".join(str(value) for value in item["gram_range"]) + "g" if item.get("gram_range") else "克数未知")} · '
+            f'{esc({"raw":"生重","cooked":"熟重","as_served":"上桌重量","not_applicable":"不适用"}.get(item.get("measurement_basis"), item.get("measurement_basis")))} · '
+            f'{esc(item.get("household_measure"))}<br><span class="muted small">吃不饱：{esc(item.get("increase_if"))}；食欲低：{esc(item.get("decrease_if"))}</span></li>'
+            for item in meal.get("portion_contracts") or []
+        )
         current_status = feedback.get("status") if feedback else ""
         status_options = "".join(f'<option value="{key}"{_selected(current_status,key)}>{label}</option>' for key,label in FEEDBACK_LABELS.items())
-        reason_checks = "".join(f'<label class="choice-row compact"><input type="checkbox" name="reason_codes" value="{key}"><span>{label}</span></label>' for key,label in REASON_LABELS.items())
+        current_outcome = feedback.get("outcome_json") or {} if feedback else {}
+        current_satiety = current_outcome.get("satiety") or ""
+        satiety_options = "".join(
+            f'<option value="{key}"{_selected(current_satiety,key)}>{label}</option>'
+            for key, label in (
+                ("as_planned", "刚好"), ("not_enough", "没吃饱"), ("too_much", "吃不完 / 太多")
+            )
+        )
+        current_reasons = feedback.get("reason_codes_json") or [] if feedback else []
+        reason_checks = "".join(f'<label class="choice-row compact"><input type="checkbox" name="reason_codes" value="{key}"{_checked(current_reasons,key)}><span>{label}</span></label>' for key,label in REASON_LABELS.items())
         version = feedback.get("version", 0) if feedback else 0
         cards.append(f'''<article class="plan-card"><div class="section-header"><div><p class="eyebrow">{esc(meal.get('slot') or meal.get('meal_type') or '')}</p><h2>{esc(meal.get('name') or '未命名餐次')}</h2></div>{f'<span class="status completed">{esc(FEEDBACK_LABELS.get(current_status,current_status))}</span>' if feedback else '<span class="status pending">待回执</span>'}</div>
-        {f'<p><strong>方式：</strong>{esc(MEAL_MODE_LABELS.get(meal.get("mode"), meal.get("mode") or ""))}</p>' if meal.get('mode') else ''}{f'<p><strong>份量：</strong>{esc(meal.get("portion_guidance"))}</p>' if meal.get('portion_guidance') else ''}{eat_out_html}{f'<p class="muted">{esc(execution_html)}</p>' if execution_html else ''}{f'<h3>{"可选食物" if meal.get("mode")=="eat_out" else "食材"}</h3><ul>{detail}</ul>' if detail else ''}{f'<h3>执行步骤</h3><ol>{step_html}</ol>' if step_html else ''}
-        <details class="feedback-box"{' open' if not feedback else ''}><summary>{'修订执行回执' if feedback else '记录实际执行结果'}</summary><form method="post" action="/plans/{esc(plan_date)}/{esc(meal['plan_item_id'])}/feedback"><input type="hidden" name="expected_version" value="{version}"><label>执行状态<select name="status" required><option value="">请选择</option>{status_options}</select></label><fieldset><legend>偏离原因（调整或未执行时必选）</legend><div class="option-grid">{reason_checks}</div></fieldset><label>实际怎么做的（可选）<textarea name="actual_text">{esc(feedback.get('actual_text','') if feedback else '')}</textarea></label><button type="submit">保存回执</button></form></details>
+        {purpose_html}{f'<p><strong>方式：</strong>{esc(MEAL_MODE_LABELS.get(meal.get("mode"), meal.get("mode") or ""))}</p>' if meal.get('mode') else ''}{f'<p><strong>份量：</strong>{esc(meal.get("portion_guidance"))}</p>' if meal.get('portion_guidance') else ''}{f'<h3>具体吃多少</h3><ul class="portion-list">{portion_contract_html}</ul>' if portion_contract_html else ''}{eat_out_html}{f'<p class="muted">{esc(execution_html)}</p>' if execution_html else ''}{f'<h3>{"可选食物" if meal.get("mode")=="eat_out" else "食材"}</h3><ul>{detail}</ul>' if detail else ''}{f'<h3>执行步骤</h3><ol>{step_html}</ol>' if step_html else ''}
+        <details class="feedback-box"{' open' if not feedback else ''}><summary>{'修订执行回执' if feedback else '记录实际执行结果'}</summary><form method="post" action="/plans/{esc(plan_date)}/{esc(meal['plan_item_id'])}/feedback"><input type="hidden" name="expected_version" value="{version}"><label>执行状态<select name="status" required><option value="">请选择</option>{status_options}</select></label><label>吃完后的份量感受<select name="satiety"><option value="">未记录</option>{satiety_options}</select></label><fieldset><legend>偏离原因（调整或未执行时必选）</legend><div class="option-grid">{reason_checks}</div></fieldset><label>实际怎么做的（可选）<textarea name="actual_text">{esc(feedback.get('actual_text','') if feedback else '')}</textarea></label><button type="submit">保存回执</button></form></details>
         {f'<form class="rescue-form" method="post" action="/rescue/start"><input type="hidden" name="plan_date" value="{esc(plan_date)}"><input type="hidden" name="plan_item_id" value="{esc(meal["plan_item_id"])}"><label>计划临时做不了怎么办？<select name="issue_code">{"".join(f"<option value={key!r}>{label}</option>" for key,label in RESCUE_LABELS.items())}</select></label><input name="input_text" aria-label="救场补充" placeholder="可补充当前手边条件"><button class="secondary" type="submit">生成救场任务</button></form>' if plan.get('scope_current') else ''}</article>''')
     stale = '' if plan.get('scope_current') else '<div class="form-error" role="alert"><strong>这是旧目标或策略版本的历史计划</strong><p>仍可补录实际执行结果，但不能据此生成新的救场建议。</p></div>'
     revision = plan.get("revision_policy") or {"mode": "locked", "reasons": []}
@@ -387,6 +626,65 @@ def render_questions_page(question_date: str) -> str:
 
 
 def render_learning_page() -> str:
+    claims = agent_workspace.list_claims(include_inactive=True)
+    reflection = agent_workspace.reflection_status()
+    reflection_ai = ai.ai_status()
+    reflection_action = (
+        '<form method="post" action="/learning/reflect"><button>现在运行纵向反思</button></form>'
+        if reflection["due"] and all(
+            reflection_ai[key] for key in ("provider_valid", "model_configured", "key_configured")
+        ) else ""
+    )
+    reflection_html = (
+        '<section class="panel reflection-status"><div><p class="eyebrow">Longitudinal reflection</p>'
+        f'<h2>{"已达到反思条件" if reflection["due"] else "继续收集真实执行结果"}</h2>'
+        f'<p class="muted">上次反思：{esc(reflection["last_reflection_at"] or "尚未运行")} · '
+        f'新完成计划日 {esc(reflection["completed_plan_dates_since"])} · 新证据 {esc(reflection["evidence_events_since"])}</p></div>'
+        f'{reflection_action}</section>'
+    )
+    claim_cards = []
+    claim_labels = {
+        "confirmed_fact": "已确认事实", "stable_preference": "稳定偏好",
+        "soft_need_hypothesis": "软需求假设", "friction_hypothesis": "执行摩擦假设",
+        "body_response_hypothesis": "身体反应假设", "causal_hypothesis": "因果假设",
+        "interaction_preference": "沟通偏好", "temporary_state": "临时状态",
+    }
+    for item in claims:
+        supports = [value for value in item["evidence"] if value["stance"] == "support"]
+        counters = [value for value in item["evidence"] if value["stance"] == "counterexample"]
+        evidence_html = "".join(
+            f'<li><span class="status">{"支持" if value["stance"]=="support" else "反证"}</span> '
+            f'{esc(value.get("excerpt") or value["evidence_type"])} <span class="muted small">{esc(value["observed_at"])}</span></li>'
+            for value in item["evidence"][:6]
+        ) or '<li class="muted">暂无可展示证据</li>'
+        options = [("", "请选择处理方式")]
+        if item["risk_level"] == "high":
+            options.extend((("correct", "不对，留下反证"), ("pause", "暂停使用"), ("forget", "遗忘")))
+        else:
+            options.extend((
+                ("confirm", "确认这是正确的"), ("correct", "不对，留下反证"),
+                ("today", "只适用于今天"), ("stable", "以后都这样"),
+                ("pause", "暂停使用"), ("forget", "遗忘"),
+            ))
+            if item["status"] == "paused":
+                options.insert(1, ("resume", "恢复评估"))
+        select = "".join(f'<option value="{key}">{label}</option>' for key,label in options)
+        high_risk_html = (
+            '<p><a class="small" href="/profile">高影响信息只能在目标与边界中确认</a></p>'
+            if item["risk_level"] == "high" else ""
+        )
+        claim_cards.append(
+            f'<article class="panel user-claim"><div class="section-header"><div><p class="eyebrow">'
+            f'{esc(claim_labels.get(item["claim_type"],item["claim_type"]))} · v{esc(item["version"])}</p>'
+            f'<h2>{esc(item["statement"])}</h2></div><span class="status">{esc(item["status"])}</span></div>'
+            f'<p class="muted">置信度 {esc(item["effective_confidence"])} · 支持 {len(supports)} · 反证 {len(counters)}'
+            f' · 最近使用 {esc(item.get("last_used_at") or "尚未用于正式计划")}</p>'
+            f'<details><summary>为什么这样认为</summary><ul>{evidence_html}</ul><p><strong>对规划的影响：</strong>{esc(item.get("effect_json") or "只观察，不自动限制")}</p></details>'
+            f'{high_risk_html}'
+            f'<form method="post" action="/learning/claims/{esc(item["id"])}/action"><label>处理方式<select name="action" required>{select}</select></label>'
+            '<label>如果不对，写下正确理解<textarea name="correction"></textarea></label><button>保存对这条理解的处理</button></form></article>'
+        )
+    claims_html = "".join(claim_cards) or '<section class="panel"><h2>还没有形成用户模型</h2><p class="muted">明确纠正或两个独立执行证据才会让低风险假设开始影响计划。</p></section>'
     candidates = adaptive.list_candidates("pending")
     rules = adaptive.list_rules(active_only=False)
     experiments = adaptive.list_experiments()
@@ -415,7 +713,7 @@ def render_learning_page() -> str:
         if experiment_policy["allowed"] else f'<p class="muted">{esc(experiment_policy["reason"])}</p>'
     )
     experiment_html = "".join(experiment_cards) or '<section class="panel"><p class="muted">暂无实验历史</p></section>'
-    return f'<section class="section-header"><div><p class="eyebrow">Deterministic learning</p><h1>由你确认，系统才学习</h1><p class="muted">候选、正式规则和实验均绑定当前目标、策略与安全模式。</p></div></section><div class="learning-grid"><div>{candidate_html}</div><section class="panel"><h2>正式规则</h2><ul class="rule-list">{rule_html}</ul></section></div><section class="section-header"><div><p class="eyebrow">One variable at a time</p><h2>可撤销实验</h2><p class="muted">同时最多一个待确认或进行中的实验；实验不会自动修改营养目标。</p></div></section><div class="learning-grid"><section class="panel"><h3>提出实验</h3>{propose_form}</section><div>{experiment_html}</div></div>'
+    return f'<section class="section-header"><div><p class="eyebrow">Longitudinal user model</p><h1>系统正在怎样理解你</h1><p class="muted">由你确认，系统才学习：每条理解都有证据、反证、作用范围和回滚版本；目标、安全和营养数值仍必须在档案中确认。</p></div></section>{reflection_html}<div class="claim-list">{claims_html}</div><details class="legacy-learning"><summary>查看旧版确定性规则与实验</summary><section class="section-header"><div><p class="eyebrow">Legacy deterministic learning</p><h2>兼容的规则候选</h2><p class="muted">旧规则继续保留；新规划优先读取上方用户模型。</p></div></section><div class="learning-grid"><div>{candidate_html}</div><section class="panel"><h2>正式规则</h2><ul class="rule-list">{rule_html}</ul></section></div><section class="section-header"><div><p class="eyebrow">One variable at a time</p><h2>可撤销实验</h2><p class="muted">同时最多一个待确认或进行中的实验；实验不会自动修改营养目标。</p></div></section><div class="learning-grid"><section class="panel"><h3>提出实验</h3>{propose_form}</section><div>{experiment_html}</div></div></details>'
 
 
 def render_inventory_page() -> str:
@@ -535,7 +833,7 @@ def layout(title: str, body: str) -> bytes:
     except Exception:
         sync_enabled = False
     storage_label = "本地优先 · 同步已启用" if sync_enabled else "仅存于本机"
-    page = f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{esc(title)} · MealCircuit</title><link rel="icon" href="/assets/ui/favicon.svg" type="image/svg+xml"><script src="/assets/ui/theme-init.js?v=20260711a"></script><link rel="stylesheet" href="/assets/ui/app.css?v=20260711a"><script src="/assets/ui/app.js?v=20260711a" defer></script></head><body>
+    page = f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{esc(title)} · MealCircuit</title><link rel="icon" href="/assets/ui/favicon.svg" type="image/svg+xml"><script src="/assets/ui/theme-init.js?v=20260714c"></script><link rel="stylesheet" href="/assets/ui/app.css?v=20260714c"><script src="/assets/ui/app.js?v=20260714c" defer></script></head><body>
     <a class="skip-link" href="#main-content">跳到主要内容</a>
     <div class="app-shell"><aside class="app-sidebar" id="app-sidebar" aria-label="主导航"><a class="sidebar-brand" href="/">MealCircuit</a><nav class="sidebar-nav">{"".join(nav_sections)}</nav><div class="sidebar-footer"><button class="icon-button" type="button" data-nav-collapse aria-label="收起侧栏" title="收起侧栏">{icon("collapse")}</button></div></aside>
     <button class="nav-scrim" type="button" data-nav-close aria-label="关闭导航"></button>
@@ -937,6 +1235,7 @@ def render_ai_settings() -> str:
     status = ai.ai_status()
     provider = status.get("provider") or ""
     model_value = esc(os.environ.get("MEALCIRCUIT_AI_MODEL", ""))
+    stage_models = status.get("stage_models") or {}
     provider_options = "".join(
         f'<option value="{name}"{" selected" if provider == name else ""}>{label}</option>'
         for name, label in (
@@ -964,6 +1263,10 @@ def render_ai_settings() -> str:
 <label for="ai-key">API Key</label><input id="ai-key" name="api_key" type="password" autocomplete="off" required>
 <div class="grid two"><div><label for="ai-timeout">超时秒数</label><input id="ai-timeout" name="timeout_seconds" type="number" min="1" value="{esc(status["timeout_seconds"])}"></div>
 <div><label for="ai-max-output">最大输出 token</label><input id="ai-max-output" name="max_output_tokens" type="number" min="1" value="{esc(status["max_output_tokens"])}"></div></div>
+<details><summary>高级：为三个阶段指定不同模型</summary><p class="muted">留空就全部使用上面的默认模型；API Key 仍只保存在当前进程。</p>
+<div class="grid"><label>个案理解模型<input name="case_model" value="{esc(stage_models.get('case') or '')}" placeholder="默认模型"></label>
+<label>计划设计模型<input name="plan_model" value="{esc(stage_models.get('plan') or '')}" placeholder="默认模型"></label>
+<label>独立审查模型<input name="review_model" value="{esc(stage_models.get('review') or '')}" placeholder="默认模型"></label></div></details>
 <div class="form-actions"><button type="submit">启用本次运行的 API Key 模式</button></div></form>{disable}</section>'''
 
 
@@ -1304,6 +1607,16 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
 
+    def send_json(self, value: object, status: int = 200) -> None:
+        payload = json.dumps(value, ensure_ascii=False, indent=2, default=str).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(payload)))
+        self.send_header("Content-Disposition", 'inline; filename="agent-context-v2.json"')
+        self.send_security_headers()
+        self.end_headers()
+        self.wfile.write(payload)
+
     def send_static(self, relative_path: str) -> None:
         root = STATIC_ROOT.resolve()
         try:
@@ -1485,6 +1798,25 @@ class Handler(BaseHTTPRequestHandler):
                     render_today_workspace(date.today().isoformat())
                     + f'<details class="legacy-dashboard"><summary>查看原有今日总览</summary>{legacy_snapshot}</details>',
                 )
+            elif path.startswith("/agent/context/"):
+                work_date = path.split("/")[3]
+                if query.get("format") == ["json"]:
+                    self.send_json(agent_workspace.build_agent_context(work_date))
+                else:
+                    self.send_html("Agent 上下文", render_agent_context_page(work_date))
+            elif path.startswith("/agent/state/"):
+                work_date = path.split("/")[3]
+                state = agent_workspace.get_workspace_state(work_date)
+                draft = state.get("draft") or {}
+                latest = state.get("latest_run") or {}
+                self.send_json({
+                    "status": draft.get("status") or latest.get("status") or "collecting",
+                    "version": draft.get("version") or 0,
+                    "updated_at": draft.get("updated_at") or latest.get("updated_at"),
+                    "pending_questions": len([
+                        item for item in state.get("questions") or [] if item.get("status") == "pending"
+                    ]),
+                })
             elif path == "/capture":
                 self.send_html("记录", render_capture_page())
             elif path.startswith("/plans/"):
@@ -1722,6 +2054,40 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_html("初始化", render_setup_step(session, "review", error=str(exc)), 400)
                     return
                 self.redirect("/")
+            elif path == "/agent/intake":
+                form = self.read_urlencoded()
+                agent_workspace.record_intake(form.get("record_date", ""), form.get("text", ""))
+                self.redirect("/")
+            elif path.startswith("/agent/drafts/") and path.endswith("/generate"):
+                review_date = path.strip("/").split("/")[2]
+                agent_workspace.run_agent_draft(review_date, force=True)
+                self.redirect("/")
+            elif path.startswith("/agent/drafts/") and path.endswith("/revise"):
+                review_date = path.strip("/").split("/")[2]
+                agent_workspace.revise_draft(review_date, self.read_urlencoded().get("instruction", ""))
+                self.redirect("/")
+            elif path.startswith("/agent/drafts/") and path.endswith("/accept"):
+                review_date = path.strip("/").split("/")[2]
+                accepted = agent_workspace.accept_draft(review_date)
+                plan_date = ((accepted.get("result_json") or {}).get("tomorrow_menu") or {}).get("date")
+                self.redirect(f"/plans/{plan_date}" if plan_date else "/")
+            elif path.startswith("/agent/questions/") and path.endswith("/answer"):
+                question_id = path.strip("/").split("/")[2]
+                form = self.read_urlencoded()
+                agent_workspace.answer_clarification(
+                    question_id, form.get("answer", ""), int(form.get("version", "-1"))
+                )
+                self.redirect("/")
+            elif path == "/learning/reflect":
+                agent_workspace.run_longitudinal_reflection()
+                self.redirect("/learning")
+            elif path.startswith("/learning/claims/") and path.endswith("/action"):
+                claim_id = path.strip("/").split("/")[2]
+                form = self.read_urlencoded()
+                agent_workspace.update_claim(
+                    claim_id, form.get("action", ""), correction=form.get("correction", "")
+                )
+                self.redirect("/" if form.get("return_to") == "/" else "/learning")
             elif path.startswith("/plans/") and path.endswith("/feedback"):
                 parts = path.strip("/").split("/")
                 plan_date, plan_item_id = parts[1], parts[2]
@@ -1731,6 +2097,7 @@ class Handler(BaseHTTPRequestHandler):
                     plan_date, plan_item_id, (values.get("status") or [""])[-1],
                     reason_codes=values.get("reason_codes") or [],
                     actual_text=(values.get("actual_text") or [""])[-1],
+                    outcome={"satiety": (values.get("satiety") or [""])[-1]} if (values.get("satiety") or [""])[-1] else {},
                     expected_version=expected or None, actor_source="web",
                 )
                 self.redirect(f"/plans/{plan_date}")
@@ -1866,6 +2233,9 @@ class Handler(BaseHTTPRequestHandler):
                     form.get("api_key", ""),
                     form.get("timeout_seconds", ""),
                     form.get("max_output_tokens", ""),
+                    form.get("case_model", ""),
+                    form.get("plan_model", ""),
+                    form.get("review_model", ""),
                 )
                 self.redirect("/ai")
             elif path == "/ai/disable":
@@ -2050,6 +2420,7 @@ class Handler(BaseHTTPRequestHandler):
                 form = self.read_urlencoded()
                 record_date = form.get("record_date", "")
                 service.add_daily_record(record_date, form.get("raw_input", ""))
+                agent_workspace.schedule_auto_draft(record_date)
                 self.redirect(f"/reviews/{record_date}")
             elif path.startswith("/reviews/") and path.endswith("/generate"):
                 review_date = path.split("/")[2]

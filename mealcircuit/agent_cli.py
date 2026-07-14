@@ -6,7 +6,7 @@ import json
 import sys
 from pathlib import Path
 
-from . import adaptive, ai, personalization, portability, service
+from . import adaptive, agent_workspace, ai, personalization, portability, service
 from .configuration import configuration_status, initialize_private_home
 from .db import init_db
 from .migration import apply_migration, migration_preview
@@ -150,6 +150,40 @@ def build_parser() -> argparse.ArgumentParser:
     day_generate = sub.add_parser("day-generate", help="使用用户环境变量中的模型 API Key 生成并提交每日复盘")
     day_generate.add_argument("date")
     day_generate.add_argument("--output", "-o")
+    agent_context = sub.add_parser("agent-context", help="导出分层、可解释的 AgentContextV2")
+    agent_context.add_argument("date")
+    agent_context.add_argument("--output", "-o")
+    agent_intake = sub.add_parser("agent-intake", help="记录自然语言真实情况并让当前草案过期")
+    agent_intake.add_argument("date")
+    agent_intake.add_argument("--text", required=True)
+    agent_intake.add_argument("--output", "-o")
+    agent_state = sub.add_parser("agent-state", help="查看个案理解、追问、草案和运行状态")
+    agent_state.add_argument("date")
+    agent_state.add_argument("--output", "-o")
+    agent_draft = sub.add_parser("agent-draft", help="运行个案理解、计划设计和独立审查，生成未发布草案")
+    agent_draft.add_argument("date")
+    agent_draft.add_argument("--force", action="store_true")
+    agent_draft.add_argument("--output", "-o")
+    agent_answer = sub.add_parser("agent-answer", help="回答会改变计划的 Agent 集中追问")
+    agent_answer.add_argument("question_id")
+    agent_answer.add_argument("--file", "-f", required=True, help="答案 JSON；可为字符串、数值或对象")
+    agent_answer.add_argument("--version", type=int, required=True)
+    agent_revise = sub.add_parser("agent-revise", help="局部重算草案，保留未受影响餐次")
+    agent_revise.add_argument("date")
+    agent_revise.add_argument("--text", required=True)
+    agent_revise.add_argument("--output", "-o")
+    agent_accept = sub.add_parser("agent-accept", help="接受草案并发布正式计划")
+    agent_accept.add_argument("date")
+    agent_accept.add_argument("--output", "-o")
+    user_model = sub.add_parser("user-model", help="查看或纠正可回滚的长期用户模型")
+    user_model_sub = user_model.add_subparsers(dest="user_model_command", required=True)
+    user_model_sub.add_parser("list")
+    user_model_sub.add_parser("reflection-status")
+    user_model_sub.add_parser("reflect")
+    user_model_action = user_model_sub.add_parser("action")
+    user_model_action.add_argument("claim_id")
+    user_model_action.add_argument("action", choices=["confirm", "correct", "today", "stable", "pause", "forget", "resume"])
+    user_model_action.add_argument("--correction", default="")
     cleanup = sub.add_parser("review-cleanup", help="预览或执行单个未执行复盘的生成历史清理")
     cleanup.add_argument("date")
     cleanup.add_argument("--expected-version", type=int)
@@ -426,6 +460,33 @@ def main() -> None:
             emit(service.submit_daily_review(args.date, load_json(args.file)), args.output)
         elif args.command == "day-generate":
             emit(service.generate_daily_review(args.date), args.output)
+        elif args.command == "agent-context":
+            emit(agent_workspace.build_agent_context(args.date), args.output)
+        elif args.command == "agent-intake":
+            emit(agent_workspace.record_intake(args.date, args.text), args.output)
+        elif args.command == "agent-state":
+            emit(agent_workspace.get_workspace_state(args.date), args.output)
+        elif args.command == "agent-draft":
+            emit(agent_workspace.run_agent_draft(args.date, force=args.force), args.output)
+        elif args.command == "agent-answer":
+            emit(agent_workspace.answer_clarification(
+                args.question_id, load_json_value(args.file), args.version
+            ))
+        elif args.command == "agent-revise":
+            emit(agent_workspace.revise_draft(args.date, args.text), args.output)
+        elif args.command == "agent-accept":
+            emit(agent_workspace.accept_draft(args.date), args.output)
+        elif args.command == "user-model":
+            if args.user_model_command == "list":
+                emit(agent_workspace.list_claims(include_inactive=True))
+            elif args.user_model_command == "reflection-status":
+                emit(agent_workspace.reflection_status())
+            elif args.user_model_command == "reflect":
+                emit(agent_workspace.run_longitudinal_reflection())
+            else:
+                emit(agent_workspace.update_claim(
+                    args.claim_id, args.action, correction=args.correction
+                ))
         elif args.command == "review-cleanup":
             emit(service.cleanup_generated_review_history(
                 args.date,

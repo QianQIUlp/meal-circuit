@@ -868,6 +868,22 @@ def _apply_revision(connection: sqlite3.Connection, revision: DomainRevision, as
                    WHERE module_key=?""",
                 (item["enabled"], item["sort_order"], item["frequency"], item["updated_at"], item["module_key"]),
             )
+    elif revision.entity_kind == "preferences" and payload.get("kind") == "agent_user_model":
+        content = str(payload.get("content", ""))
+        try:
+            projection = json.loads(content)
+        except json.JSONDecodeError as exc:
+            raise ValidationError("导入的 Agent 用户模型投影不是合法 JSON") from exc
+        if not isinstance(projection, dict) or not isinstance(projection.get("claims"), list):
+            raise ValidationError("导入的 Agent 用户模型投影结构无效")
+        connection.execute(
+            """INSERT INTO config_documents(kind,content,content_sha256,revision_id,updated_at)
+               VALUES('agent_user_model',?,?,?,?)
+               ON CONFLICT(kind) DO UPDATE SET content=excluded.content,
+                   content_sha256=excluded.content_sha256,revision_id=excluded.revision_id,
+                   updated_at=excluded.updated_at""",
+            (content, _sha256_bytes(content.encode("utf-8")), revision.revision_id, revision.created_at),
+        )
     elif revision.entity_kind == "asset":
         path = asset_paths[revision.entity_id]
         connection.execute(
