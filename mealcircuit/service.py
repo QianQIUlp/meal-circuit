@@ -994,6 +994,52 @@ def add_daily_record(record_date: str, raw_input: str, structured: dict | None =
     return result
 
 
+def list_daily_records(record_date: str) -> list[dict]:
+    try:
+        date.fromisoformat(record_date)
+    except ValueError as exc:
+        raise ValidationError("日期必须是 YYYY-MM-DD") from exc
+    init_db()
+    with connect() as conn:
+        return [
+            row_dict(row)
+            for row in conn.execute(
+                "SELECT * FROM daily_records WHERE record_date=? ORDER BY created_at,id",
+                (record_date,),
+            ).fetchall()
+        ]
+
+
+def update_daily_record(record_id: str, record_date: str, raw_input: str) -> dict:
+    try:
+        date.fromisoformat(record_date)
+    except ValueError as exc:
+        raise ValidationError("日期必须是 YYYY-MM-DD") from exc
+    clean = str(raw_input or "").strip()
+    if not clean:
+        raise ValidationError("每日记录不能为空")
+    init_db()
+    with connect() as conn:
+        row = conn.execute("SELECT * FROM daily_records WHERE id=?", (record_id,)).fetchone()
+        if row is None:
+            raise KeyError(record_id)
+        current = row_dict(row)
+        if current["record_date"] != record_date:
+            raise ValidationError("这条记录不属于当前日期")
+        if current["raw_input"] == clean:
+            return current
+        conn.execute("UPDATE daily_records SET raw_input=? WHERE id=?", (clean, record_id))
+        capture_entity(conn, "daily_record", record_id)
+        _queue_daily_review(conn, record_date, "daily_record_edited")
+        updated = row_dict(
+            conn.execute("SELECT * FROM daily_records WHERE id=?", (record_id,)).fetchone()
+        )
+    from . import agent_workspace
+
+    agent_workspace.schedule_auto_draft(record_date)
+    return updated
+
+
 def ensure_daily_review(review_date: str) -> dict:
     try:
         date.fromisoformat(review_date)

@@ -1210,6 +1210,44 @@ def record_intake(review_date: str, text: str) -> dict:
     return {"id": event_id, "record": record, "scheduled": True}
 
 
+def update_intake(record_id: str, review_date: str, text: str) -> dict:
+    _validate_date(review_date)
+    clean = str(text or "").strip()
+    if not clean:
+        raise ValidationError("记录内容不能为空")
+    if len(clean) > 4000:
+        raise ValidationError("单次补充不能超过 4000 字")
+    from . import service
+
+    existing = next(
+        (item for item in service.list_daily_records(review_date) if item["id"] == record_id),
+        None,
+    )
+    if existing is None:
+        raise KeyError(record_id)
+    if existing["raw_input"] == clean:
+        return {"record": existing, "scheduled": False}
+    record = service.update_daily_record(record_id, review_date, clean)
+    with connect() as conn:
+        events = conn.execute(
+            "SELECT id,classification_json FROM agent_workspace_events WHERE event_date=?",
+            (review_date,),
+        ).fetchall()
+        for event in events:
+            classification = json.loads(event["classification_json"] or "{}")
+            if classification.get("record_id") != record_id:
+                continue
+            conn.execute(
+                """UPDATE agent_workspace_events
+                   SET input_text=?,event_kind='unclassified',classification_json=?,affects_plan=1
+                   WHERE id=?""",
+                (clean, json.dumps({"record_id": record_id}, ensure_ascii=False), event["id"]),
+            )
+    mark_draft_stale(review_date, "修改了今天的真实情况")
+    schedule_auto_draft(review_date)
+    return {"record": record, "scheduled": True}
+
+
 def record_diagnostic_event(event_date: str, event_kind: str, message: str, details: dict | None = None) -> dict:
     """Record a local Agent failure without changing facts, plans, or learning evidence."""
     _validate_date(event_date)

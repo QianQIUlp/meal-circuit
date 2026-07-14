@@ -412,6 +412,21 @@ def render_today_workspace(work_date: str) -> str:
             f'<p>{esc(meal_names)}</p></div><a class="button" href="/plans/{esc(work_date)}">查看今天安排</a></div></section>'
         )
 
+    saved_records = service.list_daily_records(work_date)
+    saved_record_cards = "".join(
+        f'<article class="saved-intake"><div class="saved-intake-label">已记下</div>'
+        f'<p>{esc(record["raw_input"])}</p><details><summary>修改这条内容</summary>'
+        f'<form method="post" action="/agent/intake/{esc(record["id"])}/edit">'
+        f'<input type="hidden" name="record_date" value="{esc(work_date)}">'
+        f'<label>修改内容<textarea name="text" maxlength="4000" required>{esc(record["raw_input"])}</textarea></label>'
+        '<button class="secondary">保存修改</button></form></details></article>'
+        for record in saved_records
+    )
+    saved_records_html = (
+        f'<section class="saved-intakes" aria-label="今天已记下的内容"><h3>今天已记下</h3>{saved_record_cards}</section>'
+        if saved_record_cards else ""
+    )
+
     question_cards = []
     for question in state.get("questions") or []:
         if question.get("status") != "pending":
@@ -491,10 +506,10 @@ def render_today_workspace(work_date: str) -> str:
         f'{active_plan}'
         f'<section class="panel agent-intake" id="record"><div><h2>今天有什么变化？</h2>'
         '<p>吃了什么、训练感受、食欲、日程和临时安排都可以直接说。</p></div>'
-        f'<form method="post" action="/agent/intake"><input type="hidden" name="record_date" value="{esc(work_date)}">'
-        '<label>记一笔<textarea name="text" required placeholder="例如：明天中午外食，晚上自己做；今天训练后特别饿。"></textarea></label>'
+        f'<div class="agent-intake-entry">{saved_records_html}<form method="post" action="/agent/intake"><input type="hidden" name="record_date" value="{esc(work_date)}">'
+        '<label>记一笔<textarea name="text" maxlength="4000" required placeholder="例如：明天中午外食，晚上自己做；今天训练后特别饿。"></textarea></label>'
         '<button>记下来</button><div class="secondary-actions"><a href="/tasks/photo">上传照片</a>'
-        '<a href="/tasks/material">补充食材</a><a href="/inventory">更新库存</a></div></form></section>'
+        '<a href="/tasks/material">补充食材</a><a href="/inventory">更新库存</a></div></form></div></section>'
         f'{_render_today_state(work_date)}{clarification}{draft_html}'
     )
 
@@ -1018,7 +1033,7 @@ def layout(title: str, body: str) -> bytes:
     except Exception:
         sync_enabled = False
     storage_label = "本地优先 · 同步已启用" if sync_enabled else "仅存于本机"
-    page = f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{esc(title)} · MealCircuit</title><link rel="icon" href="/assets/ui/favicon.svg" type="image/svg+xml"><script src="/assets/ui/theme-init.js?v=20260714d"></script><link rel="stylesheet" href="/assets/ui/app.css?v=20260714f"><script src="/assets/ui/app.js?v=20260714e" defer></script></head><body>
+    page = f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{esc(title)} · MealCircuit</title><link rel="icon" href="/assets/ui/favicon.svg" type="image/svg+xml"><script src="/assets/ui/theme-init.js?v=20260714d"></script><link rel="stylesheet" href="/assets/ui/app.css?v=20260714g"><script src="/assets/ui/app.js?v=20260714e" defer></script></head><body>
     <a class="skip-link" href="#main-content">跳到主要内容</a>
     <div class="app-shell"><aside class="app-sidebar" id="app-sidebar" aria-label="主导航"><a class="sidebar-brand" href="/">MealCircuit</a><nav class="sidebar-nav">{"".join(nav_sections)}</nav><div class="sidebar-footer"><button class="icon-button" type="button" data-nav-collapse aria-label="收起侧栏" title="收起侧栏">{icon("collapse")}</button></div></aside>
     <button class="nav-scrim" type="button" data-nav-close aria-label="关闭导航"></button>
@@ -2131,7 +2146,14 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/agent/intake":
                 form = self.read_urlencoded()
                 agent_workspace.record_intake(form.get("record_date", ""), form.get("text", ""))
-                self.redirect("/")
+                self.redirect("/#record")
+            elif path.startswith("/agent/intake/") and path.endswith("/edit"):
+                record_id = path.strip("/").split("/")[2]
+                form = self.read_urlencoded()
+                agent_workspace.update_intake(
+                    record_id, form.get("record_date", ""), form.get("text", "")
+                )
+                self.redirect("/#record")
             elif path.startswith("/agent/drafts/") and path.endswith("/generate"):
                 review_date = path.strip("/").split("/")[2]
                 agent_workspace.run_agent_draft(review_date, force=True)

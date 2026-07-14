@@ -1473,6 +1473,65 @@ class WebAppTest(unittest.TestCase):
         self.assertNotIn('href="/">返回总览', page)
         self.assertIsNone(adaptive.get_plan_for_date(plan_date)["feedback"].get(item_id))
 
+    def test_today_intake_stays_visible_and_can_be_revised(self):
+        record_date = date.today().isoformat()
+        original_text = "午餐临时外食，训练后比平时更饿。"
+        payload = urllib.parse.urlencode({
+            "record_date": record_date,
+            "text": original_text,
+        }).encode()
+        status, headers, _ = self.request(
+            "POST", "/agent/intake", payload,
+            {"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        self.assertEqual(303, status)
+        self.assertEqual("/#record", headers["Location"])
+
+        records = service.list_daily_records(record_date)
+        self.assertEqual(1, len(records))
+        record = records[0]
+        status, _, raw = self.request("GET", "/")
+        page = raw.decode("utf-8")
+        self.assertEqual(200, status)
+        self.assertIn("今天已记下", page)
+        self.assertIn(original_text, page)
+        self.assertIn("修改这条内容", page)
+        self.assertIn(f'action="/agent/intake/{record["id"]}/edit"', page)
+
+        revised_text = "午餐改为在家吃，训练后加了一份主食。"
+        revision_payload = urllib.parse.urlencode({
+            "record_date": record_date,
+            "text": revised_text,
+        }).encode()
+        status, headers, _ = self.request(
+            "POST", f'/agent/intake/{record["id"]}/edit', revision_payload,
+            {"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        self.assertEqual(303, status)
+        self.assertEqual("/#record", headers["Location"])
+        updated = service.list_daily_records(record_date)
+        self.assertEqual(record["id"], updated[0]["id"])
+        self.assertEqual(revised_text, updated[0]["raw_input"])
+
+        with connect() as conn:
+            revision_count = conn.execute(
+                "SELECT COUNT(*) FROM domain_revisions WHERE entity_id=?", (record["id"],)
+            ).fetchone()[0]
+            event = conn.execute(
+                "SELECT input_text,event_kind,classification_json FROM agent_workspace_events WHERE event_date=?",
+                (record_date,),
+            ).fetchone()
+        self.assertEqual(2, revision_count)
+        self.assertEqual(revised_text, event["input_text"])
+        self.assertEqual("unclassified", event["event_kind"])
+        self.assertEqual(record["id"], json.loads(event["classification_json"])["record_id"])
+
+        status, _, raw = self.request("GET", "/")
+        revised_page = raw.decode("utf-8")
+        self.assertEqual(200, status)
+        self.assertIn(revised_text, revised_page)
+        self.assertNotIn(original_text, revised_page)
+
     def test_pages_and_material_form(self):
         for path in ("/", "/plans", "/me", "/history", "/tasks/photo", "/tasks/material", "/tasks", "/ai", "/sync", "/foods", "/overview"):
             status, _, body = self.request("GET", path)
