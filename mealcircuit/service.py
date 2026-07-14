@@ -1810,7 +1810,7 @@ def cleanup_generated_review_history(
             raise ValidationError("只能清理已有当前结果的已完成复盘")
         if expected_current_version is not None and review["result_version"] != expected_current_version:
             raise ValidationError(
-                f"当前版本为 v{review['result_version']}，与预期 v{expected_current_version} 不符"
+                "当前记录已经发生变化，请刷新后再试"
             )
         policy = _revision_policy_with_connection(conn, review)
         if policy["mode"] != "replaceable":

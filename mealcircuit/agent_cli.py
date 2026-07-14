@@ -150,7 +150,7 @@ def build_parser() -> argparse.ArgumentParser:
     day_generate = sub.add_parser("day-generate", help="使用用户环境变量中的模型 API Key 生成并提交每日复盘")
     day_generate.add_argument("date")
     day_generate.add_argument("--output", "-o")
-    agent_context = sub.add_parser("agent-context", help="导出分层、可解释的 AgentContextV2")
+    agent_context = sub.add_parser("agent-context", help="导出分层、可解释的规划上下文")
     agent_context.add_argument("date")
     agent_context.add_argument("--output", "-o")
     agent_intake = sub.add_parser("agent-intake", help="记录自然语言真实情况并让当前草案过期")

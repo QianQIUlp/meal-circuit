@@ -1615,7 +1615,7 @@ def auto_generation_status(review_date: str) -> dict:
         return {"eligible": False, "reason": str(exc)}
     status = ai.ai_status()
     if not (status["provider_valid"] and status["model_configured"] and status["key_configured"]):
-        return {"eligible": False, "reason": "未配置模型；可以查看和导出 AgentContextV2 手动处理"}
+        return {"eligible": False, "reason": "未配置模型；可以查看和导出本次规划参考，交给模型手动处理"}
     return {"eligible": True, "reason": "满足自动草案条件"}
 
 
