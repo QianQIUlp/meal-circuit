@@ -17,14 +17,9 @@ This matrix is the release evidence for the local-first, user-configurable multi
 | User-selected AI providers remain device-local | Python standard-library provider layer and Android `AiClient.kt`/`SecretVault.kt` | Provider payload/validation tests; secret exclusions; DeepSeek photo rejection |
 | Release and supply-chain readiness | `uv.lock`, Gradle lock, release workflow, SBOM/checksum/signing gates, license/privacy/threat docs | dependency audit, lock/checksum verifier, release-data scan and native runner workflows |
 
-## Executed local acceptance
+## Verification boundary
 
-- `./test.ps1`: 112 tests pass; 26 optional-dependency tests skip by design.
-- Full Python environment: 112 tests run, 111 pass; only the environment-gated PostgreSQL URL test skips locally.
-- Android: 11 JVM tests; release lint, unsigned APK/AAB, debug instrumentation and 10 real-service cross-client instrumentation tests pass.
-- Real cross-client run proves Python offline write → Android and Android offline write → fresh Python client, then scans the server database/WAL/backup, blob volume and server log for synthetic meal content, password, recovery string and API key with zero matches.
-- Windows PyInstaller clean build and packaged `--smoke-test` pass.
-- Domain/OpenAPI/lock/dependency/release-data/compile checks, Alembic fresh/legacy upgrade, YAML parsing, `pip-audit` and `git diff --check` pass.
+This matrix defines the required multi-device coverage; it is not a claim about the latest branch run. Exact test counts and platform results become stale as the product changes, so current verification must come from the latest GitHub Actions run and the newest entry at the top of `DEVELOPMENT.md`. Historical counts must not be used to infer that a current change has passed.
 
 ## External release gates
 
