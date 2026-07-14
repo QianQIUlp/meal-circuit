@@ -1349,7 +1349,10 @@ class WebAppTest(unittest.TestCase):
         plan = adaptive.get_plan_for_date(plan_date)
         meal = plan["menu"]["meals"][0]
         item_id = meal["plan_item_id"]
-        image = b"\x89PNG\r\n\x1a\nmeal-feedback"
+        images = [
+            b"\x89PNG\r\n\x1a\nmeal-feedback-one",
+            b"\x89PNG\r\n\x1a\nmeal-feedback-two",
+        ]
 
         body, headers = self.multipart_form(
             [
@@ -1358,7 +1361,10 @@ class WebAppTest(unittest.TestCase):
                 ("satiety", "not_enough"),
                 ("actual_text", "临时多吃了一碗饭"),
             ],
-            [("photo", "actual.png", "image/png", image)],
+            [
+                ("photo", "actual-one.png", "image/png", images[0]),
+                ("photo", "actual-two.png", "image/png", images[1]),
+            ],
         )
         status, _, raw = self.request(
             "POST", f"/plans/{plan_date}/{item_id}/feedback", body, headers
@@ -1372,11 +1378,14 @@ class WebAppTest(unittest.TestCase):
         self.assertIn('<details class="feedback-box" open>', page)
         self.assertIsNone(adaptive.get_plan_for_date(plan_date)["feedback"].get(item_id))
 
-        photo_task = service.list_tasks()[0]
-        self.assertEqual("photo", photo_task["type"])
-        self.assertEqual(image, resolve_data_path(photo_task["image_path"]).read_bytes())
-        self.assertIn(f'name="photo_task_id" value="{photo_task["id"]}"', page)
-        self.assertIn(f'/media/{Path(photo_task["image_path"]).name}', page)
+        photo_tasks = service.list_tasks()
+        self.assertEqual(2, len(photo_tasks))
+        self.assertEqual({"photo"}, {task["type"] for task in photo_tasks})
+        self.assertEqual(set(images), {resolve_data_path(task["image_path"]).read_bytes() for task in photo_tasks})
+        for photo_task in photo_tasks:
+            self.assertIn(f'name="photo_task_ids" value="{photo_task["id"]}"', page)
+            self.assertIn(f'/media/{Path(photo_task["image_path"]).name}', page)
+        self.assertIn('type="file" name="photo" accept="image/jpeg,image/png,image/gif,image/webp" multiple', page)
 
         corrected_body, corrected_headers = self.multipart_form([
             ("expected_version", "0"),
@@ -1385,7 +1394,7 @@ class WebAppTest(unittest.TestCase):
             ("reason_codes", "schedule_change"),
             ("reason_codes", "hunger_mismatch"),
             ("actual_text", "临时多吃了一碗饭"),
-            ("photo_task_id", photo_task["id"]),
+            *(("photo_task_ids", task["id"]) for task in photo_tasks),
         ])
         status, response_headers, _ = self.request(
             "POST", f"/plans/{plan_date}/{item_id}/feedback", corrected_body, corrected_headers
@@ -1395,10 +1404,41 @@ class WebAppTest(unittest.TestCase):
         feedback = adaptive.get_plan_for_date(plan_date)["feedback"][item_id]
         self.assertEqual(["schedule_change", "hunger_mismatch"], feedback["reason_codes_json"])
         self.assertEqual("not_enough", feedback["outcome_json"]["satiety"])
-        self.assertEqual(photo_task["id"], feedback["outcome_json"]["photo_task_id"])
-        links = adaptive.task_evidence_links(photo_task["id"])
-        self.assertEqual("consumed", links[0]["role"])
-        self.assertEqual(plan_date, links[0]["observed_date"])
+        self.assertEqual(
+            {task["id"] for task in photo_tasks},
+            set(feedback["outcome_json"]["photo_task_ids"]),
+        )
+        self.assertIn(feedback["outcome_json"]["photo_task_id"], feedback["outcome_json"]["photo_task_ids"])
+        for photo_task in photo_tasks:
+            links = adaptive.task_evidence_links(photo_task["id"])
+            self.assertEqual("consumed", links[0]["role"])
+            self.assertEqual(plan_date, links[0]["observed_date"])
+
+        additional_image = b"\x89PNG\r\n\x1a\nmeal-feedback-three"
+        append_body, append_headers = self.multipart_form(
+            [
+                ("expected_version", str(feedback["version"])),
+                ("status", "modified"),
+                ("satiety", "not_enough"),
+                ("reason_codes", "schedule_change"),
+                ("actual_text", "临时多吃了一碗饭"),
+                *(("photo_task_ids", task_id) for task_id in feedback["outcome_json"]["photo_task_ids"]),
+            ],
+            [("photo", "actual-three.png", "image/png", additional_image)],
+        )
+        status, _, _ = self.request(
+            "POST", f"/plans/{plan_date}/{item_id}/feedback", append_body, append_headers
+        )
+        self.assertEqual(303, status)
+        updated_feedback = adaptive.get_plan_for_date(plan_date)["feedback"][item_id]
+        self.assertEqual(3, len(updated_feedback["outcome_json"]["photo_task_ids"]))
+        self.assertEqual(
+            set(images + [additional_image]),
+            {
+                resolve_data_path(service.get_task(task_id)["image_path"]).read_bytes()
+                for task_id in updated_feedback["outcome_json"]["photo_task_ids"]
+            },
+        )
 
         status, _, app_script = self.request("GET", "/assets/ui/app.js")
         self.assertEqual(200, status)

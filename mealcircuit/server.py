@@ -659,22 +659,34 @@ def render_plan_page(
                 current_outcome["satiety"] = draft["satiety"]
             else:
                 current_outcome.pop("satiety", None)
-            if draft.get("photo_task_id"):
+            if draft.get("photo_task_ids"):
+                current_outcome["photo_task_ids"] = draft["photo_task_ids"]
+            elif draft.get("photo_task_id"):
                 current_outcome["photo_task_id"] = draft["photo_task_id"]
         current_satiety = current_outcome.get("satiety") or ""
-        feedback_photo_html = ""
-        photo_task_id = current_outcome.get("photo_task_id")
-        if photo_task_id:
+        photo_task_ids = []
+        raw_photo_task_ids = current_outcome.get("photo_task_ids")
+        if isinstance(raw_photo_task_ids, list):
+            photo_task_ids.extend(str(item) for item in raw_photo_task_ids if item)
+        if current_outcome.get("photo_task_id"):
+            photo_task_ids.append(str(current_outcome["photo_task_id"]))
+        photo_task_ids = list(dict.fromkeys(photo_task_ids))
+        feedback_photos = []
+        for index, photo_task_id in enumerate(photo_task_ids, start=1):
             try:
                 photo_task = service.get_task(str(photo_task_id))
             except KeyError:
                 photo_task = None
             if photo_task and photo_task.get("image_path"):
-                feedback_photo_html = (
+                feedback_photos.append(
                     '<figure class="feedback-photo"><img src="/media/'
                     f'{esc(Path(photo_task["image_path"]).name)}" alt="{esc(meal.get("name") or "这一餐")}的实际照片">'
-                    '<figcaption>这次记录的实际照片</figcaption></figure>'
+                    f'<figcaption>实际照片 {index}</figcaption></figure>'
                 )
+        feedback_photo_html = (
+            f'<div class="feedback-photos">{"".join(feedback_photos)}</div>'
+            if feedback_photos else ""
+        )
         satiety_options = "".join(
             f'<option value="{key}"{_selected(current_satiety,key)}>{label}</option>'
             for key, label in (
@@ -689,16 +701,16 @@ def render_plan_page(
             f'<div class="form-error" role="alert" tabindex="-1" data-feedback-error><strong>还差一项</strong><p>{esc(feedback_error)}</p></div>'
             if draft and feedback_error else ""
         )
-        photo_task_field = (
-            f'<input type="hidden" name="photo_task_id" value="{esc(photo_task_id)}">'
-            if photo_task_id else ""
+        photo_task_fields = "".join(
+            f'<input type="hidden" name="photo_task_ids" value="{esc(photo_task_id)}">'
+            for photo_task_id in photo_task_ids
         )
         slot_label = {"breakfast": "早餐", "lunch": "午餐", "dinner": "晚餐"}.get(
             meal.get("slot") or meal.get("meal_type"), meal.get("slot") or meal.get("meal_type") or ""
         )
         cards.append(f'''<article class="plan-card"><div class="section-header"><div><span class="subtle-label">{esc(slot_label)}</span><h2>{esc(meal.get('name') or '这一餐')}</h2></div>{f'<span class="status completed">{esc(FEEDBACK_LABELS.get(current_status,current_status))}</span>' if feedback else ''}</div>
         {purpose_html}{f'<p><strong>方式：</strong>{esc(MEAL_MODE_LABELS.get(meal.get("mode"), meal.get("mode") or ""))}</p>' if meal.get('mode') else ''}{f'<p><strong>份量：</strong>{esc(meal.get("portion_guidance"))}</p>' if meal.get('portion_guidance') else ''}{f'<h3>具体吃多少</h3><ul class="portion-list">{portion_contract_html}</ul>' if portion_contract_html else ''}{eat_out_html}{f'<p class="muted">{esc(execution_html)}</p>' if execution_html else ''}{f'<h3>{"可选食物" if meal.get("mode")=="eat_out" else "食材"}</h3><ul>{detail}</ul>' if detail else ''}{f'<h3>执行步骤</h3><ol>{step_html}</ol>' if step_html else ''}
-        {feedback_photo_html}<details class="feedback-box"{' open' if not feedback or draft else ''}><summary>{'修改这次记录' if feedback else '吃得怎么样？'}</summary><form method="post" enctype="multipart/form-data" action="/plans/{esc(plan_date)}/{esc(meal['plan_item_id'])}/feedback" data-plan-feedback><input type="hidden" name="expected_version" value="{version}">{photo_task_field}<div data-feedback-error-slot>{inline_error}</div><label>实际情况<select name="status" required><option value="">请选择</option>{status_options}</select></label><label>份量感觉<select name="satiety"><option value="">未记录</option>{satiety_options}</select></label><fieldset><legend>如果有变化，原因是什么？</legend><div class="option-grid">{reason_checks}</div></fieldset><label>实际怎么吃的（可选）<textarea name="actual_text" maxlength="2000">{esc(actual_text)}</textarea></label><label for="feedback-photo-{esc(meal['plan_item_id'])}">{'更换实际照片（可选）' if feedback_photo_html else '实际照片（可选）'}</label><input id="feedback-photo-{esc(meal['plan_item_id'])}" type="file" name="photo" accept="image/jpeg,image/png,image/gif,image/webp" capture="environment"><p class="muted small">可以直接拍照或选择已有图片，照片会和这顿的实际情况一起保存。</p><button type="submit">记下来</button></form></details>
+        {feedback_photo_html}<details class="feedback-box"{' open' if not feedback or draft else ''}><summary>{'修改这次记录' if feedback else '吃得怎么样？'}</summary><form method="post" enctype="multipart/form-data" action="/plans/{esc(plan_date)}/{esc(meal['plan_item_id'])}/feedback" data-plan-feedback><input type="hidden" name="expected_version" value="{version}">{photo_task_fields}<div data-feedback-error-slot>{inline_error}</div><label>实际情况<select name="status" required><option value="">请选择</option>{status_options}</select></label><label>份量感觉<select name="satiety"><option value="">未记录</option>{satiety_options}</select></label><fieldset><legend>如果有变化，原因是什么？</legend><div class="option-grid">{reason_checks}</div></fieldset><label>实际怎么吃的（可选）<textarea name="actual_text" maxlength="2000">{esc(actual_text)}</textarea></label><label for="feedback-photo-{esc(meal['plan_item_id'])}">{'继续添加实际照片（可选）' if feedback_photo_html else '实际照片（可选）'}</label><input id="feedback-photo-{esc(meal['plan_item_id'])}" type="file" name="photo" accept="image/jpeg,image/png,image/gif,image/webp" multiple><p class="muted small">可以一次选择多张，也可以之后继续添加；照片会和这顿的实际情况一起保存。</p><button type="submit">记下来</button></form></details>
         {f'<form class="rescue-form" method="post" action="/rescue/start"><input type="hidden" name="plan_date" value="{esc(plan_date)}"><input type="hidden" name="plan_item_id" value="{esc(meal["plan_item_id"])}"><label>临时有变化<select name="issue_code">{"".join(f"<option value={key!r}>{label}</option>" for key,label in RESCUE_LABELS.items())}</select></label><input name="input_text" aria-label="补充当前情况" placeholder="可以补充手边的食材或时间"><button class="secondary" type="submit">帮我调整这一餐</button></form>' if plan.get('scope_current') else ''}</article>''')
     stale = '' if plan.get('scope_current') else '<div class="quiet-note panel" role="note"><strong>这是过去的安排</strong><p>仍可以补记实际情况，但不会再按它调整今天。</p></div>'
     return (
@@ -1006,7 +1018,7 @@ def layout(title: str, body: str) -> bytes:
     except Exception:
         sync_enabled = False
     storage_label = "本地优先 · 同步已启用" if sync_enabled else "仅存于本机"
-    page = f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{esc(title)} · MealCircuit</title><link rel="icon" href="/assets/ui/favicon.svg" type="image/svg+xml"><script src="/assets/ui/theme-init.js?v=20260714d"></script><link rel="stylesheet" href="/assets/ui/app.css?v=20260714e"><script src="/assets/ui/app.js?v=20260714e" defer></script></head><body>
+    page = f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{esc(title)} · MealCircuit</title><link rel="icon" href="/assets/ui/favicon.svg" type="image/svg+xml"><script src="/assets/ui/theme-init.js?v=20260714d"></script><link rel="stylesheet" href="/assets/ui/app.css?v=20260714f"><script src="/assets/ui/app.js?v=20260714e" defer></script></head><body>
     <a class="skip-link" href="#main-content">跳到主要内容</a>
     <div class="app-shell"><aside class="app-sidebar" id="app-sidebar" aria-label="主导航"><a class="sidebar-brand" href="/">MealCircuit</a><nav class="sidebar-nav">{"".join(nav_sections)}</nav><div class="sidebar-footer"><button class="icon-button" type="button" data-nav-collapse aria-label="收起侧栏" title="收起侧栏">{icon("collapse")}</button></div></aside>
     <button class="nav-scrim" type="button" data-nav-close aria-label="关闭导航"></button>
@@ -1771,7 +1783,7 @@ class Handler(BaseHTTPRequestHandler):
         raw = self.rfile.read(length).decode("utf-8")
         return urllib.parse.parse_qs(raw, keep_blank_values=True)
 
-    def read_multipart_values(self, max_bytes: int | None = None) -> tuple[dict[str, list[str]], dict[str, tuple[str, bytes]]]:
+    def read_multipart_values(self, max_bytes: int | None = None) -> tuple[dict[str, list[str]], dict[str, list[tuple[str, bytes]]]]:
         content_type = self.headers.get("Content-Type", "")
         if not content_type.startswith("multipart/form-data"):
             raise ValidationError("上传必须使用 multipart/form-data")
@@ -1783,20 +1795,23 @@ class Handler(BaseHTTPRequestHandler):
             f"Content-Type: {content_type}\r\nMIME-Version: 1.0\r\n\r\n".encode() + raw
         )
         fields: dict[str, list[str]] = {}
-        files: dict[str, tuple[str, bytes]] = {}
+        files: dict[str, list[tuple[str, bytes]]] = {}
         for part in message.iter_parts():
             name = part.get_param("name", header="content-disposition")
             filename = part.get_filename()
             data = part.get_payload(decode=True) or b""
-            if filename:
-                files[name] = (filename, data)
+            if filename and name:
+                files.setdefault(name, []).append((filename, data))
             elif name:
                 fields.setdefault(name, []).append(data.decode(part.get_content_charset() or "utf-8"))
         return fields, files
 
     def read_multipart(self, max_bytes: int | None = None) -> tuple[dict[str, str], dict[str, tuple[str, bytes]]]:
         values, files = self.read_multipart_values(max_bytes=max_bytes)
-        return {key: items[-1] for key, items in values.items()}, files
+        return (
+            {key: items[-1] for key, items in values.items()},
+            {key: items[-1] for key, items in files.items()},
+        )
 
     def render_error(self, error: Exception, status: int = 400) -> None:
         self.send_html("操作失败", f'<section class="card error"><h1>操作失败</h1><p>{esc(error)}</p><a class="button secondary" href="/">返回总览</a></section>', status)
@@ -2150,9 +2165,9 @@ class Handler(BaseHTTPRequestHandler):
             elif path.startswith("/plans/") and path.endswith("/feedback"):
                 parts = path.strip("/").split("/")
                 plan_date, plan_item_id = parts[1], parts[2]
-                files: dict[str, tuple[str, bytes]] = {}
+                files: dict[str, list[tuple[str, bytes]]] = {}
                 if self.headers.get("Content-Type", "").startswith("multipart/form-data"):
-                    values, files = self.read_multipart_values()
+                    values, files = self.read_multipart_values(max_bytes=256 * 1024 * 1024)
                 else:
                     values = self.read_urlencoded_values()
                 expected = int((values.get("expected_version") or ["0"])[-1])
@@ -2177,8 +2192,17 @@ class Handler(BaseHTTPRequestHandler):
                 meal_slot = meal.get("slot") or {
                     "早餐": "breakfast", "午餐": "lunch", "晚餐": "dinner",
                 }.get(meal.get("name"), "unknown")
-                preserved_photo_task_id = (values.get("photo_task_id") or [""])[-1]
-                if preserved_photo_task_id:
+                photo_task_ids = []
+                existing_photo_task_ids = outcome.get("photo_task_ids")
+                if isinstance(existing_photo_task_ids, list):
+                    photo_task_ids.extend(str(item) for item in existing_photo_task_ids if item)
+                if outcome.get("photo_task_id"):
+                    photo_task_ids.append(str(outcome["photo_task_id"]))
+                preserved_photo_task_ids = list(values.get("photo_task_ids") or [])
+                legacy_photo_task_id = (values.get("photo_task_id") or [""])[-1]
+                if legacy_photo_task_id:
+                    preserved_photo_task_ids.append(legacy_photo_task_id)
+                for preserved_photo_task_id in dict.fromkeys(preserved_photo_task_ids):
                     preserved_task = service.get_task(preserved_photo_task_id)
                     valid_link = any(
                         link["observed_date"] == plan_date
@@ -2188,15 +2212,22 @@ class Handler(BaseHTTPRequestHandler):
                     )
                     if preserved_task.get("type") != "photo" or not valid_link:
                         raise ValidationError("实际照片与这顿记录不匹配")
-                    outcome["photo_task_id"] = preserved_photo_task_id
-                uploaded = files.get("photo")
-                if uploaded and uploaded[1]:
-                    _, data = uploaded
+                    photo_task_ids.append(preserved_photo_task_id)
+                for _, data in files.get("photo") or []:
+                    if not data:
+                        continue
                     task = service.create_photo_task(
                         io.BytesIO(data), f'{plan_date} {meal.get("name") or "餐次"}实际执行照片'
                     )
                     adaptive.link_task_evidence(task["id"], plan_date, "consumed", meal_slot)
-                    outcome["photo_task_id"] = task["id"]
+                    photo_task_ids.append(task["id"])
+                photo_task_ids = list(dict.fromkeys(photo_task_ids))
+                if photo_task_ids:
+                    outcome["photo_task_ids"] = photo_task_ids
+                    outcome["photo_task_id"] = photo_task_ids[-1]
+                else:
+                    outcome.pop("photo_task_ids", None)
+                    outcome.pop("photo_task_id", None)
                 draft = {
                     "plan_item_id": plan_item_id,
                     "expected_version": expected,
@@ -2204,7 +2235,7 @@ class Handler(BaseHTTPRequestHandler):
                     "satiety": satiety,
                     "reason_codes": reason_codes,
                     "actual_text": actual_text,
-                    "photo_task_id": outcome.get("photo_task_id"),
+                    "photo_task_ids": photo_task_ids,
                 }
                 try:
                     adaptive.save_plan_feedback(
