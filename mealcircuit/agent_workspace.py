@@ -45,6 +45,9 @@ WORKSPACE_STATUSES = {
 }
 _TIMERS: dict[str, threading.Timer] = {}
 _TIMER_LOCK = threading.Lock()
+_DURABLE_FEEDBACK_MARKERS = (
+    "以后", "今后", "经常", "总是", "每次", "通常", "一直", "长期", "默认",
+)
 
 
 def _now() -> str:
@@ -362,11 +365,67 @@ def _recover_recent_user_learning_once() -> None:
         )
 
 
+def _feedback_requests_durable_change(text: str) -> bool:
+    clean = str(text or "").strip()
+    return bool(clean) and any(marker in clean for marker in _DURABLE_FEEDBACK_MARKERS)
+
+
+def _repair_overeager_single_feedback_claims() -> None:
+    """Return one-off friction observations to confirmation without erasing evidence."""
+    timestamp = _now()
+    changed = False
+    with connect() as conn:
+        rows = [row_dict(row) for row in conn.execute(
+            """SELECT * FROM user_model_claims
+               WHERE status='active' AND risk_level='low'
+                 AND claim_dimension='execution_friction' AND source='execution_feedback'"""
+        ).fetchall()]
+        for claim in rows:
+            user_decision = conn.execute(
+                """SELECT 1 FROM user_model_claim_versions
+                   WHERE claim_id=? AND change_reason IN (
+                       'user_confirm','user_stable','user_resume','user_today'
+                   ) LIMIT 1""",
+                (claim["id"],),
+            ).fetchone()
+            if user_decision:
+                continue
+            evidence = [row_dict(row) for row in conn.execute(
+                """SELECT * FROM user_model_evidence
+                   WHERE claim_id=? AND stance='support' AND active=1""",
+                (claim["id"],),
+            ).fetchall()]
+            if (
+                len(evidence) != 1
+                or evidence[0]["evidence_type"] != "execution_feedback"
+                or _feedback_requests_durable_change(evidence[0].get("excerpt") or "")
+            ):
+                continue
+            conn.execute(
+                "UPDATE user_model_evidence SET explicit=0 WHERE id=?",
+                (evidence[0]["id"],),
+            )
+            conn.execute(
+                """UPDATE user_model_claims
+                   SET status='pending_confirmation',confidence=MIN(confidence,0.55),
+                       version=version+1,updated_at=? WHERE id=?""",
+                (timestamp, claim["id"]),
+            )
+            updated = row_dict(conn.execute(
+                "SELECT * FROM user_model_claims WHERE id=?", (claim["id"],)
+            ).fetchone())
+            _append_claim_version(conn, updated, "single_feedback_needs_confirmation", timestamp)
+            changed = True
+        if changed:
+            _refresh_user_model_projection(conn, timestamp)
+
+
 def list_claims(*, include_inactive: bool = True) -> list[dict]:
     init_db()
     _migrate_legacy_rules_once()
     _hydrate_user_model_projection()
     _recover_recent_user_learning_once()
+    _repair_overeager_single_feedback_claims()
     timestamp = _now()
     with connect() as conn:
         expired = conn.execute(
@@ -2816,7 +2875,7 @@ def note_feedback_signal(feedback: dict) -> dict | None:
             scope={"meal": feedback.get("meal_name") or "unknown"},
             effect={"complexity": "减少持续看火步骤并提供更短备选"},
             evidence_type="execution_feedback", evidence_id=feedback["id"], excerpt=actual,
-            explicit=bool(actual), source="execution_feedback",
+            explicit=_feedback_requests_durable_change(actual), source="execution_feedback",
         )
     if "did_not_want_it" in reasons:
         return upsert_claim(

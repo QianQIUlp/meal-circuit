@@ -8,6 +8,7 @@ import unittest
 from copy import deepcopy
 from datetime import date, timedelta
 from pathlib import Path
+from unittest.mock import patch
 
 from mealcircuit import adaptive, agent_intelligence, agent_workspace, personalization, server, service
 from mealcircuit.configuration import load_resolved_settings
@@ -775,15 +776,85 @@ class AgentWorkspaceTest(unittest.TestCase):
             if item.get("claim_dimension") == "resource_constraint"
         )
         html = server.render_today_workspace(self.review_date)
-        self.assertIn("我从这次记录里记住了", html)
-        self.assertIn("我会优先选择长期负担得起的食材，不再默认安排牛肉", html)
-        self.assertIn("只适用于今天", html)
+        self.assertIn("我准备这样调整", html)
+        self.assertIn("以后安排牛肉时，要优先考虑长期负担得起的选择吗？", html)
+        self.assertIn("你刚才提到：“牛肉太贵，以后算了。”", html)
+        self.assertIn("只是今天", html)
         self.assertIn('name="action" value="reject"', html)
         self.assertNotIn("resource_constraint", html)
         self.assertNotIn("confidence", html)
         rejected = agent_workspace.update_claim(claim["id"], "reject")
         self.assertEqual("refuted", rejected["status"])
         self.assertEqual(1, rejected["counter_count"])
+
+    def test_one_off_time_feedback_waits_for_confirmation_and_explains_the_change(self):
+        draft = agent_workspace.run_agent_draft(self.review_date, self._provider())
+        accepted = agent_workspace.accept_agent_run(draft["run_id"])
+        plan_date = accepted["result_json"]["tomorrow_menu"]["date"]
+        plan = adaptive.get_plan_for_date(plan_date)
+        breakfast = next(item for item in plan["menu"]["meals"] if item["name"] == "早餐")
+        feedback = adaptive.save_plan_feedback(
+            plan_date,
+            breakfast["plan_item_id"],
+            "modified",
+            reason_codes=["not_enough_time"],
+            actual_text="今天起晚了，所以没时间煮鸡蛋，改成了豆浆和面包。",
+            actor_source="web",
+        )
+        claim = next(
+            item for item in agent_workspace.list_claims()
+            if item.get("claim_dimension") == "execution_friction"
+            and (item.get("scope_json") or {}).get("meal") == "早餐"
+        )
+        self.assertEqual("pending_confirmation", claim["status"])
+        self.assertEqual(0, next(
+            item for item in claim["evidence"] if item["evidence_id"] == feedback["id"]
+        )["explicit"])
+
+        with patch("mealcircuit.server._render_today_state", return_value=""):
+            html = server.render_today_workspace(plan_date)
+        self.assertIn("我想确认一下", html)
+        self.assertIn("以后需要给早餐准备一个不用开火或更快的备选吗？", html)
+        self.assertIn("你刚才提到：“今天起晚了，所以没时间煮鸡蛋，改成了豆浆和面包。”", html)
+        self.assertIn("以后都准备", html)
+        self.assertIn("只是今天", html)
+        self.assertIn("不用这样调整", html)
+        self.assertLess(html.index("以后都准备"), html.index("只是今天"))
+        self.assertLess(html.index("只是今天"), html.index("不用这样调整"))
+        self.assertNotIn("我从这次记录里记住了", html)
+
+    def test_existing_single_feedback_friction_is_returned_to_confirmation(self):
+        claim = agent_workspace.upsert_claim(
+            claim_type="friction_hypothesis",
+            claim_dimension="execution_friction",
+            statement="这类餐次的主动操作时间或步骤可能超过可接受范围",
+            scope={"meal": "早餐"},
+            effect={"complexity": "减少持续看火步骤并提供更短备选"},
+            evidence_type="execution_feedback",
+            evidence_id="legacy-single-feedback",
+            excerpt="起晚了所以没时间煮鸡蛋。",
+            explicit=True,
+            source="execution_feedback",
+        )
+        self.assertEqual("active", claim["status"])
+
+        repaired = next(
+            item for item in agent_workspace.list_claims() if item["id"] == claim["id"]
+        )
+        self.assertEqual("pending_confirmation", repaired["status"])
+        self.assertEqual(0, repaired["evidence"][0]["explicit"])
+        with connect() as conn:
+            reason = conn.execute(
+                """SELECT change_reason FROM user_model_claim_versions
+                   WHERE claim_id=? ORDER BY version DESC LIMIT 1""",
+                (claim["id"],),
+            ).fetchone()[0]
+        self.assertEqual("single_feedback_needs_confirmation", reason)
+        agent_workspace.update_claim(claim["id"], "confirm")
+        confirmed = next(
+            item for item in agent_workspace.list_claims() if item["id"] == claim["id"]
+        )
+        self.assertEqual("active", confirmed["status"])
 
     def test_three_photos_and_user_correction_form_one_traceable_meal_episode(self):
         task_ids = []
