@@ -96,7 +96,7 @@
     },
     "memoryPayload": {"type": "object", "required": ["id", "kind", "content", "active", "created_at", "updated_at"]},
     "adjustmentPayload": {"type": "object", "required": ["id", "content", "active", "created_at", "updated_at"]},
-    "preferencesPayload": {"type": "object", "required": ["kind", "content"], "properties": {"kind": {"enum": ["profile", "settings", "doctrine", "checkin_settings", "agent_user_model"]}}},
+    "preferencesPayload": {"type": "object", "required": ["kind", "content"], "properties": {"kind": {"enum": ["profile", "settings", "doctrine", "checkin_settings", "agent_user_model", "goal_contract", "meal_episode_projection"]}}},
     "assetPayload": {"type": "object", "required": ["sha256", "media_type", "extension", "byte_count"]}
   }
 }

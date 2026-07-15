@@ -670,7 +670,7 @@ class MealCircuitTest(unittest.TestCase):
         plan_id = first["plan_version_id"]
         second_result = daily_review_result(today)
         second_result["one_line_review"] = "修正尚未执行的生成内容。"
-        second = service.submit_daily_review(today, second_result)
+        second = service.complete_daily_review(today, second_result)
         self.assertEqual(second["result_version"], 1)
         self.assertEqual(second["plan_version_id"], plan_id)
         self.assertEqual(second["history"], [])
@@ -682,7 +682,8 @@ class MealCircuitTest(unittest.TestCase):
         self.assertEqual(service.get_daily_review(today)["revision_policy"]["mode"], "locked")
         third_result = daily_review_result(today)
         third_result["one_line_review"] = "执行反馈后修订必须形成正式版本。"
-        third = service.submit_daily_review(today, third_result)
+        service.requeue_daily_review(today, "执行反馈后需要形成正式修订")
+        third = service.complete_daily_review(today, third_result)
         self.assertEqual(third["result_version"], 2)
         self.assertEqual(len(third["history"]), 1)
         with connect() as conn:
@@ -1051,6 +1052,21 @@ class MealCircuitTest(unittest.TestCase):
         with self.assertRaisesRegex(ValidationError, "复用窗口"):
             service.complete_daily_review(today, wrong_date)
         self.assertEqual(service.complete_daily_review(today, home_cooking_review_result(today))["status"], "completed")
+
+    def test_home_cooking_does_not_invent_shopping_or_reuse_to_fill_structure(self):
+        settings_path = Path(self.temp.name) / "settings.json"
+        settings_path.write_text(
+            json.dumps({**TEST_SETTINGS, "home_cooking": HOME_COOKING}, ensure_ascii=False), encoding="utf-8"
+        )
+        today = date.today().isoformat()
+        service.add_daily_record(today, "家里现有食材足够，明天用完，不需要采购。")
+        result = home_cooking_review_result(today)
+        result["tomorrow_menu"]["shopping_list"] = []
+        result["tomorrow_menu"]["online_options"] = []
+        result["tomorrow_menu"]["reuse_plan"] = {"horizon_days": 3, "items": []}
+        completed = service.complete_daily_review(today, result)
+        self.assertEqual([], completed["result_json"]["tomorrow_menu"]["shopping_list"])
+        self.assertEqual([], completed["result_json"]["tomorrow_menu"]["reuse_plan"]["items"])
 
     def test_lunch_and_dinner_home_cooking_have_independent_cards_constraints_and_history(self):
         settings_path = Path(self.temp.name) / "settings.json"
@@ -1631,7 +1647,7 @@ class WebAppTest(unittest.TestCase):
         self.assertEqual(200, status)
         self.assertIn("application/json", headers["Content-Type"])
         context = json.loads(raw)
-        self.assertEqual("AgentContextV2", context["context_schema"])
+        self.assertEqual("AgentContextV3", context["context_schema"])
 
         status, _, raw_state = self.request("GET", f"/agent/state/{review_date}")
         self.assertEqual(200, status)
@@ -1649,7 +1665,7 @@ class WebAppTest(unittest.TestCase):
 
         for path, label in (
             ("/", "今天有什么变化"), ("/plans", "计划"), ("/me", "目标与饮食偏好"),
-            (f"/plans/{plan_date}", "的安排"), (f"/questions/{plan_date}", "只补齐会改变行动的信息"),
+            (f"/plans/{plan_date}", "的安排"), (f"/questions/{plan_date}", "只会询问真正影响行动的信息"),
             ("/learning", "MealCircuit了解的你"), ("/inventory", "家里有什么"),
             ("/profile", "目标与饮食偏好"), ("/data", "备份与迁移"),
         ):

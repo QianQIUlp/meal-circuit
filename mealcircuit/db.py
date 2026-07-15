@@ -23,6 +23,7 @@ MIGRATIONS = {
     3: "published plan projections and constrained rescue provenance",
     4: "versioned rule and experiment provenance",
     5: "longitudinal agent drafts, case formulation, and reversible user model",
+    6: "mandatory agent stages, goal contracts, meal episodes, and outcome attribution",
 }
 CURRENT_SCHEMA_VERSION = max(MIGRATIONS)
 
@@ -582,6 +583,22 @@ def init_db(path: Path | None = None) -> None:
                 updated_at TEXT NOT NULL,
                 completed_at TEXT
             );
+            CREATE TABLE IF NOT EXISTS agent_stage_receipts (
+                id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL REFERENCES agent_planning_runs(id),
+                stage_key TEXT NOT NULL,
+                stage_order INTEGER NOT NULL,
+                status TEXT NOT NULL CHECK (status IN ('pending','completed','rejected','superseded')),
+                input_hash TEXT NOT NULL,
+                input_json TEXT NOT NULL DEFAULT '{}',
+                schema_json TEXT NOT NULL DEFAULT '{}',
+                result_json TEXT,
+                findings_json TEXT NOT NULL DEFAULT '[]',
+                submitted_by TEXT NOT NULL DEFAULT 'system',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(run_id,stage_key)
+            );
             CREATE TABLE IF NOT EXISTS agent_drafts (
                 id TEXT PRIMARY KEY,
                 review_date TEXT NOT NULL UNIQUE,
@@ -663,9 +680,34 @@ def init_db(path: Path | None = None) -> None:
                 stance TEXT NOT NULL CHECK (stance IN ('support','counterexample')),
                 explicit INTEGER NOT NULL DEFAULT 0 CHECK (explicit IN (0,1)),
                 excerpt TEXT NOT NULL DEFAULT '',
+                active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0,1)),
                 observed_at TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 UNIQUE(claim_id,evidence_type,evidence_id,stance)
+            );
+            CREATE TABLE IF NOT EXISTS meal_episode_projections (
+                id TEXT PRIMARY KEY,
+                event_date TEXT NOT NULL,
+                meal_slot TEXT NOT NULL,
+                projection_json TEXT NOT NULL DEFAULT '{}',
+                source_ids_json TEXT NOT NULL DEFAULT '[]',
+                version INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(event_date,meal_slot)
+            );
+            CREATE TABLE IF NOT EXISTS plan_outcome_attributions (
+                id TEXT PRIMARY KEY,
+                feedback_id TEXT NOT NULL UNIQUE REFERENCES plan_execution_feedback(id),
+                plan_date TEXT NOT NULL,
+                meal_slot TEXT NOT NULL,
+                purpose TEXT NOT NULL DEFAULT '',
+                prediction_json TEXT NOT NULL DEFAULT '{}',
+                outcome_json TEXT NOT NULL DEFAULT '{}',
+                attribution_json TEXT NOT NULL DEFAULT '{}',
+                learning_links_json TEXT NOT NULL DEFAULT '[]',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status, created_at);
             CREATE INDEX IF NOT EXISTS idx_task_input_history ON task_input_history(task_id, version);
@@ -692,10 +734,13 @@ def init_db(path: Path | None = None) -> None:
             CREATE INDEX IF NOT EXISTS idx_rules_status ON adaptive_rules(status, updated_at);
             CREATE INDEX IF NOT EXISTS idx_agent_events_date ON agent_workspace_events(event_date,created_at);
             CREATE INDEX IF NOT EXISTS idx_agent_runs_date ON agent_planning_runs(review_date,started_at);
+            CREATE INDEX IF NOT EXISTS idx_agent_stage_receipts ON agent_stage_receipts(run_id,stage_order);
             CREATE INDEX IF NOT EXISTS idx_agent_drafts_status ON agent_drafts(status,review_date);
             CREATE INDEX IF NOT EXISTS idx_agent_questions ON agent_clarifications(review_date,status,created_at);
             CREATE INDEX IF NOT EXISTS idx_user_claims_status ON user_model_claims(status,claim_type,updated_at);
             CREATE INDEX IF NOT EXISTS idx_user_evidence_claim ON user_model_evidence(claim_id,observed_at);
+            CREATE INDEX IF NOT EXISTS idx_meal_episode_date ON meal_episode_projections(event_date,meal_slot);
+            CREATE INDEX IF NOT EXISTS idx_outcome_attribution_date ON plan_outcome_attributions(plan_date,meal_slot);
             """
         )
         migration_columns = {row["name"] for row in conn.execute("PRAGMA table_info(schema_migrations)")}
@@ -809,6 +854,32 @@ def init_db(path: Path | None = None) -> None:
             for name, definition in columns.items():
                 if name not in existing_columns:
                     conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
+        agent_planning_columns = {
+            "current_stage": "TEXT NOT NULL DEFAULT 'facts'",
+            "stage_cursor": "INTEGER NOT NULL DEFAULT 0",
+            "revision_count": "INTEGER NOT NULL DEFAULT 0",
+            "stage_state_json": "TEXT NOT NULL DEFAULT '{}'",
+        }
+        existing_columns = {row["name"] for row in conn.execute("PRAGMA table_info(agent_planning_runs)")}
+        for name, definition in agent_planning_columns.items():
+            if name not in existing_columns:
+                conn.execute(f"ALTER TABLE agent_planning_runs ADD COLUMN {name} {definition}")
+        claim_columns = {
+            "claim_dimension": "TEXT NOT NULL DEFAULT ''",
+            "planning_impact_json": "TEXT NOT NULL DEFAULT '{}'",
+            "last_plan_ids_json": "TEXT NOT NULL DEFAULT '[]'",
+        }
+        existing_columns = {row["name"] for row in conn.execute("PRAGMA table_info(user_model_claims)")}
+        for name, definition in claim_columns.items():
+            if name not in existing_columns:
+                conn.execute(f"ALTER TABLE user_model_claims ADD COLUMN {name} {definition}")
+        evidence_columns = {
+            "active": "INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0,1))",
+        }
+        existing_columns = {row["name"] for row in conn.execute("PRAGMA table_info(user_model_evidence)")}
+        for name, definition in evidence_columns.items():
+            if name not in existing_columns:
+                conn.execute(f"ALTER TABLE user_model_evidence ADD COLUMN {name} {definition}")
         review_columns = {row["name"] for row in conn.execute("PRAGMA table_info(daily_reviews)")}
         review_provenance = {
             "agent_run_id": "TEXT",
@@ -911,7 +982,9 @@ def row_dict(row: sqlite3.Row | None) -> dict | None:
         "scope_json", "evidence_summary_json", "proposed_effect_json", "effect_json",
         "plan_json", "menu_json", "item_json", "usage_json", "source_manifest_json", "validation_attempts_json",
         "classification_json", "formulation_json", "review_json", "clarification_json", "attempts_json",
-        "answer_schema_json",
+        "answer_schema_json", "stage_state_json", "input_json", "schema_json", "findings_json",
+        "source_ids_json", "projection_json", "prediction_json", "attribution_json", "learning_links_json",
+        "planning_impact_json", "last_plan_ids_json",
     ):
         if key in result and result[key]:
             result[key] = json.loads(result[key])

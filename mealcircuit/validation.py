@@ -10,7 +10,7 @@ class ValidationError(ValueError):
     pass
 
 
-VALIDATOR_VERSION = "validator-v3"
+VALIDATOR_VERSION = "validator-v4"
 
 
 def _required_object(value: Any, name: str) -> dict:
@@ -201,8 +201,6 @@ def _validate_home_cooking_menu(menu: dict, meals: list, settings: dict, menu_da
         _validate_meal_rotation(menu, meals_by_name[meal_name], meal_name)
 
     shopping = _required_list(menu.get("shopping_list"), "tomorrow_menu.shopping_list")
-    if not shopping:
-        raise ValidationError("tomorrow_menu.shopping_list 不能为空")
     for index, item in enumerate(shopping):
         item = _required_object(item, f"tomorrow_menu.shopping_list[{index}]")
         for field in ("name", "amount", "purpose", "selection_guide", "storage"):
@@ -224,8 +222,6 @@ def _validate_home_cooking_menu(menu: dict, meals: list, settings: dict, menu_da
     if reuse.get("horizon_days") != settings["rotation_window_days"]:
         raise ValidationError(f"tomorrow_menu.reuse_plan.horizon_days 必须是 {settings['rotation_window_days']}")
     reuse_items = _required_list(reuse.get("items"), "tomorrow_menu.reuse_plan.items")
-    if not reuse_items:
-        raise ValidationError("tomorrow_menu.reuse_plan.items 不能为空")
     start = date.fromisoformat(menu_date)
     end = start + timedelta(days=settings["rotation_window_days"] - 1)
     for index, item in enumerate(reuse_items):
@@ -233,8 +229,6 @@ def _validate_home_cooking_menu(menu: dict, meals: list, settings: dict, menu_da
         for field in ("ingredient", "tomorrow_use", "storage"):
             _required_text(item.get(field), f"tomorrow_menu.reuse_plan.items[{index}].{field}")
         later = _required_list(item.get("later_uses"), f"tomorrow_menu.reuse_plan.items[{index}].later_uses")
-        if not later:
-            raise ValidationError(f"tomorrow_menu.reuse_plan.items[{index}].later_uses 不能为空")
         for later_index, use in enumerate(later):
             use = _required_object(use, f"tomorrow_menu.reuse_plan.items[{index}].later_uses[{later_index}]")
             use_date_text = _required_text(use.get("date"), "reuse date")

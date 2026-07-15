@@ -794,6 +794,59 @@ def _asset_paths(archive: zipfile.ZipFile, revisions: list[DomainRevision]) -> d
     return result
 
 
+def _materialize_goal_contract_projection(connection: sqlite3.Connection, projection: dict) -> None:
+    rows = projection.get("versioned_rows")
+    if not isinstance(rows, dict) or not isinstance(rows.get("profile"), dict):
+        return
+    profile = dict(rows["profile"])
+    goals = [dict(item) for item in rows.get("goals") or [] if isinstance(item, dict)]
+    strategy = dict(rows["strategy"]) if isinstance(rows.get("strategy"), dict) else None
+    targets = [dict(item) for item in rows.get("targets") or [] if isinstance(item, dict)]
+    connection.execute("UPDATE profile_versions SET active=0 WHERE active=1")
+    connection.execute("UPDATE goal_versions SET active=0 WHERE active=1")
+    connection.execute("UPDATE strategy_versions SET active=0 WHERE active=1")
+    connection.execute("UPDATE nutrition_target_versions SET active=0 WHERE active=1")
+    if connection.execute("SELECT 1 FROM profile_versions WHERE id=?", (profile["id"],)).fetchone() is None:
+        profile["version"] = int(connection.execute(
+            "SELECT COALESCE(MAX(version),0)+1 FROM profile_versions"
+        ).fetchone()[0])
+    profile["active"] = 1
+    _upsert_row(connection, "profile_versions", profile)
+    for goal in goals:
+        if connection.execute("SELECT 1 FROM goal_versions WHERE id=?", (goal["id"],)).fetchone() is None:
+            goal["version"] = int(connection.execute(
+                "SELECT COALESCE(MAX(version),0)+1 FROM goal_versions WHERE goal_key=?",
+                (goal["goal_key"],),
+            ).fetchone()[0])
+        goal["profile_version_id"] = profile["id"]
+        goal["active"] = 1
+        _upsert_row(connection, "goal_versions", goal)
+    if strategy:
+        if connection.execute("SELECT 1 FROM strategy_versions WHERE id=?", (strategy["id"],)).fetchone() is None:
+            strategy["version"] = int(connection.execute(
+                "SELECT COALESCE(MAX(version),0)+1 FROM strategy_versions"
+            ).fetchone()[0])
+        strategy["profile_version_id"] = profile["id"]
+        strategy["active"] = 1
+        _upsert_row(connection, "strategy_versions", strategy)
+    for target in targets:
+        if connection.execute("SELECT 1 FROM nutrition_target_versions WHERE id=?", (target["id"],)).fetchone() is None:
+            target["version"] = int(connection.execute(
+                "SELECT COALESCE(MAX(version),0)+1 FROM nutrition_target_versions WHERE target_key=?",
+                (target["target_key"],),
+            ).fetchone()[0])
+        target["profile_version_id"] = profile["id"]
+        target["active"] = 1
+        _upsert_row(connection, "nutrition_target_versions", target)
+
+
+def _materialize_meal_episode_projection(connection: sqlite3.Connection, projection: dict) -> None:
+    for item in projection.get("episodes") or []:
+        if not isinstance(item, dict) or not item.get("id"):
+            continue
+        _upsert_row(connection, "meal_episode_projections", item)
+
+
 def _apply_revision(connection: sqlite3.Connection, revision: DomainRevision, asset_paths: dict[str, str]) -> None:
     payload = revision.payload
     if revision.entity_kind == "task":
@@ -868,22 +921,34 @@ def _apply_revision(connection: sqlite3.Connection, revision: DomainRevision, as
                    WHERE module_key=?""",
                 (item["enabled"], item["sort_order"], item["frequency"], item["updated_at"], item["module_key"]),
             )
-    elif revision.entity_kind == "preferences" and payload.get("kind") == "agent_user_model":
+    elif revision.entity_kind == "preferences" and payload.get("kind") in {
+        "agent_user_model", "goal_contract", "meal_episode_projection",
+    }:
+        kind = str(payload.get("kind"))
         content = str(payload.get("content", ""))
         try:
             projection = json.loads(content)
         except json.JSONDecodeError as exc:
-            raise ValidationError("导入的 Agent 用户模型投影不是合法 JSON") from exc
-        if not isinstance(projection, dict) or not isinstance(projection.get("claims"), list):
-            raise ValidationError("导入的 Agent 用户模型投影结构无效")
+            raise ValidationError("导入的 Agent 投影不是合法 JSON") from exc
+        required_list = {
+            "agent_user_model": "claims",
+            "goal_contract": "goals",
+            "meal_episode_projection": "episodes",
+        }[kind]
+        if not isinstance(projection, dict) or not isinstance(projection.get(required_list), list):
+            raise ValidationError("导入的 Agent 投影结构无效")
         connection.execute(
             """INSERT INTO config_documents(kind,content,content_sha256,revision_id,updated_at)
-               VALUES('agent_user_model',?,?,?,?)
+               VALUES(?,?,?,?,?)
                ON CONFLICT(kind) DO UPDATE SET content=excluded.content,
                    content_sha256=excluded.content_sha256,revision_id=excluded.revision_id,
                    updated_at=excluded.updated_at""",
-            (content, _sha256_bytes(content.encode("utf-8")), revision.revision_id, revision.created_at),
+            (kind, content, _sha256_bytes(content.encode("utf-8")), revision.revision_id, revision.created_at),
         )
+        if kind == "goal_contract":
+            _materialize_goal_contract_projection(connection, projection)
+        elif kind == "meal_episode_projection":
+            _materialize_meal_episode_projection(connection, projection)
     elif revision.entity_kind == "asset":
         path = asset_paths[revision.entity_id]
         connection.execute(

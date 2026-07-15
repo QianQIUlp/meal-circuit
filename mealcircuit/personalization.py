@@ -46,6 +46,11 @@ ACTIVITY_BANDS = {
     "moderate": (1.4, 1.6),
     "high": (1.6, 1.8),
 }
+NON_NEGOTIABLES = {
+    "health", "training", "satiety", "budget", "time", "taste", "social", "convenience",
+}
+RECORDING_INTENSITIES = {"light", "standard", "detailed"}
+FOLLOWUP_INTENSITIES = {"only_when_needed", "balanced", "proactive"}
 OBSERVATION_FLAGS = (
     "therapeutic_diet",
     "medication_affects_nutrition",
@@ -404,9 +409,21 @@ def _validate_onboarding_step(step: str, payload: dict) -> None:
         _text(payload.get("portion_method"), "份量表达", maximum=200)
         modes = _meal_modes(payload.get("meal_modes")) if "meal_modes" in payload else None
         _number(payload.get("cooking_time_minutes", 25), "做饭时间", minimum=0, maximum=180)
-        _number(payload.get("question_budget", 2), "每日问题预算", minimum=0, maximum=5)
+        _number(payload.get("question_budget", 2), "每日问题预算", minimum=0, maximum=3)
         for name in ("equipment", "food_exclusions", "preferences"):
             _text_list(payload.get(name), name)
+        _text_list(payload.get("non_negotiables"), "不愿牺牲的事项", allowed=NON_NEGOTIABLES)
+        _text_list(payload.get("priority_tradeoffs"), "现实取舍顺序", allowed=NON_NEGOTIABLES)
+        recording_intensity = _text(
+            payload.get("recording_intensity", "light"), "记录强度", maximum=30
+        )
+        followup_intensity = _text(
+            payload.get("followup_intensity", "only_when_needed"), "追问强度", maximum=30
+        )
+        if recording_intensity not in RECORDING_INTENSITIES:
+            raise ValidationError("记录强度无效")
+        if followup_intensity not in FOLLOWUP_INTENSITIES:
+            raise ValidationError("追问强度无效")
         if modes and "home_cook" in modes.values() and not payload.get("equipment"):
             raise ValidationError("选择在家下厨时必须至少填写一种可用厨具")
 
@@ -434,12 +451,28 @@ def _validate_profile(answers: dict) -> dict:
     if missing_safety:
         raise ValidationError(f"安全步骤缺少明确回答：{missing_safety}")
     question_budget = int(_number(
-        constraints.get("question_budget", 2), "每日问题预算", minimum=0, maximum=5
+        constraints.get("question_budget", 2), "每日问题预算", minimum=0, maximum=3
     ))
     meal_modes = _meal_modes(constraints.get("meal_modes")) if "meal_modes" in constraints else None
     equipment = _text_list(constraints.get("equipment"), "炊具")
     food_exclusions = _text_list(constraints.get("food_exclusions"), "排除食品")
     preferences = _text_list(constraints.get("preferences"), "饮食偏好")
+    non_negotiables = _text_list(
+        constraints.get("non_negotiables"), "不愿牺牲的事项", allowed=NON_NEGOTIABLES
+    )
+    priority_tradeoffs = _text_list(
+        constraints.get("priority_tradeoffs"), "现实取舍顺序", allowed=NON_NEGOTIABLES
+    )
+    recording_intensity = _text(
+        constraints.get("recording_intensity", "light"), "记录强度", maximum=30
+    )
+    followup_intensity = _text(
+        constraints.get("followup_intensity", "only_when_needed"), "追问强度", maximum=30
+    )
+    if recording_intensity not in RECORDING_INTENSITIES:
+        raise ValidationError("记录强度无效")
+    if followup_intensity not in FOLLOWUP_INTENSITIES:
+        raise ValidationError("追问强度无效")
 
     profile = {
         "age_years": age,
@@ -474,6 +507,10 @@ def _validate_profile(answers: dict) -> dict:
             "food_exclusions": food_exclusions,
             "preferences": preferences,
             "question_budget": question_budget,
+            "non_negotiables": non_negotiables,
+            "priority_tradeoffs": priority_tradeoffs,
+            "recording_intensity": recording_intensity,
+            "followup_intensity": followup_intensity,
         },
         "legacy_profile_notes": _text(
             answers.get("legacy_profile_notes", ""), "旧档案备注", required=False, maximum=20000
@@ -882,6 +919,17 @@ def complete_onboarding(session_id: str, expected_version: int, confirmation: di
             "nutrition_target_ids": target_ids,
             "safety_mode": safety["mode"],
             "legacy_settings_snapshot": session["answers_json"].get("legacy_settings"),
+            "goal_contract": {
+                "why": [goal.get("motivation") or "" for goal in goals],
+                "priority_order": [goal["type"] for goal in goals],
+                "success_metrics": list(dict.fromkeys(
+                    metric for goal in goals for metric in goal.get("success_metrics") or []
+                )),
+                "non_negotiables": profile["constraints"].get("non_negotiables") or [],
+                "priority_tradeoffs": profile["constraints"].get("priority_tradeoffs") or [],
+                "recording_intensity": profile["constraints"].get("recording_intensity", "light"),
+                "followup_intensity": profile["constraints"].get("followup_intensity", "only_when_needed"),
+            },
         }
         if "meal_modes" in profile["constraints"]:
             strategy["meal_modes"] = profile["constraints"]["meal_modes"]
@@ -912,8 +960,9 @@ def complete_onboarding(session_id: str, expected_version: int, confirmation: di
             (timestamp, timestamp, session_id),
         )
     result = active_personalization()
-    from . import agent_workspace
+    from . import agent_intelligence, agent_workspace
 
+    agent_intelligence.refresh_goal_contract_sync(result)
     agent_workspace.mark_all_drafts_stale("目标、策略或安全档案已更新")
     return result
 

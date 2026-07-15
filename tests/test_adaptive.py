@@ -12,7 +12,7 @@ from datetime import date, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
-from mealcircuit import adaptive, agent_workspace, personalization, portability, server, service
+from mealcircuit import adaptive, agent_intelligence, agent_workspace, personalization, portability, server, service
 from mealcircuit.configuration import initialize_private_home, load_resolved_settings
 from mealcircuit.db import CURRENT_SCHEMA_VERSION, connect, init_db, row_dict
 from mealcircuit.validation import ValidationError
@@ -271,6 +271,30 @@ class AdaptiveDomainTest(unittest.TestCase):
         revision = personalization.start_onboarding()
         self.assertEqual(modes, revision["answers_json"]["constraints"]["meal_modes"])
 
+    def test_onboarding_builds_a_goal_contract_that_drives_goal_specific_planning(self):
+        session = self._fill_session(constraint_overrides={
+            "non_negotiables": ["health", "training", "budget"],
+            "priority_tradeoffs": ["health", "training", "satiety"],
+            "recording_intensity": "light",
+            "followup_intensity": "only_when_needed",
+        })
+        current = personalization.complete_onboarding(
+            session["id"], session["version"],
+            {"accept_profile": True, "accept_strategy": True, "planning_mode": "portion_guided"},
+        )
+        contract = agent_intelligence.goal_contract_projection(current)
+        programs = agent_intelligence.goal_program(current)
+        self.assertEqual("降低脂肪，同时维持力量训练表现。", contract["goals"][0]["why"])
+        self.assertEqual(["health", "training", "budget"], contract["non_negotiables"])
+        self.assertEqual(["health", "training", "satiety"], contract["priority_tradeoffs"])
+        self.assertEqual("only_when_needed", contract["collaboration"]["followup_intensity"])
+        recomposition = next(item for item in programs["programs"] if item["goal_type"] == "body_recomposition")
+        self.assertIn("训练恢复", recomposition["required_dimensions"])
+        self.assertIn("长期执行", recomposition["required_dimensions"])
+        profile_html = server.render_profile_page()
+        self.assertIn("不能为了目标牺牲什么", profile_html)
+        self.assertIn("长期负担得起", profile_html)
+
     def test_single_day_meal_modes_override_personal_defaults_without_changing_strategy(self):
         defaults = {"breakfast": "quick_assembly", "lunch": "home_cook", "dinner": "home_cook"}
         session = self._fill_session(constraint_overrides={"meal_modes": defaults})
@@ -381,7 +405,7 @@ class AdaptiveDomainTest(unittest.TestCase):
         result = _review_result("2026-07-10")
         result["tomorrow_menu"]["protein_target_g"] = None
         result["tomorrow_menu"]["environment"] = load_resolved_settings()["meal_environment"]
-        completed = service.submit_daily_review("2026-07-10", result)
+        completed = service.complete_daily_review("2026-07-10", result)
         self.assertIsNone(completed["result_json"]["tomorrow_menu"]["protein_target_g"])
 
     def test_observation_mode_never_creates_nutrition_targets(self):
@@ -529,6 +553,14 @@ class AdaptiveDomainTest(unittest.TestCase):
         self.assertEqual([90.0, 110.0], personalization.resolved_settings(SETTINGS)["protein_target_g"])
         self.assertEqual("clinician_provided", current["targets"][0]["source_kind"])
         self.assertEqual("professional_constraint", current["targets"][0]["method"])
+        service.add_daily_record("2026-07-10", "按当前专业指导记录事实。")
+        context = agent_workspace.build_agent_context("2026-07-10")
+        self.assertEqual([], context["person"]["goals"])
+        self.assertEqual([], context["person"]["goal_contract"]["goals"])
+        self.assertEqual(1, len(context["person"]["targets"]))
+        self.assertEqual("clinician_provided", context["person"]["targets"][0]["source_kind"])
+        self.assertNotIn("general", context["professional_basis"]["selection_tags"])
+        self.assertNotIn("training", context["professional_basis"]["selection_tags"])
 
     def test_feedback_revisions_are_append_only(self):
         self._complete_standard_profile()
@@ -690,7 +722,7 @@ class AdaptiveDomainTest(unittest.TestCase):
         agent_date = date.today().isoformat()
         intake = run("agent-intake", agent_date, "--text", "今天训练后更饿，明天晚饭仍自己做。")
         self.assertEqual(agent_date, intake["record"]["record_date"])
-        self.assertEqual("AgentContextV2", run("agent-context", agent_date)["context_schema"])
+        self.assertEqual("AgentContextV3", run("agent-context", agent_date)["context_schema"])
         self.assertIn("due", run("user-model", "reflection-status"))
         bundle = self.home / "exports" / "cli.zip"
         self.assertTrue(Path(run("export-bundle", "--output", str(bundle))["path"]).samefile(bundle))

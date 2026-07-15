@@ -626,6 +626,11 @@ def _system_prompt(kind: str) -> str:
         "额外文本、私密思维过程或无法从证据支持的精确营养值。区分用户事实、系统推断和仍然未知的信息。"
     )
     stage = {
+        "intent_learning": (
+            "你正在进行 IntentLearningV1。逐条处理 fact_bundle 中每个 natural_language_source，逐条回应每个"
+            "detected_intent_signal；不能用空数组跳过。明确的低风险长期表达可以成为可回滚软理解，高影响信息"
+            "只能要求在目标或安全档案中确认。模型不能把自己的重复输出当作用户证据。"
+        ),
         "case_formulation": (
             "你正在进行 CaseFormulationV1。先理解今天这个人，而不是直接写菜单。找出显式目标背后的现实需求、"
             "目标冲突、当日决定性约束、历史上有效或失败的模式。低风险理解只能写成有证据的软假设。"
@@ -636,6 +641,11 @@ def _system_prompt(kind: str) -> str:
             "只有答案会改变份量、训练恢复、餐次、安全或执行方式时才提问，最多遵守上下文 question_budget；"
             "不影响决定的信息应明确假设后继续。不要把目标、安全、过敏、疾病、药物或营养数值当作软假设。"
         ),
+        "strategy_comparison": (
+            "你正在进行 StrategyComparisonV1。比较2至3个现实可行方向，分别考虑安全、目标覆盖、预算、时间、"
+            "饱腹、口味、轮换、浪费和执行概率。选择一个方向并说明取舍，不把多个菜单交给用户决定；所选方向"
+            "必须覆盖个案阶段的全部 planning_priorities、required_goal_dimensions 和 required_non_negotiables。"
+        ),
         "daily_plan_v3": (
             "你正在设计 DailyPlanV3。以个案摘要为主线，而不是机械填字段。每餐必须说明今天为什么适合、要解决"
             "什么、与全天如何配合，并给出克数范围、生熟或上桌口径、生活量具、估算置信度及加减条件。"
@@ -644,7 +654,8 @@ def _system_prompt(kind: str) -> str:
             "严格服从 effective_meal_modes。未知保持区间或未知，不能用伪精确补齐。core_advice 必须先比较今天"
             "真实执行与原计划和个人目标，再结合训练、饥饿、睡眠、肠胃、日程和执行反馈，只保留影响最大的1至3个"
             "改变方向；不要把合理的临时调整当作失败。若整体执行良好且状态没有异常，要具体肯定有效做法，并说明"
-            "接下来继续保持什么，不要为了显得有建议而制造问题。"
+            "接下来继续保持什么，不要为了显得有建议而制造问题。advice_evidence 必须与每条 core_advice 一一对应，"
+            "只引用本次上下文真实存在的用户来源、已生效理解、目标契约或适用专业原则。"
         ),
         "daily_plan_v3_revision": (
             "你正在根据独立审查修订 DailyPlanV3。只修复审查指出的问题，保留已经满足用户需求的部分；"
@@ -654,6 +665,10 @@ def _system_prompt(kind: str) -> str:
             "你是独立的 PlanReviewV1 审查者，不为前一阶段辩护。检查计划是否真的回应用户今天的需求，"
             "菜量是否合理且口径清楚，是否忽略训练、食欲、睡眠或肠胃，是否重复、太复杂、违反历史纠正，"
             "或为追指标牺牲可执行性。approved 只有在不存在 blocking/important 问题时才可为 true。"
+            "problem_coverage 要逐项回应个案问题，dimension_coverage 要逐项回应目标程序和用户明确说不能牺牲的事项。"
+            "evidence_checks 必须逐字列出并核对每条 core_advice 的事实或专业依据，不能用空数组跳过。"
+            "核对时只使用 evidence_pack 中的真实用户事实、已生效理解、目标约定和适用专业原则。"
+            "每个问题都必须说明会给用户造成什么现实伤害；不得只因字段不整齐就阻断。"
             "审查者自己的猜测不能冒充用户证据；claim_candidates 没有真实 evidence_ids 时只能等待用户确认。"
         ),
         "targeted_plan_revision": (
@@ -682,7 +697,9 @@ def _system_prompt(kind: str) -> str:
 
 def _user_prompt(request: GenerationRequest) -> str:
     label = {
+        "intent_learning": "请逐条处理用户文字和系统标出的意图信号。",
         "case_formulation": "请完成个案理解；不要提前写菜单。",
+        "strategy_comparison": "请比较可行策略并选择一个最适合当前个案的方向。",
         "daily_plan_v3": "请根据个案摘要设计可协商的完整草案。",
         "daily_plan_v3_revision": "请根据审查问题修订完整草案。",
         "plan_review": "请独立审查候选计划。",
