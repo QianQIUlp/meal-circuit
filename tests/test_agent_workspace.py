@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import io
 import os
 import tempfile
 import unittest
@@ -8,9 +9,10 @@ from copy import deepcopy
 from datetime import date, timedelta
 from pathlib import Path
 
-from mealcircuit import agent_workspace, personalization, server, service
+from mealcircuit import adaptive, agent_intelligence, agent_workspace, personalization, server, service
 from mealcircuit.configuration import load_resolved_settings
 from mealcircuit.db import connect, init_db
+from mealcircuit.validation import ValidationError
 from tests.test_adaptive import SETTINGS, _review_result
 
 
@@ -30,6 +32,17 @@ def _portion(item: str, low: int, high: int, measure: str) -> dict:
 def _v3_result(review_date: str) -> dict:
     result = _review_result(review_date)
     result.update({
+        "problems_to_solve": ["可执行", "训练恢复", "饱腹"],
+        "selected_strategy": "balanced",
+        "strategy_tradeoffs": ["不追求最低成本，保留训练恢复所需的便利性"],
+        "predictions": {
+            "satiety": "三餐份量和蔬菜体积足以覆盖日常饥饿",
+            "recovery": "训练前后都有蛋白和主食",
+            "cost": "使用常见食材，成本可控",
+            "time": "自炊餐不超过个人时间上限",
+            "execution_risks": ["晚餐如果太晚开始，切配可能成为阻力"],
+            "adjustment_triggers": ["训练取消时减少半拳主食"],
+        },
         "case_summary": "兼顾训练恢复、减脂和真实饱腹感。",
         "planning_rationale": ["午餐保证训练前能量", "晚餐用更大蔬菜体积提高饱腹感"],
         "evidence_summary": ["用户已确认身体重组目标", "今天有真实饮食记录"],
@@ -43,10 +56,20 @@ def _v3_result(review_date: str) -> dict:
     protein_ranges = ([30, 35], [45, 55], [40, 55])
     for index, meal in enumerate(result["tomorrow_menu"]["meals"]):
         meal["protein_g"] = list(protein_ranges[index])
+        meal["mode"] = ("quick_assembly", "eat_out", "home_cook")[index]
+        if index == 1:
+            meal["eat_out_guidance"] = {
+                "protein_anchor": "一掌瘦肉或豆制品", "staple": "一拳主食",
+                "vegetables": "至少两拳", "sauce_rule": "酱汁分开",
+                "fallback": "便利店无糖奶加饭团和沙拉",
+            }
         meal.update({
             "purpose": ["低摩擦启动", "稳定下午精力", "训练恢复和晚间饱腹"][index],
             "why_today": "根据今天的目标、状态和餐次安排决定。",
             "whole_day_role": "与其他餐共同覆盖已确认目标，不机械追加。",
+            "predicted_satiety": "预计餐后舒适；饥饿时有明确加量顺序。",
+            "predicted_cost": "使用日常可购买食材。",
+            "execution_risks": ["开始太晚会压缩烹饪时间"] if index else [],
             "portion_contracts": [_portion(meal["foods"][0], 100 + index * 20, 140 + index * 20, "约一掌")],
             "adjustment_logic": {
                 "if_hungry": "先加蔬菜，再按训练情况加主食",
@@ -78,6 +101,20 @@ class ScriptedProvider:
     def generate(self, request):
         self.kinds.append(request.kind)
         self.requests.append(request)
+        if request.kind == "intent_learning":
+            bundle = request.context["fact_bundle"]
+            return {
+                "source_dispositions": [{
+                    "source_id": item["source_id"], "disposition": "today_fact",
+                    "summary": item["text"],
+                } for item in bundle.get("natural_language_sources") or []],
+                "signal_dispositions": [{
+                    "signal_id": item["signal_id"],
+                    "disposition": "active_soft_understanding" if item.get("lifetime") == "durable" else "pending_confirmation",
+                    "explanation": "已按风险和适用时间处理。",
+                } for item in bundle.get("detected_intent_signals") or []],
+                "learning_summary": ["已逐条处理本次用户输入。"],
+            }
         if request.kind == "case_formulation":
             return {
                 "current_state": ["今天已经提供真实饮食记录"],
@@ -92,17 +129,61 @@ class ScriptedProvider:
                 "clarification_questions": deepcopy(self.questions),
                 "planning_priorities": ["可执行", "训练恢复", "饱腹"],
             }
+        if request.kind == "strategy_comparison":
+            required = [
+                "可执行", "训练恢复", "饱腹",
+                *request.context.get("required_goal_dimensions", []),
+                *request.context.get("required_non_negotiables", []),
+            ]
+            return {
+                "options": [
+                    {
+                        "id": "balanced", "label": "平衡现实执行", "summary": "兼顾恢复、饱腹和时间。",
+                        "scores": {key: 4 for key in (
+                            "safety", "goal_coverage", "budget", "time", "satiety", "taste",
+                            "rotation", "waste", "execution_probability",
+                        )},
+                        "tradeoffs": ["不是最低成本"], "solves_priorities": required,
+                    },
+                    {
+                        "id": "cheapest", "label": "最低成本", "summary": "优先成本。",
+                        "scores": {key: (5 if key == "budget" else 3) for key in (
+                            "safety", "goal_coverage", "budget", "time", "satiety", "taste",
+                            "rotation", "waste", "execution_probability",
+                        )},
+                        "tradeoffs": ["口味和便利性较弱"], "solves_priorities": required,
+                    },
+                ],
+                "selected_id": "balanced", "selection_reason": "更适合长期执行。",
+                "rejected_reasons": [{"id": "cheapest", "reason": "会牺牲便利性。"}],
+            }
         if request.kind in {"daily_plan_v3", "daily_plan_v3_revision"}:
-            return deepcopy(self.plan)
+            plan = deepcopy(self.plan)
+            source_id = request.context["today"]["records"][0]["id"]
+            plan["advice_evidence"] = [{
+                "advice": advice, "basis_kind": "user_context", "source_ids": [source_id],
+            } for advice in plan["core_advice"]]
+            return plan
         if request.kind == "plan_review":
+            candidate = request.context["candidate_plan"]
             return {
                 "approved": True,
                 "human_fit_summary": "份量、执行性和当天目标相互一致。",
+                "problem_coverage": [{
+                    "problem": item, "addressed": True, "evidence": "计划有对应餐次与调整条件。",
+                } for item in request.context["case_formulation"]["planning_priorities"]],
+                "dimension_coverage": [{
+                    "dimension": item, "addressed": True, "evidence": "所选策略和餐次安排有对应体现。",
+                } for item in request.context.get("required_dimensions", [])],
+                "evidence_checks": [{
+                    "claim": advice, "supported": True,
+                    "source_or_boundary": "对应 advice_evidence 中的当天用户记录。",
+                } for advice in candidate["core_advice"]],
                 "issues": [],
                 "claim_candidates": deepcopy(self.review_claims),
             }
         if request.kind == "targeted_plan_revision":
-            updated = deepcopy(self.plan)
+            updated = deepcopy(request.context["current_draft"])
             for meal in updated["tomorrow_menu"]["meals"]:
                 meal["purpose"] = "模型尝试改动所有餐次"
             updated["tomorrow_menu"]["meals"][1]["mode"] = "eat_out"
@@ -184,7 +265,7 @@ class AgentWorkspaceTest(unittest.TestCase):
     def test_agent_context_is_layered_and_explainable(self):
         service.add_daily_record((date.today() - timedelta(days=3)).isoformat(), "与今天决策无关的旧记录")
         context = agent_workspace.build_agent_context(self.review_date)
-        self.assertEqual("AgentContextV2", context["context_schema"])
+        self.assertEqual("AgentContextV3", context["context_schema"])
         self.assertEqual({"person", "today", "longitudinal", "professional_basis", "decision_task"}, {
             key for key in context if key in {"person", "today", "longitudinal", "professional_basis", "decision_task"}
         })
@@ -196,7 +277,7 @@ class AgentWorkspaceTest(unittest.TestCase):
             {item["id"] for item in context["professional_basis"]["principles"]},
         )
         self.assertTrue(all(
-            item["source"].get("verified_on") == "2026-07-14"
+            item["source"].get("verified_on") == "2026-07-15"
             for item in context["professional_basis"]["principles"]
         ))
 
@@ -204,29 +285,52 @@ class AgentWorkspaceTest(unittest.TestCase):
         provider = self._provider()
         draft = agent_workspace.run_agent_draft(self.review_date, provider)
         self.assertEqual("ready_draft", draft["status"])
-        self.assertEqual(["case_formulation", "daily_plan_v3", "plan_review"], provider.kinds)
-        self.assertEqual("AgentContextV2", provider.requests[0].context["context_schema"])
-        self.assertEqual("DailyPlanV3Input", provider.requests[1].context["context_schema"])
-        self.assertEqual("PlanReviewV1Input", provider.requests[2].context["context_schema"])
-        self.assertNotIn("candidate_plan", provider.requests[0].context)
-        self.assertNotIn("today", provider.requests[2].context)
+        self.assertEqual(
+            ["intent_learning", "case_formulation", "strategy_comparison", "daily_plan_v3", "plan_review"],
+            provider.kinds,
+        )
+        self.assertEqual("IntentLearningV1Input", provider.requests[0].context["context_schema"])
+        self.assertEqual("CaseFormulationV1Input", provider.requests[1].context["context_schema"])
+        self.assertEqual("StrategyComparisonV1Input", provider.requests[2].context["context_schema"])
+        self.assertEqual("DailyPlanV3Input", provider.requests[3].context["context_schema"])
+        self.assertEqual("PlanReviewV1Input", provider.requests[4].context["context_schema"])
+        self.assertNotIn("candidate_plan", provider.requests[1].context)
+        self.assertNotIn("today", provider.requests[4].context)
+        self.assertIn("evidence_pack", provider.requests[4].context)
+        self.assertTrue(any(
+            item["kind"] == "user_statement" and "今天完成力量训练" in item["value"]
+            for item in provider.requests[4].context["evidence_pack"]["user_facts"]
+        ))
         self.assertEqual("pending", service.get_daily_review(self.review_date)["status"])
         plan_date = (date.fromisoformat(self.review_date) + timedelta(days=1)).isoformat()
         self.assertIsNone(__import__("mealcircuit.adaptive", fromlist=["get_plan_for_date"]).get_plan_for_date(plan_date))
+        draft_workspace_html = server.render_today_workspace(self.review_date)
+        self.assertIn("今天的核心建议", draft_workspace_html)
+        self.assertIn("维持三餐并记录真实执行阻力", draft_workspace_html)
 
         accepted = agent_workspace.accept_draft(self.review_date)
         self.assertEqual("completed", accepted["status"])
         manifest = accepted["source_manifest_json"]
-        self.assertEqual(2, manifest["agent_context_version"])
-        self.assertEqual("professional-basis-2026-07-v1", manifest["professional_knowledge"]["version"])
+        self.assertEqual(3, manifest["agent_context_version"])
+        self.assertEqual("professional-basis-2026-07-v2", manifest["professional_knowledge"]["version"])
         self.assertEqual(draft["run_id"], manifest["agent_run_id"])
+        self.assertEqual(7, len(manifest["agent_stage_receipts"]))
         self.assertIn("user_model_claims", manifest)
         self.assertIsNotNone(__import__("mealcircuit.adaptive", fromlist=["get_plan_for_date"]).get_plan_for_date(plan_date))
         self.assertEqual("accepted", agent_workspace.get_draft(self.review_date)["status"])
         workspace_html = server.render_today_workspace(self.review_date)
-        self.assertIn("草案已经成为正式执行计划", workspace_html)
+        self.assertIn("今天的核心建议", workspace_html)
+        self.assertIn("维持三餐并记录真实执行阻力", workspace_html)
+        self.assertIn(f'/reviews/{self.review_date}', workspace_html)
+        self.assertIn("明天的安排已经准备好", workspace_html)
         self.assertIn(f'/plans/{plan_date}', workspace_html)
         self.assertNotIn("未配置模型；可以查看和导出", workspace_html)
+        self.assertNotIn("AgentContextV2", workspace_html)
+        self.assertNotIn("Three-stage planning", workspace_html)
+        plan_html = server.render_plan_page(plan_date)
+        self.assertIn("为什么这样安排", plan_html)
+        self.assertIn("这次参考了什么", plan_html)
+        self.assertNotIn("source_manifest", plan_html)
 
     def test_decision_changing_questions_stop_before_planning(self):
         provider = ScriptedProvider(self.review_date, plan=self._provider().plan, questions=[{
@@ -235,9 +339,19 @@ class AgentWorkspaceTest(unittest.TestCase):
         }])
         draft = agent_workspace.run_agent_draft(self.review_date, provider)
         self.assertEqual("needs_clarification", draft["status"])
-        self.assertEqual(["case_formulation"], provider.kinds)
+        self.assertEqual(["intent_learning", "case_formulation"], provider.kinds)
         state = agent_workspace.get_workspace_state(self.review_date)
         self.assertEqual(1, len([item for item in state["questions"] if item["status"] == "pending"]))
+
+    def test_irrelevant_model_question_does_not_interrupt_planning(self):
+        provider = ScriptedProvider(self.review_date, plan=self._provider().plan, questions=[{
+            "key": "plate_color", "prompt": "你喜欢什么颜色的盘子？",
+            "reason": "让描述更有趣", "decision_impact": "只改变文字风格",
+            "answer_schema": {"kind": "text"},
+        }])
+        draft = agent_workspace.run_agent_draft(self.review_date, provider)
+        self.assertEqual("ready_draft", draft["status"])
+        self.assertEqual([], agent_workspace.get_workspace_state(self.review_date)["questions"])
 
     def test_targeted_revision_preserves_unaffected_meals(self):
         provider = self._provider()
@@ -249,7 +363,55 @@ class AgentWorkspaceTest(unittest.TestCase):
         self.assertEqual(old["早餐"], new["早餐"])
         self.assertEqual(old["晚餐"], new["晚餐"])
         self.assertEqual("eat_out", new["午餐"]["mode"])
+        self.assertEqual(["targeted_plan_revision", "plan_review"], revision_provider.kinds)
         self.assertEqual(2, agent_workspace.get_draft(self.review_date)["version"])
+        agent_workspace.assert_agent_run_publishable(
+            agent_workspace.get_draft(self.review_date)["run_id"], self.review_date
+        )
+
+    def test_targeted_revision_keeps_original_when_independent_review_rejects_twice(self):
+        before = agent_workspace.run_agent_draft(self.review_date, self._provider())["result_json"]
+
+        class RejectingReviewProvider(ScriptedProvider):
+            def generate(self, request):
+                if request.kind == "plan_review":
+                    self.kinds.append(request.kind)
+                    self.requests.append(request)
+                    return {
+                        "approved": False,
+                        "human_fit_summary": "午餐修改后仍没有覆盖预算约束。",
+                        "problem_coverage": [{
+                            "problem": item, "addressed": True, "evidence": "其余问题已有对应安排。",
+                        } for item in request.context["case_formulation"]["planning_priorities"]],
+                        "dimension_coverage": [{
+                            "dimension": item, "addressed": True, "evidence": "其余维度已有对应安排。",
+                        } for item in request.context.get("required_dimensions", [])],
+                        "evidence_checks": [{
+                            "claim": advice, "supported": True,
+                            "source_or_boundary": "对应草案已绑定的当天记录。",
+                        } for advice in request.context["candidate_plan"]["core_advice"]],
+                        "issues": [{
+                            "severity": "repair", "dimension": "budget",
+                            "description": "外食选择仍缺少预算边界。",
+                            "affected_meals": ["午餐"],
+                            "suggested_change": "增加可执行的价格上限和备用选择。",
+                            "user_harm": "可能再次给出用户长期负担不起、不会执行的选择。",
+                        }],
+                        "claim_candidates": [],
+                    }
+                return super().generate(request)
+
+        provider = RejectingReviewProvider(self.review_date, plan=before)
+        with self.assertRaisesRegex(ValidationError, "原草案保持不变"):
+            agent_workspace.revise_draft(self.review_date, "午饭改外食", provider)
+        current = agent_workspace.get_draft(self.review_date)
+        self.assertEqual("stale", current["status"])
+        self.assertEqual(2, current["version"])
+        self.assertEqual(before, current["result_json"])
+        self.assertEqual(
+            ["targeted_plan_revision", "plan_review", "targeted_plan_revision", "plan_review"],
+            provider.kinds,
+        )
 
     def test_claim_requires_explicit_or_two_independent_signals_and_syncs_projection(self):
         first = agent_workspace.upsert_claim(
@@ -269,6 +431,11 @@ class AgentWorkspaceTest(unittest.TestCase):
         self.assertEqual(
             "standard", second["scope_json"]["binding"]["safety_mode"],
         )
+        harmless_revision = agent_workspace._current_claim_binding()
+        harmless_revision["strategy_version_id"] = "strategy_new-version"
+        self.assertTrue(agent_workspace._claim_scope_is_current(second["scope_json"], harmless_revision))
+        changed_life_stage = dict(harmless_revision, life_stage="pregnant", safety_mode="clinician_guided")
+        self.assertFalse(agent_workspace._claim_scope_is_current(second["scope_json"], changed_life_stage))
         with connect() as conn:
             projection = json.loads(conn.execute(
                 "SELECT content FROM config_documents WHERE kind='agent_user_model'"
@@ -294,19 +461,33 @@ class AgentWorkspaceTest(unittest.TestCase):
             soft_assumptions=[hypothesis],
             review_claims=[hypothesis],
         )
-        agent_workspace.run_agent_draft(self.review_date, provider)
+        draft = agent_workspace.run_agent_draft(self.review_date, provider)
+        agent_workspace.accept_agent_run(draft["run_id"])
         claims = [item for item in agent_workspace.list_claims() if item["statement"] == hypothesis["statement"]]
         self.assertEqual(1, len(claims))
         self.assertEqual("pending_confirmation", claims[0]["status"])
         self.assertEqual(1, claims[0]["support_count"])
 
         intake = agent_workspace.record_intake(self.review_date, "我明确觉得晚餐菜量太少，希望以后更有饱腹感。")
+        deterministic = next(
+            item for item in agent_workspace.list_claims()
+            if item.get("claim_dimension") == "satiety_pattern"
+            and any(
+                evidence["evidence_id"] == intake["record"]["id"]
+                for evidence in item["evidence"]
+            )
+        )
+        self.assertEqual("active", deterministic["status"])
         explicit = {**hypothesis, "evidence_ids": [intake["id"]], "explicit_user_statement": True}
-        agent_workspace.run_agent_draft(
+        revised_draft = agent_workspace.run_agent_draft(
             self.review_date,
             ScriptedProvider(self.review_date, plan=self._provider().plan, soft_assumptions=[explicit]),
             force=True,
         )
+        self.assertEqual("pending_confirmation", [
+            item for item in agent_workspace.list_claims() if item["statement"] == hypothesis["statement"]
+        ][0]["status"])
+        agent_workspace.accept_agent_run(revised_draft["run_id"])
         updated = [item for item in agent_workspace.list_claims() if item["statement"] == hypothesis["statement"]][0]
         self.assertEqual("active", updated["status"])
 
@@ -320,7 +501,7 @@ class AgentWorkspaceTest(unittest.TestCase):
         self.assertEqual("pending_confirmation", claim["status"])
         self.assertEqual({}, claim["effect_json"])
 
-    def test_claim_from_previous_strategy_remains_visible_but_stops_affecting_context(self):
+    def test_claim_from_previous_strategy_remains_visible_and_keeps_affecting_context(self):
         claim = agent_workspace.upsert_claim(
             claim_type="stable_preference", statement="旧策略下偏好很小的晚餐",
             scope={"meal": "晚餐"}, effect={"portion": "旧策略份量"},
@@ -331,7 +512,7 @@ class AgentWorkspaceTest(unittest.TestCase):
         })
         self._complete_standard_profile()
         context_claims = agent_workspace.build_agent_context(self.review_date)["person"]["active_user_model"]
-        self.assertNotIn(claim["id"], {item["id"] for item in context_claims})
+        self.assertIn(claim["id"], {item["id"] for item in context_claims})
         self.assertIn(claim["id"], {item["id"] for item in agent_workspace.list_claims()})
 
     def test_context_change_during_planning_interrupts_without_publishing(self):
@@ -362,3 +543,301 @@ class AgentWorkspaceTest(unittest.TestCase):
         stale = agent_workspace.get_draft(self.review_date)
         self.assertEqual("stale", stale["status"])
         self.assertEqual([], service.get_daily_review(self.review_date)["history"])
+
+    def test_explicit_budget_need_is_learned_immediately_and_changes_planning(self):
+        service.add_daily_record(
+            self.review_date,
+            "主要今天午饭没法执行是因为牛肉太贵了，吃不起，以后也算了。其余都正常。",
+        )
+        claims = [
+            item for item in agent_workspace.list_claims()
+            if item.get("claim_dimension") == "resource_constraint"
+        ]
+        self.assertEqual(1, len(claims))
+        self.assertEqual("active", claims[0]["status"])
+        self.assertEqual("牛肉", claims[0]["scope_json"]["item"])
+        context = agent_workspace.build_agent_context(self.review_date)
+        self.assertIn(claims[0]["id"], {
+            item["id"] for item in context["person"]["active_user_model"]
+        })
+
+        bad = self._provider().plan
+        bad["tomorrow_menu"]["meals"][2]["foods"] = ["牛肉", "米饭", "蔬菜"]
+        with self.assertRaisesRegex(ValidationError, "不作为默认项"):
+            agent_workspace.run_agent_draft(
+                self.review_date, ScriptedProvider(self.review_date, plan=bad), force=True
+            )
+        self.assertEqual("pending", service.get_daily_review(self.review_date)["status"])
+
+    def test_explicit_high_price_product_need_names_the_real_item(self):
+        service.add_daily_record(self.review_date, "不需要高价酸奶，以后优先普通食物。")
+        claim = next(
+            item for item in agent_workspace.list_claims()
+            if item.get("claim_dimension") == "resource_constraint"
+        )
+        self.assertEqual("active", claim["status"])
+        self.assertEqual("酸奶", claim["scope_json"]["item"])
+        self.assertIn("长期负担得起", claim["statement"])
+
+    def test_execution_feedback_text_is_a_required_intent_source(self):
+        previous_date = (date.fromisoformat(self.review_date) - timedelta(days=1)).isoformat()
+        service.add_daily_record(previous_date, "昨天按计划吃饭。")
+        previous_result = _review_result(previous_date)
+        settings = load_resolved_settings()
+        previous_result["tomorrow_menu"]["protein_target_g"] = settings["protein_target_g"]
+        previous_result["tomorrow_menu"]["environment"] = settings["meal_environment"]
+        service.complete_daily_review(previous_date, previous_result)
+        plan = adaptive.get_plan_for_date(self.review_date)
+        lunch = next(item for item in plan["menu"]["meals"] if item["name"] == "午餐")
+        feedback = adaptive.save_plan_feedback(
+            self.review_date, lunch["plan_item_id"], "modified",
+            reason_codes=["too_expensive"],
+            actual_text="午餐的牛肉太贵，以后不要默认安排。",
+        )
+        context = agent_workspace.build_agent_context(self.review_date)
+        source = next(
+            item for item in context["fact_bundle"]["natural_language_sources"]
+            if item["source_id"] == feedback["id"]
+        )
+        self.assertEqual("execution_feedback", source["source_type"])
+        self.assertEqual(self.review_date, source["observed_date"])
+        self.assertEqual("午餐的牛肉太贵，以后不要默认安排。", source["text"])
+
+    def test_temporary_food_signal_expires_before_next_day_but_tomorrow_signal_applies(self):
+        today_record = service.add_daily_record(self.review_date, "今天不想吃鱼。")
+        today_claim = next(
+            item for item in agent_workspace.list_claims()
+            if any(evidence["evidence_id"] == today_record["id"] for evidence in item["evidence"])
+        )
+        self.assertEqual(self.review_date, today_claim["valid_until"])
+        next_context = agent_workspace.build_agent_context(self.review_date)
+        self.assertNotIn(today_claim["id"], {
+            item["id"] for item in next_context["person"]["active_user_model"]
+        })
+
+        tomorrow_record = service.add_daily_record(self.review_date, "明天不想吃鱼。")
+        tomorrow_claim = next(
+            item for item in agent_workspace.list_claims()
+            if any(evidence["evidence_id"] == tomorrow_record["id"] for evidence in item["evidence"])
+        )
+        self.assertIn(tomorrow_claim["id"], {
+            item["id"] for item in agent_workspace.build_agent_context(self.review_date)["person"]["active_user_model"]
+        })
+
+    def test_manual_stage_run_cannot_skip_or_publish_an_unreviewed_result(self):
+        started = agent_workspace.begin_agent_run(self.review_date, force=True)
+        self.assertEqual("intent_learning", started["stage"])
+        with self.assertRaisesRegex(ValidationError, "不能跳过"):
+            agent_workspace.submit_agent_stage(
+                started["run_id"], "plan_design", self._provider().plan
+            )
+        with self.assertRaisesRegex(ValidationError, "全部必需阶段"):
+            agent_workspace.finalize_agent_run(started["run_id"])
+        with self.assertRaisesRegex(ValidationError, "Agent run ID"):
+            service.submit_daily_review(self.review_date, self._provider().plan)
+
+    def test_weak_model_cannot_hide_explicit_intent_with_empty_coverage(self):
+        class WeakProvider(ScriptedProvider):
+            def generate(self, request):
+                if request.kind == "intent_learning":
+                    self.kinds.append(request.kind)
+                    self.requests.append(request)
+                    return {"source_dispositions": [], "signal_dispositions": [], "learning_summary": []}
+                return super().generate(request)
+
+        with self.assertRaisesRegex(ValidationError, "项目数量不足|逐条处理"):
+            agent_workspace.run_agent_draft(
+                self.review_date, WeakProvider(self.review_date, plan=self._provider().plan), force=True
+            )
+        self.assertEqual("pending", service.get_daily_review(self.review_date)["status"])
+
+    def test_weak_model_cannot_omit_a_goal_contract_dimension(self):
+        class WeakStrategyProvider(ScriptedProvider):
+            def generate(self, request):
+                result = super().generate(request)
+                if request.kind == "strategy_comparison":
+                    missing = request.context["required_goal_dimensions"][0]
+                    for option in result["options"]:
+                        option["solves_priorities"] = [
+                            item for item in option["solves_priorities"] if item != missing
+                        ]
+                return result
+
+        with self.assertRaisesRegex(ValidationError, "必需目标维度"):
+            agent_workspace.run_agent_draft(
+                self.review_date, WeakStrategyProvider(self.review_date, plan=self._provider().plan),
+                force=True,
+            )
+        self.assertEqual("pending", service.get_daily_review(self.review_date)["status"])
+
+    def test_repair_retry_is_part_of_the_persisted_stage_input(self):
+        class RepairOnceProvider(ScriptedProvider):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.plan_calls = 0
+
+            def generate(self, request):
+                if request.kind == "daily_plan_v3":
+                    self.plan_calls += 1
+                    if self.plan_calls == 1:
+                        self.kinds.append(request.kind)
+                        self.requests.append(request)
+                        invalid = deepcopy(self.plan)
+                        invalid["problems_to_solve"] = ["只覆盖一个无关问题"]
+                        return invalid
+                return super().generate(request)
+
+        provider = RepairOnceProvider(self.review_date, plan=self._provider().plan)
+        draft = agent_workspace.run_agent_draft(self.review_date, provider, force=True)
+        self.assertEqual("ready_draft", draft["status"])
+        receipt = agent_workspace.agent_run_status(draft["run_id"])["receipts"]
+        plan_receipt = next(item for item in receipt if item["stage_key"] == "plan_design")
+        self.assertIn("previous_rejection", plan_receipt["input_json"])
+        self.assertEqual(2, provider.plan_calls)
+
+    def test_weak_model_cannot_publish_advice_with_fake_evidence(self):
+        class FakeEvidenceProvider(ScriptedProvider):
+            def generate(self, request):
+                result = super().generate(request)
+                if request.kind in {"daily_plan_v3", "daily_plan_v3_revision"}:
+                    result["advice_evidence"] = [{
+                        "advice": advice,
+                        "basis_kind": "user_context",
+                        "source_ids": ["invented-source"],
+                    } for advice in result["core_advice"]]
+                return result
+
+        with self.assertRaisesRegex(ValidationError, "不存在的证据"):
+            agent_workspace.run_agent_draft(
+                self.review_date,
+                FakeEvidenceProvider(self.review_date, plan=self._provider().plan),
+                force=True,
+            )
+        self.assertEqual("pending", service.get_daily_review(self.review_date)["status"])
+
+    def test_independent_review_cannot_skip_core_advice_evidence_checks(self):
+        class EmptyEvidenceReviewProvider(ScriptedProvider):
+            def generate(self, request):
+                result = super().generate(request)
+                if request.kind == "plan_review":
+                    result["evidence_checks"] = []
+                return result
+
+        with self.assertRaisesRegex(ValidationError, "逐条核对核心建议"):
+            agent_workspace.run_agent_draft(
+                self.review_date,
+                EmptyEvidenceReviewProvider(self.review_date, plan=self._provider().plan),
+                force=True,
+            )
+        self.assertEqual("pending", service.get_daily_review(self.review_date)["status"])
+
+    def test_resource_constraint_can_be_refuted_by_new_user_evidence(self):
+        service.add_daily_record(self.review_date, "牛肉太贵，以后算了。")
+        service.add_daily_record(self.review_date, "现在牛肉价格可以接受，可以买。")
+        claim = next(
+            item for item in agent_workspace.list_claims()
+            if item.get("claim_dimension") == "resource_constraint"
+        )
+        self.assertEqual("refuted", claim["status"])
+        self.assertEqual(1, claim["counter_count"])
+
+    def test_editing_user_text_supersedes_old_learning_without_erasing_trace(self):
+        record = service.add_daily_record(self.review_date, "牛肉太贵，以后算了。")
+        claim = next(
+            item for item in agent_workspace.list_claims()
+            if item.get("claim_dimension") == "resource_constraint"
+        )
+        self.assertEqual("active", claim["status"])
+
+        service.update_daily_record(record["id"], self.review_date, "今天饮食和预算都正常。")
+        updated = next(item for item in agent_workspace.list_claims() if item["id"] == claim["id"])
+        self.assertEqual("pending_confirmation", updated["status"])
+        self.assertEqual(0, updated["support_count"])
+        old_evidence = next(
+            item for item in updated["evidence"]
+            if item["evidence_type"] == "daily_record" and item["evidence_id"] == record["id"]
+        )
+        self.assertEqual(0, old_evidence["active"])
+
+        service.update_daily_record(record["id"], self.review_date, "牛肉太贵，以后还是不要默认安排。")
+        reactivated = next(item for item in agent_workspace.list_claims() if item["id"] == claim["id"])
+        self.assertEqual("active", reactivated["status"])
+        self.assertEqual(1, reactivated["support_count"])
+        self.assertEqual(1, next(
+            item for item in reactivated["evidence"]
+            if item["evidence_type"] == "daily_record" and item["evidence_id"] == record["id"]
+        )["active"])
+
+    def test_today_page_explains_new_low_risk_learning_in_plain_language(self):
+        service.add_daily_record(self.review_date, "牛肉太贵，以后算了。")
+        claim = next(
+            item for item in agent_workspace.list_claims()
+            if item.get("claim_dimension") == "resource_constraint"
+        )
+        html = server.render_today_workspace(self.review_date)
+        self.assertIn("我从这次记录里记住了", html)
+        self.assertIn("我会优先选择长期负担得起的食材，不再默认安排牛肉", html)
+        self.assertIn("只适用于今天", html)
+        self.assertIn('name="action" value="reject"', html)
+        self.assertNotIn("resource_constraint", html)
+        self.assertNotIn("confidence", html)
+        rejected = agent_workspace.update_claim(claim["id"], "reject")
+        self.assertEqual("refuted", rejected["status"])
+        self.assertEqual(1, rejected["counter_count"])
+
+    def test_three_photos_and_user_correction_form_one_traceable_meal_episode(self):
+        task_ids = []
+        for index in range(3):
+            task = service.create_photo_task(
+                io.BytesIO(b"\x89PNG\r\n\x1a\n" + f"meal-{index}".encode()),
+                f"午餐第 {index + 1} 张照片",
+            )
+            adaptive.link_task_evidence(task["id"], self.review_date, "consumed", "lunch")
+            service.complete_task(task["id"], {
+                "summary": f"照片 {index + 1} 的保守观察",
+                "candidates": [{
+                    "name": "带骨禽肉", "portion_range": "约一块",
+                    "nutrition": {
+                        "energy_kcal": None, "protein_g": None,
+                        "carbs_g": None, "fat_g": None,
+                    },
+                    "confidence": 0.5,
+                }],
+                "unknowns": ["实际吃下量"],
+                "advice": ["结合餐后图和用户描述再判断"],
+            })
+            task_ids.append(task["id"])
+        episode = agent_intelligence.refresh_meal_episode(self.review_date, "lunch")
+        projection = episode["projection_json"]
+        self.assertEqual("multi_photo_observation", projection["current_fact_source"])
+        self.assertEqual(task_ids, episode["source_ids_json"])
+        self.assertTrue(all(
+            "image_path" not in item for item in projection["photo_and_material_sources"]
+        ))
+
+        service.add_correction(task_ids[0], {"text": "实际是一个鸡腿、一个鸭腿和两个豆干。"})
+        corrected = agent_intelligence.refresh_meal_episode(self.review_date, "lunch")["projection_json"]
+        self.assertEqual("user_correction", corrected["current_fact_source"])
+        self.assertIn("两个豆干", corrected["current_fact"])
+        self.assertEqual(3, len(corrected["photo_and_material_sources"]))
+
+    def test_feedback_attribution_distinguishes_price_time_inventory_and_taste(self):
+        draft = agent_workspace.run_agent_draft(self.review_date, self._provider())
+        accepted = agent_workspace.accept_agent_run(draft["run_id"])
+        plan_date = accepted["result_json"]["tomorrow_menu"]["date"]
+        plan = adaptive.get_plan_for_date(plan_date)
+        item_id = plan["menu"]["meals"][2]["plan_item_id"]
+        version = 0
+        for reason, expected in (
+            ("too_expensive", "price"),
+            ("not_enough_time", "time"),
+            ("missing_ingredient", "inventory"),
+            ("did_not_want_it", "taste"),
+        ):
+            feedback = adaptive.save_plan_feedback(
+                plan_date, item_id, "modified", reason_codes=[reason],
+                actual_text=f"这次因为{reason}调整了", expected_version=version,
+            )
+            version = feedback["version"]
+            attribution = agent_intelligence.list_outcome_attributions(plan_date, plan_date)[0]
+            self.assertEqual(expected, attribution["attribution_json"]["primary_cause"])

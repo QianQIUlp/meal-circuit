@@ -78,16 +78,6 @@ fun DailyScreen(viewModel: MainViewModel) {
     var record by remember { mutableStateOf("") }
     val records by viewModel.repository.observe(EntityKind.DAILY_RECORD).collectAsState(emptyList())
     val reviews by viewModel.repository.observe(EntityKind.DAILY_REVIEW).collectAsState(emptyList())
-    val timezone by viewModel.timezone.collectAsState()
-    val today = java.time.LocalDate.now(java.time.ZoneId.of(timezone)).toString()
-    val reviewPending = reviews.any { row ->
-        runCatching {
-            val review = kotlinx.serialization.json.Json.parseToJsonElement(row.payloadJson).jsonObject
-                .getValue("review").jsonObject
-            review.getValue("review_date").jsonPrimitive.content == today &&
-                review.getValue("status").jsonPrimitive.content == "pending"
-        }.getOrDefault(false)
-    }
     val latestPublished = reviews.mapNotNull { row ->
         runCatching {
             val review = Json.parseToJsonElement(row.payloadJson).jsonObject.getValue("review").jsonObject
@@ -99,7 +89,7 @@ fun DailyScreen(viewModel: MainViewModel) {
         Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp).widthIn(max = 880.dp),
         verticalArrangement = Arrangement.spacedBy(20.dp),
     ) {
-        SectionTitle("今天吃了什么", "先写入本机；模型生成是独立、可选的动作。")
+        SectionTitle("今天吃了什么", "记录会在设备间同步，并用于之后的复盘和安排。")
         OutlinedTextField(
             record, { record = it }, Modifier.fillMaxWidth(),
             label = { Text("自然语言饮食记录") }, minLines = 4,
@@ -112,11 +102,6 @@ fun DailyScreen(viewModel: MainViewModel) {
         SectionTitle("今日状态", "发布的信息进入复盘上下文；缺失仍保持未知。")
         CheckinEditor(viewModel)
         SectionTitle("最近饮食记录")
-        androidx.compose.material3.OutlinedButton(
-            onClick = viewModel::generateDailyReview,
-            enabled = reviewPending,
-            modifier = Modifier.fillMaxWidth(),
-        ) { Text("使用本设备配置的 AI 生成今日复盘") }
         latestPublished?.let { (reviewDate, result) ->
             PublishedAgentPlan(reviewDate, result)
         }
@@ -130,9 +115,12 @@ private fun PublishedAgentPlan(reviewDate: String, result: JsonObject) {
     val rationale = result["planning_rationale"]?.jsonArray.orEmpty().mapNotNull {
         runCatching { it.jsonPrimitive.content }.getOrNull()
     }
+    val coreAdvice = result["core_advice"]?.jsonArray.orEmpty().mapNotNull {
+        runCatching { it.jsonPrimitive.content }.getOrNull()
+    }
     Card(Modifier.fillMaxWidth()) {
         Column(Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            Text("Python 发布的复盘 · $reviewDate", style = MaterialTheme.typography.labelLarge)
+            Text("当天复盘 · $reviewDate", style = MaterialTheme.typography.labelLarge)
             Text(
                 result["case_summary"]?.jsonPrimitive?.contentOrNull
                     ?: result["one_line_review"]?.jsonPrimitive?.contentOrNull
@@ -140,6 +128,13 @@ private fun PublishedAgentPlan(reviewDate: String, result: JsonObject) {
                 style = MaterialTheme.typography.titleLarge,
                 fontWeight = FontWeight.SemiBold,
             )
+            if (coreAdvice.isNotEmpty()) {
+                Text("今天最重要的方向", style = MaterialTheme.typography.titleMedium)
+                coreAdvice.forEach { Text("• $it") }
+            }
+            if (rationale.isNotEmpty()) {
+                Text("为什么这样安排", style = MaterialTheme.typography.titleMedium)
+            }
             rationale.forEach { Text("• $it") }
             menu?.get("meals")?.jsonArray.orEmpty().forEach { element ->
                 val meal = element.jsonObject
@@ -179,12 +174,11 @@ private fun PublishedAgentPlan(reviewDate: String, result: JsonObject) {
                         contract["increase_if"]?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotBlank() }?.let {
                             Text("吃不饱时：$it", style = MaterialTheme.typography.bodySmall)
                         }
+                        contract["decrease_if"]?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotBlank() }?.let {
+                            Text("食欲低时：$it", style = MaterialTheme.typography.bodySmall)
+                        }
                     }
                 }
-            }
-            val basis = result["agent_workbench"]?.jsonObject?.get("professional_basis")?.jsonObject
-            basis?.get("version")?.jsonPrimitive?.contentOrNull?.let {
-                Text("计划依据：$it", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
         }
     }

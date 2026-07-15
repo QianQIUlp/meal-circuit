@@ -250,13 +250,22 @@ def snapshot_payload(connection: sqlite3.Connection, entity_kind: str, entity_id
                 "kind": "checkin_settings",
                 "content": json.dumps(rows, ensure_ascii=False, sort_keys=True),
             }, False
-        if entity_id == preference_entity_id("agent_user_model"):
+        projection_kinds = {
+            "agent_user_model": '{"schema_version":1,"claims":[]}',
+            "goal_contract": '{"schema_version":1,"goals":[]}',
+            "meal_episode_projection": '{"schema_version":1,"episodes":[]}',
+        }
+        projection_kind = next(
+            (kind for kind in projection_kinds if entity_id == preference_entity_id(kind)),
+            None,
+        )
+        if projection_kind:
             row = connection.execute(
-                "SELECT content FROM config_documents WHERE kind='agent_user_model'"
+                "SELECT content FROM config_documents WHERE kind=?", (projection_kind,)
             ).fetchone()
             return {
-                "kind": "agent_user_model",
-                "content": str(row["content"] if row else '{"schema_version":1,"claims":[]}'),
+                "kind": projection_kind,
+                "content": str(row["content"] if row else projection_kinds[projection_kind]),
             }, False
         if entity_id not in expected:
             raise KeyError(entity_id)
@@ -570,7 +579,10 @@ def seed_current_entities(connection: sqlite3.Connection) -> int:
 
 def refresh_configuration_entities(connection: sqlite3.Connection) -> int:
     count = 0
-    for kind in ("profile", "settings", "doctrine", "checkin_settings", "agent_user_model"):
+    for kind in (
+        "profile", "settings", "doctrine", "checkin_settings", "agent_user_model",
+        "goal_contract", "meal_episode_projection",
+    ):
         if capture_entity(connection, "preferences", preference_entity_id(kind)) is not None:
             count += 1
     return count

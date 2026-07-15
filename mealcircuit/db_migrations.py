@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
-CURRENT_SCHEMA_VERSION = 7
+CURRENT_SCHEMA_VERSION = 8
 
 
 def _timestamp() -> str:
@@ -153,7 +153,10 @@ def _migrate_1_to_2(connection: sqlite3.Connection) -> None:
         );
 
         CREATE TABLE IF NOT EXISTS config_documents (
-            kind TEXT PRIMARY KEY CHECK (kind IN ('profile','settings','doctrine','checkin_settings','agent_user_model')),
+            kind TEXT PRIMARY KEY CHECK (kind IN (
+                'profile','settings','doctrine','checkin_settings','agent_user_model',
+                'goal_contract','meal_episode_projection'
+            )),
             content TEXT NOT NULL,
             content_sha256 TEXT NOT NULL,
             revision_id TEXT,
@@ -293,6 +296,32 @@ def _migrate_6_to_7(connection: sqlite3.Connection) -> None:
     connection.execute("DROP TABLE config_documents_v6")
 
 
+def _migrate_7_to_8(connection: sqlite3.Connection) -> None:
+    table_sql = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='config_documents'"
+    ).fetchone()
+    if table_sql and "goal_contract" in str(table_sql[0]) and "meal_episode_projection" in str(table_sql[0]):
+        return
+    connection.execute("ALTER TABLE config_documents RENAME TO config_documents_v7")
+    connection.execute(
+        """CREATE TABLE config_documents (
+               kind TEXT PRIMARY KEY CHECK (kind IN (
+                   'profile','settings','doctrine','checkin_settings','agent_user_model',
+                   'goal_contract','meal_episode_projection'
+               )),
+               content TEXT NOT NULL,
+               content_sha256 TEXT NOT NULL,
+               revision_id TEXT,
+               updated_at TEXT NOT NULL
+           )"""
+    )
+    connection.execute(
+        """INSERT INTO config_documents(kind,content,content_sha256,revision_id,updated_at)
+           SELECT kind,content,content_sha256,revision_id,updated_at FROM config_documents_v7"""
+    )
+    connection.execute("DROP TABLE config_documents_v7")
+
+
 MIGRATIONS = {
     1: _migrate_1_to_2,
     2: _migrate_2_to_3,
@@ -300,6 +329,7 @@ MIGRATIONS = {
     4: _migrate_4_to_5,
     5: _migrate_5_to_6,
     6: _migrate_6_to_7,
+    7: _migrate_7_to_8,
 }
 
 

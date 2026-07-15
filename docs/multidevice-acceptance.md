@@ -12,19 +12,14 @@ This matrix is the release evidence for the local-first, user-configurable multi
 | E2EE entities/assets, recovery, pairing, device revocation and safe key rotation | Python/Android crypto and account managers; server key-envelope/rotation APIs | Fixed cross-language vectors, negative AEAD tests, asset recovery, pairing/revocation and rotation tests |
 | Opaque self-hosted service with PostgreSQL 18, Alembic, quotas and local blob boundary | `sync_server/`, `protocol/sync-v1.openapi.json`, `sync_server/compose.yaml` | FastAPI integration suite, Alembic fresh/legacy tests, PostgreSQL 18 CI job and server-plaintext canary scan |
 | Desktop local-first UI/CLI, secure storage, optional sync and native packaging | existing Web/Agent workflows plus `secret_store.py`, sync CLI/Web and `packaging/` | Python/Web tests, Windows PyInstaller clean build and packaged smoke test; native CI jobs for all desktop targets |
-| Longitudinal Agent draft and compact user-model projection | `agent_workspace.py`, `professional.py`, `agent_user_model` preference and Android optional result rendering | three-stage boundaries, clarification, stale-context, local revision, claim evidence and Portable round-trip tests |
+| Longitudinal Agent draft and compact user-model projection | `agent_workspace.py`, `agent_intelligence.py`, `professional.py`, goal/user/meal projections and Android result rendering | mandatory stage receipts, clarification, stale-context, local revision, deterministic intent coverage, claim evidence and Portable round-trip tests |
 | Native Android offline client and optional background sync | `android/` Compose/Room/WorkManager application | JVM tests, Room migrations, release lint/APK/AAB, emulator instrumentation and real Python↔Android E2EE test |
-| User-selected AI providers remain device-local | Python standard-library provider layer and Android `AiClient.kt`/`SecretVault.kt` | Provider payload/validation tests; secret exclusions; DeepSeek photo rejection |
+| User-selected AI providers remain device-local | Python standard-library provider layer and device-local secret storage | Provider payload/validation tests; secret exclusions; DeepSeek photo rejection; Android daily generation is not a publication path |
 | Release and supply-chain readiness | `uv.lock`, Gradle lock, release workflow, SBOM/checksum/signing gates, license/privacy/threat docs | dependency audit, lock/checksum verifier, release-data scan and native runner workflows |
 
-## Executed local acceptance
+## Verification boundary
 
-- `./test.ps1`: 112 tests pass; 26 optional-dependency tests skip by design.
-- Full Python environment: 112 tests run, 111 pass; only the environment-gated PostgreSQL URL test skips locally.
-- Android: 11 JVM tests; release lint, unsigned APK/AAB, debug instrumentation and 10 real-service cross-client instrumentation tests pass.
-- Real cross-client run proves Python offline write → Android and Android offline write → fresh Python client, then scans the server database/WAL/backup, blob volume and server log for synthetic meal content, password, recovery string and API key with zero matches.
-- Windows PyInstaller clean build and packaged `--smoke-test` pass.
-- Domain/OpenAPI/lock/dependency/release-data/compile checks, Alembic fresh/legacy upgrade, YAML parsing, `pip-audit` and `git diff --check` pass.
+This matrix defines the required multi-device coverage; it is not a claim about the latest branch run. Exact test counts and platform results become stale as the product changes, so current verification must come from the latest GitHub Actions run and the newest entry at the top of `DEVELOPMENT.md`. Historical counts must not be used to infer that a current change has passed.
 
 ## External release gates
 

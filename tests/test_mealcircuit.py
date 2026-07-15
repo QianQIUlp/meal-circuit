@@ -561,6 +561,10 @@ class MealCircuitTest(unittest.TestCase):
         self.assertEqual(completed["status"], "completed")
         self.assertEqual(payloads[0]["tool_choice"], {"type": "tool", "name": "submit_mealcircuit_result"})
         self.assertEqual(payloads[0]["tools"][0]["input_schema"]["type"], "object")
+        self.assertIn("core_advice", payloads[0]["system"])
+        self.assertIn("训练、饥饿、睡眠、肠胃", payloads[0]["system"])
+        advice_schema = payloads[0]["tools"][0]["input_schema"]["properties"]["core_advice"]
+        self.assertIn("执行良好时应明确肯定", advice_schema["description"])
 
     def test_deepseek_generate_material_uses_chat_json_mode_and_rejects_photo(self):
         task = service.create_material_task("鸡蛋 2 个")
@@ -666,7 +670,7 @@ class MealCircuitTest(unittest.TestCase):
         plan_id = first["plan_version_id"]
         second_result = daily_review_result(today)
         second_result["one_line_review"] = "修正尚未执行的生成内容。"
-        second = service.submit_daily_review(today, second_result)
+        second = service.complete_daily_review(today, second_result)
         self.assertEqual(second["result_version"], 1)
         self.assertEqual(second["plan_version_id"], plan_id)
         self.assertEqual(second["history"], [])
@@ -678,7 +682,8 @@ class MealCircuitTest(unittest.TestCase):
         self.assertEqual(service.get_daily_review(today)["revision_policy"]["mode"], "locked")
         third_result = daily_review_result(today)
         third_result["one_line_review"] = "执行反馈后修订必须形成正式版本。"
-        third = service.submit_daily_review(today, third_result)
+        service.requeue_daily_review(today, "执行反馈后需要形成正式修订")
+        third = service.complete_daily_review(today, third_result)
         self.assertEqual(third["result_version"], 2)
         self.assertEqual(len(third["history"]), 1)
         with connect() as conn:
@@ -1048,6 +1053,21 @@ class MealCircuitTest(unittest.TestCase):
             service.complete_daily_review(today, wrong_date)
         self.assertEqual(service.complete_daily_review(today, home_cooking_review_result(today))["status"], "completed")
 
+    def test_home_cooking_does_not_invent_shopping_or_reuse_to_fill_structure(self):
+        settings_path = Path(self.temp.name) / "settings.json"
+        settings_path.write_text(
+            json.dumps({**TEST_SETTINGS, "home_cooking": HOME_COOKING}, ensure_ascii=False), encoding="utf-8"
+        )
+        today = date.today().isoformat()
+        service.add_daily_record(today, "家里现有食材足够，明天用完，不需要采购。")
+        result = home_cooking_review_result(today)
+        result["tomorrow_menu"]["shopping_list"] = []
+        result["tomorrow_menu"]["online_options"] = []
+        result["tomorrow_menu"]["reuse_plan"] = {"horizon_days": 3, "items": []}
+        completed = service.complete_daily_review(today, result)
+        self.assertEqual([], completed["result_json"]["tomorrow_menu"]["shopping_list"])
+        self.assertEqual([], completed["result_json"]["tomorrow_menu"]["reuse_plan"]["items"])
+
     def test_lunch_and_dinner_home_cooking_have_independent_cards_constraints_and_history(self):
         settings_path = Path(self.temp.name) / "settings.json"
         settings_path.write_text(
@@ -1321,27 +1341,254 @@ class WebAppTest(unittest.TestCase):
                     raise
         raise AssertionError("unreachable")
 
+    @staticmethod
+    def multipart_form(fields, files=()):
+        boundary = "----MealCircuitTestBoundary"
+        parts = []
+        for name, value in fields:
+            parts.append(
+                f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n{value}\r\n'.encode()
+            )
+        for name, filename, content_type, data in files:
+            parts.append(
+                f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"; filename="{filename}"\r\n'
+                f'Content-Type: {content_type}\r\n\r\n'.encode() + data + b"\r\n"
+            )
+        parts.append(f"--{boundary}--\r\n".encode())
+        body = b"".join(parts)
+        return body, {
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+            "Content-Length": str(len(body)),
+        }
+
+    def test_plan_feedback_preserves_inputs_and_photo_after_missing_reason(self):
+        review_date = date.today().isoformat()
+        service.add_daily_record(review_date, "今天按计划记录实际饮食。")
+        service.complete_daily_review(review_date, daily_review_result(review_date))
+        plan_date = (date.today() + timedelta(days=1)).isoformat()
+        plan = adaptive.get_plan_for_date(plan_date)
+        meal = plan["menu"]["meals"][0]
+        item_id = meal["plan_item_id"]
+        images = [
+            b"\x89PNG\r\n\x1a\nmeal-feedback-one",
+            b"\x89PNG\r\n\x1a\nmeal-feedback-two",
+        ]
+
+        body, headers = self.multipart_form(
+            [
+                ("expected_version", "0"),
+                ("status", "modified"),
+                ("satiety", "not_enough"),
+                ("actual_text", "临时多吃了一碗饭"),
+            ],
+            [
+                ("photo", "actual-one.png", "image/png", images[0]),
+                ("photo", "actual-two.png", "image/png", images[1]),
+            ],
+        )
+        status, _, raw = self.request(
+            "POST", f"/plans/{plan_date}/{item_id}/feedback", body, headers
+        )
+        page = raw.decode("utf-8")
+        self.assertEqual(400, status)
+        self.assertIn("调整或未执行时必须选择至少一个原因", page)
+        self.assertIn('<option value="modified" selected>', page)
+        self.assertIn('<option value="not_enough" selected>', page)
+        self.assertIn("临时多吃了一碗饭", page)
+        self.assertIn('<details class="feedback-box" open>', page)
+        self.assertIsNone(adaptive.get_plan_for_date(plan_date)["feedback"].get(item_id))
+
+        photo_tasks = service.list_tasks()
+        self.assertEqual(2, len(photo_tasks))
+        self.assertEqual({"photo"}, {task["type"] for task in photo_tasks})
+        self.assertEqual(set(images), {resolve_data_path(task["image_path"]).read_bytes() for task in photo_tasks})
+        for photo_task in photo_tasks:
+            self.assertIn(f'name="photo_task_ids" value="{photo_task["id"]}"', page)
+            self.assertIn(f'/media/{Path(photo_task["image_path"]).name}', page)
+        self.assertIn('type="file" name="photo" accept="image/jpeg,image/png,image/gif,image/webp" multiple', page)
+
+        corrected_body, corrected_headers = self.multipart_form([
+            ("expected_version", "0"),
+            ("status", "modified"),
+            ("satiety", "not_enough"),
+            ("reason_codes", "schedule_change"),
+            ("reason_codes", "hunger_mismatch"),
+            ("actual_text", "临时多吃了一碗饭"),
+            *(("photo_task_ids", task["id"]) for task in photo_tasks),
+        ])
+        status, response_headers, _ = self.request(
+            "POST", f"/plans/{plan_date}/{item_id}/feedback", corrected_body, corrected_headers
+        )
+        self.assertEqual(303, status)
+        self.assertEqual(f"/plans/{plan_date}", response_headers["Location"])
+        feedback = adaptive.get_plan_for_date(plan_date)["feedback"][item_id]
+        self.assertEqual(["schedule_change", "hunger_mismatch"], feedback["reason_codes_json"])
+        self.assertEqual("not_enough", feedback["outcome_json"]["satiety"])
+        self.assertEqual(
+            {task["id"] for task in photo_tasks},
+            set(feedback["outcome_json"]["photo_task_ids"]),
+        )
+        self.assertIn(feedback["outcome_json"]["photo_task_id"], feedback["outcome_json"]["photo_task_ids"])
+        for photo_task in photo_tasks:
+            links = adaptive.task_evidence_links(photo_task["id"])
+            self.assertEqual("consumed", links[0]["role"])
+            self.assertEqual(plan_date, links[0]["observed_date"])
+
+        additional_image = b"\x89PNG\r\n\x1a\nmeal-feedback-three"
+        append_body, append_headers = self.multipart_form(
+            [
+                ("expected_version", str(feedback["version"])),
+                ("status", "modified"),
+                ("satiety", "not_enough"),
+                ("reason_codes", "schedule_change"),
+                ("actual_text", "临时多吃了一碗饭"),
+                *(("photo_task_ids", task_id) for task_id in feedback["outcome_json"]["photo_task_ids"]),
+            ],
+            [("photo", "actual-three.png", "image/png", additional_image)],
+        )
+        status, _, _ = self.request(
+            "POST", f"/plans/{plan_date}/{item_id}/feedback", append_body, append_headers
+        )
+        self.assertEqual(303, status)
+        updated_feedback = adaptive.get_plan_for_date(plan_date)["feedback"][item_id]
+        self.assertEqual(3, len(updated_feedback["outcome_json"]["photo_task_ids"]))
+        self.assertEqual(
+            set(images + [additional_image]),
+            {
+                resolve_data_path(service.get_task(task_id)["image_path"]).read_bytes()
+                for task_id in updated_feedback["outcome_json"]["photo_task_ids"]
+            },
+        )
+
+        status, _, app_script = self.request("GET", "/assets/ui/app.js")
+        self.assertEqual(200, status)
+        self.assertIn("请选择这顿发生变化的原因", app_script.decode("utf-8"))
+
+    def test_plan_feedback_text_limit_stays_on_the_plan_with_inputs(self):
+        review_date = date.today().isoformat()
+        service.add_daily_record(review_date, "今天按计划记录实际饮食。")
+        service.complete_daily_review(review_date, daily_review_result(review_date))
+        plan_date = (date.today() + timedelta(days=1)).isoformat()
+        plan = adaptive.get_plan_for_date(plan_date)
+        meal = plan["menu"]["meals"][0]
+        item_id = meal["plan_item_id"]
+        actual_text = "长" * 2001
+        body, headers = self.multipart_form([
+            ("expected_version", "0"),
+            ("status", "followed"),
+            ("satiety", "too_much"),
+            ("actual_text", actual_text),
+        ])
+
+        status, _, raw = self.request(
+            "POST", f"/plans/{plan_date}/{item_id}/feedback", body, headers
+        )
+        page = raw.decode("utf-8")
+        self.assertEqual(400, status)
+        self.assertIn("“实际怎么吃的”最多填写 2000 字，请精简后再保存。", page)
+        self.assertIn('<option value="followed" selected>', page)
+        self.assertIn('<option value="too_much" selected>', page)
+        self.assertIn(f'<textarea name="actual_text" maxlength="2000">{actual_text}</textarea>', page)
+        self.assertIn('<details class="feedback-box" open>', page)
+        self.assertNotIn('href="/">返回总览', page)
+        self.assertIsNone(adaptive.get_plan_for_date(plan_date)["feedback"].get(item_id))
+
+    def test_today_intake_stays_visible_and_can_be_revised(self):
+        record_date = date.today().isoformat()
+        original_text = "午餐临时外食，训练后比平时更饿。"
+        payload = urllib.parse.urlencode({
+            "record_date": record_date,
+            "text": original_text,
+        }).encode()
+        status, headers, _ = self.request(
+            "POST", "/agent/intake", payload,
+            {"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        self.assertEqual(303, status)
+        self.assertEqual("/#record", headers["Location"])
+
+        records = service.list_daily_records(record_date)
+        self.assertEqual(1, len(records))
+        record = records[0]
+        status, _, raw = self.request("GET", "/")
+        page = raw.decode("utf-8")
+        self.assertEqual(200, status)
+        self.assertNotIn("今天已记下", page)
+        self.assertIn(original_text, page)
+        self.assertNotIn("修改这条内容", page)
+        self.assertIn(
+            f'<form class="agent-intake-form is-saved" method="post" action="/agent/intake/{record["id"]}/edit">',
+            page,
+        )
+        self.assertIn(
+            f'<textarea class="agent-intake-text" name="text" maxlength="4000" required>{original_text}</textarea>',
+            page,
+        )
+        self.assertEqual(1, page.count('name="text"'))
+
+        revised_text = "午餐改为在家吃，训练后加了一份主食。"
+        revision_payload = urllib.parse.urlencode({
+            "record_date": record_date,
+            "text": revised_text,
+        }).encode()
+        status, headers, _ = self.request(
+            "POST", f'/agent/intake/{record["id"]}/edit', revision_payload,
+            {"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        self.assertEqual(303, status)
+        self.assertEqual("/#record", headers["Location"])
+        updated = service.list_daily_records(record_date)
+        self.assertEqual(record["id"], updated[0]["id"])
+        self.assertEqual(revised_text, updated[0]["raw_input"])
+
+        with connect() as conn:
+            revision_count = conn.execute(
+                "SELECT COUNT(*) FROM domain_revisions WHERE entity_id=?", (record["id"],)
+            ).fetchone()[0]
+            event = conn.execute(
+                "SELECT input_text,event_kind,classification_json FROM agent_workspace_events WHERE event_date=?",
+                (record_date,),
+            ).fetchone()
+        self.assertEqual(2, revision_count)
+        self.assertEqual(revised_text, event["input_text"])
+        self.assertEqual("unclassified", event["event_kind"])
+        self.assertEqual(record["id"], json.loads(event["classification_json"])["record_id"])
+
+        status, _, raw = self.request("GET", "/")
+        revised_page = raw.decode("utf-8")
+        self.assertEqual(200, status)
+        self.assertIn(revised_text, revised_page)
+        self.assertNotIn(original_text, revised_page)
+
     def test_pages_and_material_form(self):
-        for path in ("/", "/daily", "/history", "/tasks/photo", "/tasks/material", "/tasks", "/ai", "/sync", "/foods", "/overview"):
+        for path in ("/", "/plans", "/me", "/history", "/tasks/photo", "/tasks/material", "/tasks", "/ai", "/sync", "/foods", "/overview"):
             status, _, body = self.request("GET", path)
             self.assertEqual(status, 200)
             self.assertIn(b"MealCircuit", body)
             if path == "/sync":
                 self.assertIn("同步服务 URL", body.decode("utf-8"))
+        for old_path, destination in (
+            ("/capture", "/#record"),
+            ("/daily", "/plans"),
+            ("/insights", "/me#progress"),
+        ):
+            status, headers, _ = self.request("GET", old_path)
+            self.assertEqual(status, 303)
+            self.assertEqual(headers["Location"], destination)
         status, home_headers, home = self.request("GET", "/")
         decoded_home = home.decode("utf-8")
-        for label in ("今日结论", "今日状态", "明日计划", "处理队列", "照片任务", "原材料"):
+        for label in ("今天感觉怎么样？", "今天有什么变化？", "今天的状态", "今天", "计划", "我的", "记一笔"):
             self.assertIn(label, decoded_home)
         self.assertIn('class="app-sidebar"', decoded_home)
         self.assertIn('aria-current="page"', decoded_home)
+        self.assertEqual(3, decoded_home.count('class="nav-link"'))
         self.assertIn('href="/assets/ui/app.css?v=', decoded_home)
         self.assertIn('rel="icon" href="/assets/ui/favicon.svg"', decoded_home)
         self.assertIn('src="/assets/ui/theme-init.js?v=', decoded_home)
         self.assertIn('data-theme-toggle', decoded_home)
         self.assertEqual(1, decoded_home.count("<h1"))
-        self.assertIn('href="/history"', decoded_home)
-
-        self.assertNotIn("最近任务", decoded_home)
+        for hidden_copy in ("建议生成", "洞察", "学习确认", "Three-stage planning", "AgentContextV2", "查看原有今日总览"):
+            self.assertNotIn(hidden_copy, decoded_home)
         self.assertIn("script-src 'self'", home_headers["Content-Security-Policy"])
         status, headers, css = self.request("GET", "/assets/ui/app.css")
         self.assertEqual(status, 200)
@@ -1359,8 +1606,10 @@ class WebAppTest(unittest.TestCase):
         self.assertIn(b"mealcircuit.theme", theme_script)
         status, _, _ = self.request("GET", "/assets/ui/%2e%2e/server.py")
         self.assertEqual(status, 404)
-        status, _, daily = self.request("GET", "/daily")
-        self.assertIn("尚未记录", daily.decode("utf-8"))
+        status, _, app_script = self.request("GET", "/assets/ui/app.js")
+        self.assertEqual(status, 200)
+        self.assertIn(b"sidebarScrollTop", app_script)
+        self.assertIn(b'aria-current="page"', app_script)
         body = "materials=" + urllib.parse.quote("鸡胸肉 300g")
         status, headers, _ = self.request("POST", "/tasks/material", body.encode(), {"Content-Type": "application/x-www-form-urlencoded"})
         self.assertEqual(status, 303)
@@ -1398,7 +1647,7 @@ class WebAppTest(unittest.TestCase):
         self.assertEqual(200, status)
         self.assertIn("application/json", headers["Content-Type"])
         context = json.loads(raw)
-        self.assertEqual("AgentContextV2", context["context_schema"])
+        self.assertEqual("AgentContextV3", context["context_schema"])
 
         status, _, raw_state = self.request("GET", f"/agent/state/{review_date}")
         self.assertEqual(200, status)
@@ -1415,15 +1664,18 @@ class WebAppTest(unittest.TestCase):
         self.assertIsNotNone(plan)
 
         for path, label in (
-            ("/", "今天只处理下一步"), ("/capture", "记录发生了什么"),
-            (f"/plans/{plan_date}", "执行计划"), (f"/questions/{plan_date}", "只补齐会改变行动的信息"),
-            ("/learning", "由你确认，系统才学习"), ("/inventory", "食材库存与临期状态"),
-            ("/profile", "目标、边界与来源"), ("/insights", "证据覆盖与校准资格"),
-            ("/data", "备份、恢复与设备迁移"),
+            ("/", "今天有什么变化"), ("/plans", "计划"), ("/me", "目标与饮食偏好"),
+            (f"/plans/{plan_date}", "的安排"), (f"/questions/{plan_date}", "只会询问真正影响行动的信息"),
+            ("/learning", "MealCircuit了解的你"), ("/inventory", "家里有什么"),
+            ("/profile", "目标与饮食偏好"), ("/data", "备份与迁移"),
         ):
             status, _, page = self.request("GET", path)
             self.assertEqual(200, status, path)
             self.assertIn(label, page.decode("utf-8"))
+        for old_path, destination in (("/capture", "/#record"), ("/insights", "/me#progress")):
+            status, headers, _ = self.request("GET", old_path)
+            self.assertEqual(303, status, old_path)
+            self.assertEqual(destination, headers["Location"])
 
         status, export_headers, bundle = self.request("GET", "/data/export")
         self.assertEqual(200, status)
@@ -1462,7 +1714,7 @@ class WebAppTest(unittest.TestCase):
             {"Content-Type": "application/x-www-form-urlencoded"},
         )
         self.assertEqual(303, status)
-        self.assertEqual("/insights", headers["Location"])
+        self.assertEqual("/me#progress", headers["Location"])
         self.assertEqual(79.4, personalization.list_metrics("weight_kg")[0]["value_json"])
 
         payload = urllib.parse.urlencode({"name": "小白菜", "amount_text": "约一顿", "expires_on": plan_date}).encode()
@@ -1498,8 +1750,9 @@ class WebAppTest(unittest.TestCase):
         self.assertEqual(303, status)
         status, _, learning_page = self.request("GET", "/learning")
         self.assertEqual(200, status)
-        self.assertIn("没有待确认的学习候选", learning_page.decode("utf-8"))
-        self.assertIn("晚餐主动准备时间最多 15 分钟。", learning_page.decode("utf-8"))
+        self.assertIn("MealCircuit了解的你", learning_page.decode("utf-8"))
+        self.assertNotIn("置信度", learning_page.decode("utf-8"))
+        self.assertIn("晚餐主动准备时间最多 15 分钟。", [item["statement"] for item in adaptive.list_rules()])
 
         experiment_payload = urllib.parse.urlencode({
             "variable_key": "dinner_active_minutes", "action": "晚餐主动时间控制在15分钟",
@@ -1686,7 +1939,7 @@ class WebAppTest(unittest.TestCase):
         status, _, page = self.request("GET", "/ai")
         decoded = page.decode("utf-8")
         self.assertEqual(status, 200)
-        self.assertIn("API Key 接入", decoded)
+        self.assertIn("智能规划设置", decoded)
         self.assertIn("启用本次运行的 API Key 模式", decoded)
         self.assertNotIn("secret-runtime-key", decoded)
 
@@ -1717,7 +1970,7 @@ class WebAppTest(unittest.TestCase):
         decoded_configured = configured.decode("utf-8")
         self.assertEqual(status, 200)
         self.assertIn("已启用", decoded_configured)
-        self.assertIn("MEALCIRCUIT_DEEPSEEK_API_KEY 已设置", decoded_configured)
+        self.assertIn("当前使用 deepseek", decoded_configured)
         self.assertNotIn("secret-runtime-key", decoded_configured)
 
         status, headers, _ = self.request("POST", "/ai/disable", b"", {"Content-Length": "0"})
@@ -1739,36 +1992,33 @@ class WebAppTest(unittest.TestCase):
         form = urllib.parse.urlencode({"record_date": review_date, "raw_input": "今天蛋白很多"}).encode()
         status, headers, _ = self.request("POST", "/records", form, {"Content-Type": "application/x-www-form-urlencoded"})
         self.assertEqual(status, 303)
-        self.assertEqual(headers["Location"], f"/reviews/{review_date}")
-        pending_status, _, pending_body = self.request("GET", headers["Location"])
+        self.assertEqual(headers["Location"], "/#record")
+        pending_status, _, pending_body = self.request("GET", f"/reviews/{review_date}")
         self.assertEqual(pending_status, 200)
-        self.assertIn("等待 Agent 生成核心建议和次日菜单", pending_body.decode("utf-8"))
-        daily_pending_status, _, daily_pending = self.request("GET", "/daily")
-        self.assertEqual(daily_pending_status, 200)
-        decoded_daily_pending = daily_pending.decode("utf-8")
-        self.assertIn("等待 Agent 生成核心建议和明日菜单", decoded_daily_pending)
-        self.assertIn(f'action="/reviews/{review_date}/generate"', decoded_daily_pending)
-        self.assertIn("用 API Key 生成今日建议", decoded_daily_pending)
+        self.assertIn("复盘还没有准备好", pending_body.decode("utf-8"))
+        daily_status, daily_headers, _ = self.request("GET", "/daily")
+        self.assertEqual(daily_status, 303)
+        self.assertEqual(daily_headers["Location"], "/plans")
         result = daily_review_result(review_date, unsafe=True)
         result["priority_food_decisions"] = [{"food_id": priority_food["id"], "decision": "use", "reason": "早餐主食优先"}]
         service.complete_daily_review(review_date, result)
         status, _, detail = self.request("GET", f"/reviews/{review_date}")
         decoded = detail.decode("utf-8")
         self.assertEqual(status, 200)
-        for label in ("核心建议", "明日计划", "蛋白目标", "早餐", "午餐", "晚餐", "条件加餐", "训练日调整", "肠胃异常调整"):
+        for label in ("接下来最重要", "明天怎么吃", "蛋白目标", "早餐", "午餐", "晚餐", "条件加餐", "训练日调整", "肠胃异常调整"):
             self.assertIn(label, decoded)
-        self.assertIn("优先食品裁决", decoded)
+        self.assertIn("食材安排", decoded)
         self.assertIn("优先全麦面包", decoded)
         self.assertIn(f'/foods/{priority_food["id"]}', decoded)
         self.assertIn("&lt;script&gt;推断&lt;/script&gt;", decoded)
         self.assertNotIn("<script>推断</script>", decoded)
-        status, _, daily = self.request("GET", "/daily")
+        status, _, daily = self.request("GET", "/plans")
         self.assertEqual(status, 200)
-        self.assertIn("今日建议与明日菜单", daily.decode("utf-8"))
+        self.assertIn("明天", daily.decode("utf-8"))
         status, _, history = self.request("GET", "/history")
         decoded_history = history.decode("utf-8")
         self.assertEqual(status, 200)
-        self.assertIn("历史建议", decoded_history)
+        self.assertIn("过去的安排", decoded_history)
         self.assertIn("review-card", decoded_history)
         self.assertIn(review_date, decoded_history)
         self.assertIn(f'/reviews/{review_date}', decoded_history)
@@ -1865,8 +2115,21 @@ class WebAppTest(unittest.TestCase):
         status, _, hub = self.request("GET", f"/check-ins/{today}")
         decoded = hub.decode("utf-8")
         self.assertEqual(status, 200)
-        for label in ("每日状态", "体重", "训练", "饥饿与饱腹", "睡眠", "肠胃反应", "0/5"):
+        for label in ("今天的状态", "体重", "训练", "饥饿与饱腹", "睡眠", "肠胃反应"):
             self.assertIn(label, decoded)
+        self.assertNotIn("0/5", decoded)
+        status, _, today_question = self.request("GET", f"/check-ins/{today}/training?return_to=today")
+        self.assertEqual(status, 200)
+        self.assertIn('name="return_to" value="today"', today_question.decode("utf-8"))
+        return_payload = urllib.parse.urlencode({"expected_version": "0", "return_to": "today"}).encode()
+        status, response_headers, _ = self.request(
+            "POST", f"/check-ins/{today}/training/skip", return_payload,
+            {"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        self.assertEqual(status, 303)
+        self.assertEqual(
+            response_headers["Location"], f"/check-ins/{today}/weight?return_to=today"
+        )
         status, _, question = self.request("GET", f"/check-ins/{today}/weight")
         self.assertEqual(status, 200)
         self.assertIn("今天测体重了吗", question.decode("utf-8"))
@@ -1891,7 +2154,7 @@ class WebAppTest(unittest.TestCase):
         self.assertIn("72.4 kg", completed_hub.decode("utf-8"))
         status, _, settings = self.request("GET", "/check-ins/settings")
         self.assertEqual(status, 200)
-        self.assertIn("每日状态设置", settings.decode("utf-8"))
+        self.assertIn("今天状态的提问设置", settings.decode("utf-8"))
         rejected = urllib.parse.urlencode({"expected_version": "0"}).encode()
         status, _, response = self.request(
             "POST", f"/check-ins/{today}/gut/skip", rejected,
@@ -1899,6 +2162,63 @@ class WebAppTest(unittest.TestCase):
         )
         self.assertEqual(status, 400)
         self.assertIn("拒绝跨来源写入请求", response.decode("utf-8"))
+
+    def test_today_checkin_continues_through_questions_and_modules(self):
+        today = date.today().isoformat()
+        service.skip_checkin_module(today, "weight", 0)
+        headers = {"Content-Type": "application/x-www-form-urlencoded"}
+
+        trained = urllib.parse.urlencode({
+            "question_id": "trained",
+            "expected_version": "0",
+            "value": "no",
+            "return_to": "today",
+        }).encode()
+        status, response_headers, _ = self.request(
+            "POST", f"/check-ins/{today}/training/answer", trained, headers
+        )
+        self.assertEqual(303, status)
+        self.assertEqual(
+            f"/check-ins/{today}/training?q=rest_reason&return_to=today",
+            response_headers["Location"],
+        )
+
+        rest_reason = urllib.parse.urlencode({
+            "question_id": "rest_reason",
+            "expected_version": "0",
+            "value": "rest_day",
+            "return_to": "today",
+        }).encode()
+        status, response_headers, _ = self.request(
+            "POST", f"/check-ins/{today}/training/answer", rest_reason, headers
+        )
+        self.assertEqual(303, status)
+        self.assertEqual(
+            f"/check-ins/{today}/hunger?return_to=today",
+            response_headers["Location"],
+        )
+
+        for module_key, next_module in (("hunger", "sleep"), ("sleep", "gut")):
+            skip = urllib.parse.urlencode({
+                "expected_version": "0", "return_to": "today",
+            }).encode()
+            status, response_headers, _ = self.request(
+                "POST", f"/check-ins/{today}/{module_key}/skip", skip, headers
+            )
+            self.assertEqual(303, status)
+            self.assertEqual(
+                f"/check-ins/{today}/{next_module}?return_to=today",
+                response_headers["Location"],
+            )
+
+        final_skip = urllib.parse.urlencode({
+            "expected_version": "0", "return_to": "today",
+        }).encode()
+        status, response_headers, _ = self.request(
+            "POST", f"/check-ins/{today}/gut/skip", final_skip, headers
+        )
+        self.assertEqual(303, status)
+        self.assertEqual("/#today-state", response_headers["Location"])
 
     def test_loopback_origin_policy_and_real_post_actions(self):
         port = self.port
