@@ -124,7 +124,8 @@ FEEDBACK_LABELS = {
     "not_applicable": "今天不适用",
 }
 REASON_LABELS = {
-    "missing_ingredient": "缺少食材", "not_enough_time": "时间不足", "too_complex": "步骤太复杂",
+    "missing_ingredient": "缺少食材", "too_expensive": "价格不合适",
+    "not_enough_time": "时间不足", "too_complex": "步骤太复杂",
     "ate_out": "临时外食", "did_not_want_it": "当时不想吃", "hunger_mismatch": "饥饿或份量不匹配",
     "gut_change": "肠胃状态变化", "schedule_change": "日程变化", "other": "其他",
 }
@@ -186,11 +187,11 @@ def render_setup_start(status: dict) -> str:
     if session:
         action = f'<a class="button" href="/setup/{esc(session["current_step"])}">继续初始化</a>'
     else:
-        action = '<form method="post" action="/setup/start"><button type="submit">开始建立目标契约</button></form>'
+        action = '<form method="post" action="/setup/start"><button type="submit">开始设置</button></form>'
     return f'''<section class="setup-shell panel"><h1>先让MealCircuit了解你的目标</h1>
-    <p class="lede">初始化会确认你想达成什么、安全边界、训练与生活约束。答案逐步保存在本机，可随时退出继续；没有确认前不会生成处方型计划。</p>
-    <div class="setup-principles"><p><strong>目标可修改</strong><br><span class="muted">修改只影响之后的安排，过去的计划保持原样。</span></p><p><strong>未知保持未知</strong><br><span class="muted">不知道或暂不回答不会被当成否定。</span></p><p><strong>安全许可先于生成</strong><br><span class="muted">专业指导模式只执行有来源的约束。</span></p></div>{action}
-    <p class="muted small">原有记录、照片和库存入口始终可用；初始化只限制生成和提交。</p></section>'''
+    <p class="lede">我们会先了解你想达成什么、平时怎样吃、怎样训练，以及哪些情况需要特别注意。答案只保存在本机，可以随时退出后继续。</p>
+    <div class="setup-principles"><p><strong>目标可以随时改</strong><br><span class="muted">新的选择只影响之后的安排，过去的记录不会变。</span></p><p><strong>不确定也没关系</strong><br><span class="muted">暂时不知道的内容可以跳过，我们不会替你猜。</span></p><p><strong>先照顾健康需要</strong><br><span class="muted">有特殊健康情况时，只会在可靠指导允许的范围内提供安排。</span></p></div>{action}
+    <p class="muted small">即使还没设置完，你也可以继续记录饮食、照片和库存。</p></section>'''
 
 
 def render_setup_step(session: dict, step: str, *, error: str = "", override: dict | None = None) -> str:
@@ -259,7 +260,31 @@ def render_setup_step(session: dict, step: str, *, error: str = "", override: di
             + "</select></div>"
             for key, name in (("breakfast", "早餐"), ("lunch", "午餐"), ("dinner", "晚餐"))
         )
-        fields = f'''<fieldset class="form-section"><legend>逐餐准备标准</legend><p class="muted">这些选择会成为你的长期习惯；选择在家下厨的餐次会分别生成一人份执行卡。</p><div class="row">{mode_fields}</div></fieldset><label for="meal-environment">典型用餐环境</label><input id="meal-environment" name="meal_environment" required value="{esc(value.get('meal_environment',''))}" placeholder="例如：午餐和晚餐在家做"><label for="portion-method">希望怎样表达份量</label><input id="portion-method" name="portion_method" required value="{esc(value.get('portion_method','手掌与拳头份量法'))}"><div class="row"><div><label for="cooking-time">每个自炊餐次可用时间（分钟）</label><input id="cooking-time" type="number" min="10" max="60" name="cooking_time_minutes" value="{esc(value.get('cooking_time_minutes',25))}"></div><div><label for="question-budget">每天最多主动问几题</label><input id="question-budget" type="number" min="0" max="5" name="question_budget" value="{esc(value.get('question_budget',2))}"></div></div><label for="equipment">可用厨具（逗号分隔）</label><input id="equipment" name="equipment" value="{esc(', '.join(value.get('equipment') or []))}" placeholder="例如：炒锅, 电饭煲"><label for="exclusions">排除食品（逗号分隔）</label><input id="exclusions" name="food_exclusions" value="{esc(', '.join(value.get('food_exclusions') or []))}"><label for="preferences">偏好（逗号分隔）</label><input id="preferences" name="preferences" value="{esc(', '.join(value.get('preferences') or []))}">'''
+        value_labels = {
+            "health": "健康与安全", "training": "训练与恢复", "satiety": "吃得饱",
+            "budget": "长期负担得起", "time": "不占用太多时间", "taste": "合口味",
+            "social": "保留社交弹性", "convenience": "足够方便",
+        }
+        non_negotiables = value.get("non_negotiables") or []
+        non_negotiable_fields = "".join(
+            f'<label class="choice-row"><input type="checkbox" name="non_negotiables" value="{key}"'
+            f'{_checked(non_negotiables, key)}><span>{label}</span></label>'
+            for key, label in value_labels.items()
+        )
+        priorities = value.get("priority_tradeoffs") or []
+        priority_selects = "".join(
+            f'<div><label for="priority-{index}">第{index}优先</label><select id="priority-{index}" name="priority_tradeoff">'
+            '<option value="">暂不指定</option>'
+            + "".join(
+                f'<option value="{key}"{_selected(priorities[index - 1] if len(priorities) >= index else "", key)}>{label}</option>'
+                for key, label in value_labels.items()
+            )
+            + '</select></div>'
+            for index in range(1, 4)
+        )
+        recording = value.get("recording_intensity", "light")
+        followup = value.get("followup_intensity", "only_when_needed")
+        fields = f'''<fieldset class="form-section"><legend>逐餐准备标准</legend><p class="muted">这些选择会成为你的长期习惯；选择在家下厨的餐次会分别生成一人份执行卡。</p><div class="row">{mode_fields}</div></fieldset><fieldset class="form-section"><legend>哪些事情不能为了饮食目标被牺牲？</legend><p class="muted">这会在多个方案都可行时决定 MealCircuit 怎样取舍。</p><div class="option-grid">{non_negotiable_fields}</div></fieldset><fieldset class="form-section"><legend>发生冲突时，更看重什么？</legend><div class="row">{priority_selects}</div></fieldset><label for="meal-environment">典型用餐环境</label><input id="meal-environment" name="meal_environment" required value="{esc(value.get('meal_environment',''))}" placeholder="例如：午餐和晚餐在家做"><label for="portion-method">希望怎样表达份量</label><input id="portion-method" name="portion_method" required value="{esc(value.get('portion_method','手掌与拳头份量法'))}"><div class="row"><div><label for="cooking-time">每个自炊餐次可用时间（分钟）</label><input id="cooking-time" type="number" min="10" max="60" name="cooking_time_minutes" value="{esc(value.get('cooking_time_minutes',25))}"></div><div><label for="question-budget">每天最多主动问几题</label><input id="question-budget" type="number" min="0" max="3" name="question_budget" value="{esc(value.get('question_budget',2))}"></div></div><div class="row"><div><label for="recording-intensity">希望记录到什么程度</label><select id="recording-intensity" name="recording_intensity"><option value="light"{_selected(recording,'light')}>尽量少记</option><option value="standard"{_selected(recording,'standard')}>需要时补充</option><option value="detailed"{_selected(recording,'detailed')}>愿意记录更多细节</option></select></div><div><label for="followup-intensity">希望 MealCircuit 怎样追问</label><select id="followup-intensity" name="followup_intensity"><option value="only_when_needed"{_selected(followup,'only_when_needed')}>只问会改变安排的事</option><option value="balanced"{_selected(followup,'balanced')}>适度确认</option><option value="proactive"{_selected(followup,'proactive')}>主动帮我深挖</option></select></div></div><label for="equipment">可用厨具（逗号分隔）</label><input id="equipment" name="equipment" value="{esc(', '.join(value.get('equipment') or []))}" placeholder="例如：炒锅, 电饭煲"><label for="exclusions">排除食品（逗号分隔）</label><input id="exclusions" name="food_exclusions" value="{esc(', '.join(value.get('food_exclusions') or []))}"><label for="preferences">偏好（逗号分隔）</label><input id="preferences" name="preferences" value="{esc(', '.join(value.get('preferences') or []))}">'''
     else:
         preview = personalization.onboarding_preview(session["id"])
         safety = preview["safety"]
@@ -267,6 +292,18 @@ def render_setup_step(session: dict, step: str, *, error: str = "", override: di
         primary_goal = preview["goals"][0]
         primary_goal_label = primary_goal.get("custom_label") or GOAL_LABELS.get(primary_goal["type"], primary_goal["type"])
         selected_modes = preview["profile"]["constraints"]["meal_modes"]
+        contract_constraints = preview["profile"]["constraints"]
+        value_labels = {
+            "health": "健康与安全", "training": "训练与恢复", "satiety": "吃得饱",
+            "budget": "长期负担得起", "time": "不占用太多时间", "taste": "合口味",
+            "social": "保留社交弹性", "convenience": "足够方便",
+        }
+        non_negotiable_summary = "、".join(
+            value_labels.get(item, item) for item in contract_constraints.get("non_negotiables") or []
+        ) or "暂未指定"
+        tradeoff_summary = " → ".join(
+            value_labels.get(item, item) for item in contract_constraints.get("priority_tradeoffs") or []
+        ) or "根据当天情况协商"
         meal_mode_summary = " · ".join(
             f'{name}：{MEAL_PREPARATION_LABELS[selected_modes[key]]}'
             for key, name in (("breakfast", "早餐"), ("lunch", "午餐"), ("dinner", "晚餐"))
@@ -280,10 +317,10 @@ def render_setup_step(session: dict, step: str, *, error: str = "", override: di
             professional_target_fields = '''<fieldset class="form-section"><legend>专业指导中的蛋白范围（可选）</legend><p class="muted">只录入指导中明确给出的范围；来源和有效期沿用上一页的专业指导，不做系统推算。</p><div class="row"><label>下界 g/天<input type="number" step="0.1" name="professional_protein_low"></label><label>上界 g/天<input type="number" step="0.1" name="professional_protein_high"></label></div></fieldset>'''
         strategy_ack = '' if safety["mode"] in {"observation", "halt_and_refer"} or (safety["mode"] == "clinician_guided" and not safety["professional_guidance_current"]) else '<label class="choice-row"><input type="checkbox" name="accept_strategy" value="yes" required><span>我确认采用这份初始策略</span></label>'
         safety_label = SAFETY_MODE_LABELS.get(safety["mode"], "按当前健康边界安排")
-        fields = f'''<div class="contract-summary"><p><span class="status">需要注意</span><strong>{esc(safety_label)}</strong></p><p><span class="status">当前目标</span><strong>{esc(primary_goal_label)}</strong></p><p><span class="status">每天通常怎么吃</span><strong>{esc(meal_mode_summary)}</strong></p></div><h2>每天的蛋白质范围</h2><div class="option-list">{target_options}</div>{professional_target_fields}<input type="hidden" name="planning_mode" value="portion_guided"><label class="choice-row"><input type="checkbox" name="accept_profile" value="yes" required><span>上面的目标和注意事项符合我的情况</span></label>{strategy_ack}<div class="notice panel"><strong>还没有确定</strong><ul>{''.join(f'<li>{esc(note)}</li>' for note in assessment['notes']) or '<li>没有额外提示</li>'}</ul></div>'''
+        fields = f'''<div class="contract-summary"><p><span class="status">想达成</span><strong>{esc(primary_goal_label)}</strong></p><p><span class="status">为什么</span><strong>{esc(primary_goal.get('motivation') or '暂未填写')}</strong></p><p><span class="status">不能牺牲</span><strong>{esc(non_negotiable_summary)}</strong></p><p><span class="status">冲突时优先</span><strong>{esc(tradeoff_summary)}</strong></p><p><span class="status">每天通常怎么吃</span><strong>{esc(meal_mode_summary)}</strong></p><p><span class="status">需要注意</span><strong>{esc(safety_label)}</strong></p></div><h2>每天的蛋白质范围</h2><div class="option-list">{target_options}</div>{professional_target_fields}<input type="hidden" name="planning_mode" value="portion_guided"><label class="choice-row"><input type="checkbox" name="accept_profile" value="yes" required><span>上面的目标和注意事项符合我的情况</span></label>{strategy_ack}<div class="notice panel"><strong>还没有确定</strong><ul>{''.join(f'<li>{esc(note)}</li>' for note in assessment['notes']) or '<li>没有额外提示</li>'}</ul></div>'''
     action = "/setup/complete" if step == "review" else f"/setup/save/{step}"
     submit = "确认并进入工作台" if step == "review" else "保存并继续"
-    return f'''<section class="setup-shell"><div class="setup-progress"><p class="eyebrow">步骤 {index + 1} / {len(order)}</p><div class="progress-track" role="progressbar" aria-valuemin="1" aria-valuemax="{len(order)}" aria-valuenow="{index + 1}"><span class="progress-fill" style="width:{progress}%"></span></div></div>{error_html}<form class="panel setup-form" method="post" action="{action}">{hidden}<h1>{esc({"welcome":"隐私与边界","goals":"目标契约","baseline":"当前基线","safety":"安全边界","training":"训练需求","constraints":"现实约束","review":"确认理解"}[step])}</h1>{fields}<div class="form-actions"><button type="submit">{submit}</button></div></form></section>'''
+    return f'''<section class="setup-shell"><div class="setup-progress"><p class="eyebrow">步骤 {index + 1} / {len(order)}</p><div class="progress-track" role="progressbar" aria-valuemin="1" aria-valuemax="{len(order)}" aria-valuenow="{index + 1}"><span class="progress-fill" style="width:{progress}%"></span></div></div>{error_html}<form class="panel setup-form" method="post" action="{action}">{hidden}<h1>{esc({"welcome":"隐私与边界","goals":"你想达成什么","baseline":"你的基本情况","safety":"需要注意的健康情况","training":"平时怎样训练","constraints":"怎样安排才做得到","review":"确认理解"}[step])}</h1>{fields}<div class="form-actions"><button type="submit">{submit}</button></div></form></section>'''
 
 
 def _today_reference_points(state: dict, draft: dict, goal_label: str) -> list[str]:
@@ -455,6 +492,37 @@ def render_today_workspace(work_date: str) -> str:
             'placeholder="例如：明天中午外食，晚上自己做；今天训练后特别饿。"></textarea></label>'
             '<button>记下来</button></form>'
         )
+    today_evidence_ids = {item["id"] for item in saved_records}
+    today_evidence_ids.update(
+        item["id"] for item in adaptive.list_plan_feedback(work_date)
+    )
+    learned_today = next((
+        item for item in state.get("claims") or []
+        if item.get("status") == "active"
+        and item.get("risk_level") == "low"
+        and any(evidence.get("evidence_id") in today_evidence_ids for evidence in item.get("evidence") or [])
+    ), None)
+    learning_prompt = ""
+    if learned_today:
+        scope = learned_today.get("scope_json") or {}
+        if learned_today.get("claim_dimension") == "resource_constraint":
+            item_name = str(scope.get("item") or "高价食材")
+            learned_text = f"我会优先选择长期负担得起的食材，不再默认安排{item_name}。"
+        else:
+            learned_text = str(learned_today.get("statement") or "")
+        learning_prompt = (
+            '<section class="panel learning-nudge"><p class="muted">我从这次记录里记住了</p>'
+            f'<h2>{esc(learned_text)}</h2><div class="actions">'
+            f'<form method="post" action="/learning/claims/{esc(learned_today["id"])}/action">'
+            '<input type="hidden" name="action" value="confirm"><input type="hidden" name="return_to" value="/">'
+            '<button class="secondary">对</button></form>'
+            f'<form method="post" action="/learning/claims/{esc(learned_today["id"])}/action">'
+            '<input type="hidden" name="action" value="reject"><input type="hidden" name="return_to" value="/">'
+            '<button class="secondary">不对</button></form>'
+            f'<form method="post" action="/learning/claims/{esc(learned_today["id"])}/action">'
+            '<input type="hidden" name="action" value="today"><input type="hidden" name="return_to" value="/">'
+            '<button class="secondary">只适用于今天</button></form></div></section>'
+        )
 
     question_cards = []
     for question in state.get("questions") or []:
@@ -538,7 +606,7 @@ def render_today_workspace(work_date: str) -> str:
         '<p>吃了什么、训练感受、食欲、日程和临时安排都可以直接说。</p></div>'
         f'<div class="agent-intake-entry">{intake_forms}<div class="secondary-actions"><a href="/tasks/photo">上传照片</a>'
         '<a href="/tasks/material">补充食材</a><a href="/inventory">更新库存</a></div></div></section>'
-        f'{_render_today_state(work_date)}{clarification}{draft_html}'
+        f'{learning_prompt}{_render_today_state(work_date)}{clarification}{draft_html}'
     )
 
 
@@ -879,7 +947,7 @@ def render_learning_page() -> str:
         evidence = "".join(
             f'<li>{esc(value.get("excerpt") or "来自一次真实记录")}'
             f'<span class="muted small">{esc(value["observed_at"])}</span></li>'
-            for value in item.get("evidence") or []
+            for value in item.get("evidence") or [] if value.get("active", 1)
         ) or '<li class="muted">还没有可以展示的记录</li>'
         state_label = "想和你确认" if item["status"] == "pending_confirmation" else "正在用于安排"
         if item["risk_level"] == "high":
@@ -903,7 +971,7 @@ def render_learning_page() -> str:
             guidance = ""
         select = "".join(f'<option value="{key}">{label}</option>' for key, label in options)
         cards.append(
-            f'<article class="panel user-claim"><div class="section-header"><div><span class="subtle-label">{esc(state_label)}</span>'
+            f'<article class="panel user-claim" id="claim-{esc(item["id"])}"><div class="section-header"><div><span class="subtle-label">{esc(state_label)}</span>'
             f'<h2>{esc(item["statement"])}</h2></div></div>{guidance}'
             f'<details><summary>为什么这样认为</summary><ul class="plain-summary">{evidence}</ul></details>'
             f'<details><summary>调整这条理解</summary><form method="post" action="/learning/claims/{esc(item["id"])}/action">'
@@ -959,7 +1027,19 @@ def render_profile_page() -> str:
     else:
         mode_summary = "按当前个人设置安排"
     safety_text = SAFETY_MODE_LABELS.get(current["safety"]["mode"], "按当前健康边界安排")
-    return f'''<section class="section-header"><div><h1>目标与饮食偏好</h1><p class="muted">这里决定MealCircuit长期怎样为你安排；临时变化直接在“今天”里记录。</p></div><div class="actions"><form method="post" action="/setup/start"><button>修改设置</button></form><a class="button secondary" href="/me">返回我的</a></div></section><div class="grid"><section class="panel"><h2>你想达成什么</h2><ol>{goals}</ol></section><section class="panel"><h2>需要注意的边界</h2><p>{esc(safety_text)}</p></section><section class="panel"><h2>每天通常怎么吃</h2><p>{esc(mode_summary)}</p></section><section class="panel"><h2>当前营养目标</h2><ul class="profile-summary">{targets}</ul></section></div>'''
+    constraints = ((current.get("profile") or {}).get("profile_json") or {}).get("constraints") or {}
+    value_labels = {
+        "health": "健康与安全", "training": "训练与恢复", "satiety": "吃得饱",
+        "budget": "长期负担得起", "time": "不占用太多时间", "taste": "合口味",
+        "social": "保留社交弹性", "convenience": "足够方便",
+    }
+    non_negotiables = "、".join(
+        value_labels.get(item, item) for item in constraints.get("non_negotiables") or []
+    ) or "暂未指定"
+    priorities = " → ".join(
+        value_labels.get(item, item) for item in constraints.get("priority_tradeoffs") or []
+    ) or "根据当天情况协商"
+    return f'''<section class="section-header"><div><h1>目标与饮食偏好</h1><p class="muted">这里决定MealCircuit长期怎样为你安排；临时变化直接在“今天”里记录。</p></div><div class="actions"><form method="post" action="/setup/start"><button>修改设置</button></form><a class="button secondary" href="/me">返回我的</a></div></section><div class="grid"><section class="panel"><h2>你想达成什么</h2><ol>{goals}</ol></section><section class="panel"><h2>不能为了目标牺牲什么</h2><p>{esc(non_negotiables)}</p><p class="muted">发生冲突时：{esc(priorities)}</p></section><section class="panel"><h2>需要注意的边界</h2><p>{esc(safety_text)}</p></section><section class="panel"><h2>每天通常怎么吃</h2><p>{esc(mode_summary)}</p></section><section class="panel"><h2>当前营养目标</h2><ul class="profile-summary">{targets}</ul></section></div>'''
 
 
 def render_me_page() -> str:
@@ -1913,6 +1993,10 @@ class Handler(BaseHTTPRequestHandler):
         if step == "training":
             return {"types": values.get("types") or [], "frequency_per_week": int(last("frequency_per_week", "0"))}
         if step == "constraints":
+            priority_tradeoffs = [
+                item for item in values.get("priority_tradeoff") or [] if item
+            ]
+            priority_tradeoffs = list(dict.fromkeys(priority_tradeoffs))
             return {
                 "meal_environment": last("meal_environment"), "portion_method": last("portion_method"),
                 "meal_modes": {
@@ -1923,6 +2007,10 @@ class Handler(BaseHTTPRequestHandler):
                 "question_budget": int(last("question_budget", "2")),
                 "equipment": _csv(last("equipment")), "food_exclusions": _csv(last("food_exclusions")),
                 "preferences": _csv(last("preferences")),
+                "non_negotiables": values.get("non_negotiables") or [],
+                "priority_tradeoffs": priority_tradeoffs,
+                "recording_intensity": last("recording_intensity", "light"),
+                "followup_intensity": last("followup_intensity", "only_when_needed"),
             }
         raise ValidationError("未知的初始化步骤")
 

@@ -14,7 +14,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from unittest.mock import patch
 from pathlib import Path
 
-from mealcircuit import agent_workspace, personalization, service
+from mealcircuit import agent_intelligence, agent_workspace, personalization, service
 from mealcircuit.configuration import configured_today, configuration_status, initialize_private_home
 from mealcircuit.contracts import load_contract, validate_transition
 from mealcircuit.crypto import format_recovery_key, parse_recovery_key, random_key
@@ -419,6 +419,10 @@ class DomainAndPortableTest(unittest.TestCase):
             scope={"meal": "晚餐"}, effect={"complexity": "优先一锅菜"},
             evidence_type="user_correction", evidence_id="portable-proof", explicit=True,
         )
+        goal_contract = agent_intelligence.refresh_goal_contract_sync(
+            personalization.active_personalization()
+        )
+        episode = agent_intelligence.refresh_meal_episode("2026-07-14", "lunch")
         export_data(archive, encrypted=False)
 
         configure_home(target)
@@ -427,6 +431,20 @@ class DomainAndPortableTest(unittest.TestCase):
         self.assertIn(original["id"], restored)
         self.assertEqual("active", restored[original["id"]]["status"])
         self.assertEqual({"complexity": "优先一锅菜"}, restored[original["id"]]["effect_json"])
+        with connect() as conn:
+            projections = {
+                row["kind"]: json.loads(row["content"])
+                for row in conn.execute(
+                    "SELECT kind,content FROM config_documents WHERE kind IN ('goal_contract','meal_episode_projection')"
+                ).fetchall()
+            }
+            restored_episode = conn.execute(
+                "SELECT event_date,meal_slot FROM meal_episode_projections WHERE id=?", (episode["id"],)
+            ).fetchone()
+        self.assertEqual(goal_contract["contract_id"], projections["goal_contract"]["contract_id"])
+        self.assertEqual("2026-07-14", restored_episode["event_date"])
+        self.assertEqual("lunch", restored_episode["meal_slot"])
+        self.assertEqual(1, len(projections["meal_episode_projection"]["episodes"]))
 
     def test_portable_archive_excludes_device_keys_tokens_and_api_keys(self) -> None:
         root = Path(self.temp.name)

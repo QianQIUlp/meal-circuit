@@ -20,6 +20,7 @@ EVIDENCE_ROLES = {"consumed", "planned", "inventory", "reference"}
 FEEDBACK_STATUSES = {"followed", "modified", "skipped", "not_applicable"}
 REASON_CODES = {
     "missing_ingredient",
+    "too_expensive",
     "not_enough_time",
     "too_complex",
     "ate_out",
@@ -40,6 +41,7 @@ RESCUE_ISSUES = {
 }
 FRICTION_LABELS = {
     "missing_ingredient": "缺少所需食材",
+    "too_expensive": "计划食材的长期成本不可接受",
     "not_enough_time": "可用时间不足",
     "too_complex": "执行步骤过于复杂",
     "ate_out": "临时改为外食",
@@ -201,6 +203,10 @@ def link_task_evidence(
         ).fetchone()
     if task["status"] == "completed":
         _queue_changed_date(observed_date, "task_evidence_linked")
+        if meal_slot in {"breakfast", "lunch", "dinner"}:
+            from .agent_intelligence import refresh_meal_episode
+
+            refresh_meal_episode(observed_date, meal_slot)
     return row_dict(row)
 
 
@@ -473,10 +479,47 @@ def save_plan_feedback(
         )
     recompute_candidates(plan_date)
     result = row_dict(row)
-    from . import agent_workspace
+    from . import agent_intelligence, agent_workspace
+
+    learning_links: list[str] = []
+    try:
+        agent_workspace.supersede_source_evidence(
+            "execution_feedback", result["id"], reason="execution_feedback_revised"
+        )
+    except Exception as exc:
+        agent_workspace.record_diagnostic_event(
+            plan_date, "feedback_evidence_supersede_failed", str(exc), {"feedback_id": result["id"]}
+        )
+    if result.get("actual_text"):
+        try:
+            processed = agent_workspace.process_natural_language_input(
+                result["id"], result["actual_text"], plan_date, source_type="execution_feedback"
+            )
+            learning_links.extend(
+                item["claim_id"] for item in processed.get("applied") or [] if item.get("claim_id")
+            )
+        except Exception as exc:
+            agent_workspace.record_diagnostic_event(
+                plan_date, "feedback_intent_processing_failed", str(exc), {"feedback_id": result["id"]}
+            )
+    try:
+        learned = agent_workspace.note_feedback_signal(result)
+        if learned and learned.get("id"):
+            learning_links.append(learned["id"])
+    except Exception as exc:
+        agent_workspace.record_diagnostic_event(
+            plan_date, "feedback_learning_failed", str(exc), {"feedback_id": result["id"]}
+        )
+    try:
+        result["outcome_attribution"] = agent_intelligence.attribute_feedback(
+            result, learning_links=list(dict.fromkeys(learning_links))
+        )
+    except Exception as exc:
+        agent_workspace.record_diagnostic_event(
+            plan_date, "feedback_attribution_failed", str(exc), {"feedback_id": result["id"]}
+        )
 
     postprocessors = (
-        ("feedback_learning_failed", lambda: agent_workspace.note_feedback_signal(result)),
         (
             "execution_state_update_failed",
             lambda: agent_workspace.update_execution_state(
@@ -980,7 +1023,7 @@ def schedule_questions(question_date: str | None = None) -> list[dict]:
         })
         budget = 1
     else:
-        budget = int(current["profile"]["profile_json"]["constraints"].get("question_budget", 2))
+        budget = min(3, int(current["profile"]["profile_json"]["constraints"].get("question_budget", 2)))
         if "daily_plan" not in current["safety"].get("allowed_actions", []):
             budget = min(budget, 1)
             if current["safety"]["mode"] == "clinician_guided" and not current["safety"].get("professional_guidance_current"):

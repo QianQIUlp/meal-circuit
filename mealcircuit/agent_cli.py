@@ -139,15 +139,16 @@ def build_parser() -> argparse.ArgumentParser:
     schema.add_argument("type", choices=["photo", "material", "daily"])
     day_list = sub.add_parser("day-list", help="列出每日复盘")
     day_list.add_argument("--status", choices=["pending", "completed"])
-    day_context = sub.add_parser("day-context", help="导出指定日期、近14天、总纲和菜单设置")
+    day_context = sub.add_parser("day-context", help="只读检查指定日期、近14天、总纲和菜单设置")
     day_context.add_argument("date")
     day_context.add_argument("--output", "-o")
     day_context.add_argument("--days", type=int, default=14, choices=range(1, 31), metavar="1-30")
-    day_complete = sub.add_parser("day-complete", help="校验并提交每日复盘和次日菜单")
+    day_complete = sub.add_parser("day-complete", help="发布已完成全部 Agent 阶段的每日复盘和次日菜单")
     day_complete.add_argument("date")
     day_complete.add_argument("--file", "-f", required=True)
+    day_complete.add_argument("--run-id", required=True, help="已完成并独立审查通过的 Agent run ID")
     day_complete.add_argument("--output", "-o")
-    day_generate = sub.add_parser("day-generate", help="使用用户环境变量中的模型 API Key 生成并提交每日复盘")
+    day_generate = sub.add_parser("day-generate", help="通过完整个案 Agent 生成未发布草案")
     day_generate.add_argument("date")
     day_generate.add_argument("--output", "-o")
     agent_context = sub.add_parser("agent-context", help="导出分层、可解释的规划上下文")
@@ -160,7 +161,7 @@ def build_parser() -> argparse.ArgumentParser:
     agent_state = sub.add_parser("agent-state", help="查看个案理解、追问、草案和运行状态")
     agent_state.add_argument("date")
     agent_state.add_argument("--output", "-o")
-    agent_draft = sub.add_parser("agent-draft", help="运行个案理解、计划设计和独立审查，生成未发布草案")
+    agent_draft = sub.add_parser("agent-draft", help="运行全部必需阶段并生成未发布草案")
     agent_draft.add_argument("date")
     agent_draft.add_argument("--force", action="store_true")
     agent_draft.add_argument("--output", "-o")
@@ -175,6 +176,28 @@ def build_parser() -> argparse.ArgumentParser:
     agent_accept = sub.add_parser("agent-accept", help="接受草案并发布正式计划")
     agent_accept.add_argument("date")
     agent_accept.add_argument("--output", "-o")
+    agent_run = sub.add_parser("agent-run", help="按阶段运行统一的个案 Agent")
+    agent_run_sub = agent_run.add_subparsers(dest="agent_run_command", required=True)
+    agent_run_begin = agent_run_sub.add_parser("begin", help="开始一次不可跳阶段的 Agent 运行")
+    agent_run_begin.add_argument("date")
+    agent_run_begin.add_argument("--force", action="store_true")
+    agent_run_begin.add_argument("--output", "-o")
+    for command, help_text in (
+        ("next", "读取当前阶段所需上下文和 Schema"),
+        ("status", "查看阶段回执和当前状态"),
+        ("finalize", "将审查通过的结果生成可替换草案"),
+        ("accept", "接受草案并发布正式计划"),
+    ):
+        item = agent_run_sub.add_parser(command, help=help_text)
+        item.add_argument("run_id")
+        item.add_argument("--output", "-o")
+    agent_run_submit = agent_run_sub.add_parser("submit", help="提交当前阶段结果")
+    agent_run_submit.add_argument("run_id")
+    agent_run_submit.add_argument("--stage", required=True, choices=[
+        "intent_learning", "case_formulation", "strategy_comparison", "plan_design", "independent_review",
+    ])
+    agent_run_submit.add_argument("--file", "-f", required=True)
+    agent_run_submit.add_argument("--output", "-o")
     user_model = sub.add_parser("user-model", help="查看或纠正可回滚的长期用户模型")
     user_model_sub = user_model.add_subparsers(dest="user_model_command", required=True)
     user_model_sub.add_parser("list")
@@ -457,7 +480,9 @@ def main() -> None:
         elif args.command == "day-context":
             emit(service.daily_review_context(args.date, args.days), args.output)
         elif args.command == "day-complete":
-            emit(service.submit_daily_review(args.date, load_json(args.file)), args.output)
+            emit(service.submit_daily_review(
+                args.date, load_json(args.file), run_id=args.run_id
+            ), args.output)
         elif args.command == "day-generate":
             emit(service.generate_daily_review(args.date), args.output)
         elif args.command == "agent-context":
@@ -476,6 +501,21 @@ def main() -> None:
             emit(agent_workspace.revise_draft(args.date, args.text), args.output)
         elif args.command == "agent-accept":
             emit(agent_workspace.accept_draft(args.date), args.output)
+        elif args.command == "agent-run":
+            if args.agent_run_command == "begin":
+                emit(agent_workspace.begin_agent_run(args.date, force=args.force), args.output)
+            elif args.agent_run_command == "next":
+                emit(agent_workspace.next_agent_stage(args.run_id), args.output)
+            elif args.agent_run_command == "submit":
+                emit(agent_workspace.submit_agent_stage(
+                    args.run_id, args.stage, load_json(args.file)
+                ), args.output)
+            elif args.agent_run_command == "status":
+                emit(agent_workspace.agent_run_status(args.run_id), args.output)
+            elif args.agent_run_command == "finalize":
+                emit(agent_workspace.finalize_agent_run(args.run_id), args.output)
+            else:
+                emit(agent_workspace.accept_agent_run(args.run_id), args.output)
         elif args.command == "user-model":
             if args.user_model_command == "list":
                 emit(agent_workspace.list_claims(include_inactive=True))

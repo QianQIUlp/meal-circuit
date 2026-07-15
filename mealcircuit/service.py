@@ -389,10 +389,14 @@ def complete_task(
             result=stored_result,
             provenance=portable_provenance,
         )
-    from .adaptive import linked_dates
+    from .adaptive import linked_dates, task_evidence_links
+    from .agent_intelligence import refresh_meal_episode
 
     for observed_date in linked_dates(task_id):
         queue_review_for_external_change(observed_date, "task_evidence_completed")
+    for link in task_evidence_links(task_id):
+        if link.get("meal_slot") in {"breakfast", "lunch", "dinner"}:
+            refresh_meal_episode(link["observed_date"], link["meal_slot"])
     return get_task(task_id)
 
 
@@ -453,10 +457,14 @@ def add_correction(task_id: str, correction: dict) -> dict:
             (correction_id, task_id, json.dumps(payload, ensure_ascii=False), now()),
         )
         capture_correction(conn, correction_id)
-    from .adaptive import linked_dates
+    from .adaptive import linked_dates, task_evidence_links
+    from .agent_intelligence import refresh_meal_episode
 
     for observed_date in linked_dates(task_id):
         queue_review_for_external_change(observed_date, "task_evidence_corrected")
+    for link in task_evidence_links(task_id):
+        if link.get("meal_slot") in {"breakfast", "lunch", "dinner"}:
+            refresh_meal_episode(link["observed_date"], link["meal_slot"])
     return get_task(task_id)
 
 
@@ -990,6 +998,14 @@ def add_daily_record(record_date: str, raw_input: str, structured: dict | None =
     }
     from . import agent_workspace
 
+    try:
+        result["intent_processing"] = agent_workspace.process_natural_language_input(
+            result["id"], result["raw_input"], record_date, source_type="daily_record"
+        )
+    except Exception as exc:
+        agent_workspace.record_diagnostic_event(
+            record_date, "intent_processing_failed", str(exc), {"record_id": result["id"]}
+        )
     agent_workspace.schedule_auto_draft(record_date)
     return result
 
@@ -1036,6 +1052,17 @@ def update_daily_record(record_id: str, record_date: str, raw_input: str) -> dic
         )
     from . import agent_workspace
 
+    try:
+        agent_workspace.supersede_source_evidence(
+            "daily_record", updated["id"], reason="daily_record_edited"
+        )
+        updated["intent_processing"] = agent_workspace.process_natural_language_input(
+            updated["id"], updated["raw_input"], record_date, source_type="daily_record"
+        )
+    except Exception as exc:
+        agent_workspace.record_diagnostic_event(
+            record_date, "intent_processing_failed", str(exc), {"record_id": updated["id"]}
+        )
     agent_workspace.schedule_auto_draft(record_date)
     return updated
 
@@ -1774,67 +1801,23 @@ def complete_daily_review(
 
 
 def generate_daily_review(review_date: str, client=None) -> dict:
-    from .ai import generate_json, provider_from_environment
-    from .personalization import require_generation
+    """Generate a replaceable draft through the mandatory case-Agent state machine."""
+    from . import agent_workspace
 
-    review = ensure_daily_review(review_date)
-    if review["status"] == "completed" and review["revision_policy"]["mode"] == "locked":
-        review = requeue_daily_review(review_date, "generated_result_revised")
-    require_generation("daily")
-    context = daily_review_context(review_date)
-    provider = client or provider_from_environment()
-    run_id = _start_agent_run("daily", context, provider)
-    attempts = []
-    candidate_context = json.loads(json.dumps(context, ensure_ascii=False))
-    for attempt in range(1, 4):
-        try:
-            result = generate_json(candidate_context, "daily", provider)
-            completed = complete_daily_review(
-                review_date,
-                result,
-                provenance_context=context,
-                agent_run_id=run_id,
-                source_revisions=context["source_revisions"],
-                generator=_generator_metadata(provider),
-            )
-        except ValidationError as exc:
-            attempts.append({"attempt": attempt, "status": "rejected", "error": str(exc)[:1000]})
-            if attempt < 3:
-                candidate_context.setdefault("candidate_rejections", []).append({
-                    "attempt": attempt,
-                    "error": str(exc)[:1000],
-                    "instruction": "生成不同的实际菜单内容；不得只改日期、菜名或 rotation 标签。",
-                })
-                continue
-            _finish_agent_run(run_id, error=exc, attempts=attempts)
-            raise
-        except Exception as exc:
-            attempts.append({"attempt": attempt, "status": "failed", "error": str(exc)[:1000]})
-            _finish_agent_run(run_id, error=exc, attempts=attempts)
-            raise
-        attempts.append({"attempt": attempt, "status": "valid"})
-        _finish_agent_run(run_id, result=result, attempts=attempts)
-        return completed
-    raise AssertionError("unreachable")
+    ensure_daily_review(review_date)
+    return agent_workspace.run_agent_draft(review_date, client=client)
 
 
-def submit_daily_review(review_date: str, result: dict) -> dict:
-    review = ensure_daily_review(review_date)
-    if review["status"] == "completed" and review["revision_policy"]["mode"] == "locked":
-        requeue_daily_review(review_date, "generated_result_revised")
-    context = daily_review_context(review_date)
-    run_id = _start_agent_run(
-        "daily", context, identity=("external_agent", "structured_json_submission")
-    )
-    try:
-        completed = complete_daily_review(
-            review_date, result, provenance_context=context, agent_run_id=run_id
+def submit_daily_review(review_date: str, result: dict, *, run_id: str | None = None) -> dict:
+    """Publish only the exact draft approved by a complete mandatory Agent run."""
+    if not str(run_id or "").strip():
+        raise ValidationError(
+            "新的每日结果必须携带完成全部阶段的 Agent run ID；day-context 只用于检查，不能直接发布"
         )
-    except Exception as exc:
-        _finish_agent_run(run_id, error=exc)
-        raise
-    _finish_agent_run(run_id, result=result)
-    return completed
+    from . import agent_workspace
+
+    agent_workspace.assert_agent_run_publishable(str(run_id), review_date, result)
+    return agent_workspace.accept_agent_run(str(run_id))
 
 
 def cleanup_generated_review_history(
