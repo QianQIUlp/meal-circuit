@@ -385,6 +385,9 @@ summary { width: fit-content; color: var(--accent-strong); font-weight: 650; cur
 .settings-row > label { display: flex; align-items: center; gap: 8px; }
 .settings-row input[type="checkbox"] { width: 18px; min-height: 18px; margin: 0; }
 .settings-row select { min-width: 140px; }
+.interface-settings { margin-top: 18px; }
+.interface-settings .settings-row { grid-template-columns: minmax(160px, 1fr) minmax(180px, auto); }
+.interface-settings .settings-row select { justify-self: end; }
 .move-actions { display: flex; gap: 6px; }
 .move-actions button { min-width: 42px; padding-inline: 10px; }
 
