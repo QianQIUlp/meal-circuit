@@ -11,6 +11,7 @@ from .configuration import configuration_status, initialize_private_home
 from .db import init_db
 from .migration import apply_migration, migration_preview
 from .portable import ENCRYPTED_MAGIC, apply_import, export_data, preview_import
+from .storage import app_home
 from .sync import (
     abort_account_key_rotation,
     delete_sync_account,
@@ -31,8 +32,10 @@ from .validation import ValidationError
 def emit(value: object, output: str | None = None) -> None:
     payload = json.dumps(value, ensure_ascii=False, indent=2)
     if output:
-        Path(output).write_text(payload + "\n", encoding="utf-8")
-        print(f"已写入 {Path(output).resolve()}")
+        target = Path(output)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(payload + "\n", encoding="utf-8")
+        print(f"已写入 {target.resolve()}")
     else:
         print(payload)
 
@@ -46,10 +49,72 @@ def configure_utf8_stdio() -> None:
 
 def load_json_value(path: str):
     try:
-        value = json.loads(Path(path).read_text(encoding="utf-8"))
+        raw = sys.stdin.read() if path == "-" else Path(path).read_text(encoding="utf-8")
+        value = json.loads(raw)
     except (OSError, json.JSONDecodeError) as exc:
         raise ValidationError(f"无法读取 JSON 文件：{exc}") from exc
     return value
+
+
+def _agent_run_root(run_id: str) -> Path:
+    safe = "".join(character for character in str(run_id) if character.isalnum() or character in "_-")
+    if not safe or safe != run_id:
+        raise ValidationError("Agent run ID 无效")
+    root = (app_home() / "agent-runs" / safe).resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _agent_output_path(run_id: str, output: str | None) -> str | None:
+    if not output:
+        return None
+    requested = Path(output).expanduser()
+    if requested.is_absolute():
+        return str(requested.resolve())
+    root = _agent_run_root(run_id)
+    target = (root / requested).resolve()
+    try:
+        target.relative_to(root)
+    except ValueError as exc:
+        raise ValidationError("相对输出路径不能离开私人 Agent 工作目录") from exc
+    return str(target)
+
+
+def _prepare_agent_stage_workspace(value: dict) -> dict:
+    if not isinstance(value, dict) or not value.get("run_id") or not value.get("stage_context"):
+        return value
+    stage = str(value.get("stage") or value.get("current_stage") or "stage")
+    root = _agent_run_root(str(value["run_id"])) / stage
+    root.mkdir(parents=True, exist_ok=True)
+    context_path = root / "context.json"
+    schema_path = root / "schema.json"
+    result_path = root / "result.json"
+    context_path.write_text(
+        json.dumps(value["stage_context"], ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+    schema_path.write_text(
+        json.dumps(value.get("stage_schema") or {}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+    if not result_path.exists():
+        result_path.write_text("{}\n", encoding="utf-8")
+    prepared = dict(value)
+    prepared["private_workspace"] = {
+        "directory": str(root),
+        "context_file": str(context_path),
+        "schema_file": str(schema_path),
+        "result_file": str(result_path),
+        "submit_hint": (
+            f"python -m mealcircuit.agent_cli agent-run submit {value['run_id']} "
+            f"--stage {stage}"
+        ),
+    }
+    return prepared
+
+
+def _load_agent_stage_result(run_id: str, stage: str, path: str | None) -> dict:
+    if path:
+        return load_json(path)
+    return load_json(str(_agent_run_root(run_id) / stage / "result.json"))
 
 
 def load_json(path: str) -> dict:
@@ -196,7 +261,10 @@ def build_parser() -> argparse.ArgumentParser:
     agent_run_submit.add_argument("--stage", required=True, choices=[
         "intent_learning", "case_formulation", "strategy_comparison", "plan_design", "independent_review",
     ])
-    agent_run_submit.add_argument("--file", "-f", required=True)
+    agent_run_submit.add_argument(
+        "--file", "-f",
+        help="阶段结果 JSON；省略时读取私人 Agent 工作目录中的 result.json，使用 - 可从 stdin 读取",
+    )
     agent_run_submit.add_argument("--output", "-o")
     user_model = sub.add_parser("user-model", help="查看或纠正可回滚的长期用户模型")
     user_model_sub = user_model.add_subparsers(dest="user_model_command", required=True)
@@ -503,19 +571,34 @@ def main() -> None:
             emit(agent_workspace.accept_draft(args.date), args.output)
         elif args.command == "agent-run":
             if args.agent_run_command == "begin":
-                emit(agent_workspace.begin_agent_run(args.date, force=args.force), args.output)
+                value = _prepare_agent_stage_workspace(
+                    agent_workspace.begin_agent_run(args.date, force=args.force)
+                )
+                emit(value, _agent_output_path(value["run_id"], args.output))
             elif args.agent_run_command == "next":
-                emit(agent_workspace.next_agent_stage(args.run_id), args.output)
+                value = _prepare_agent_stage_workspace(agent_workspace.next_agent_stage(args.run_id))
+                emit(value, _agent_output_path(args.run_id, args.output))
             elif args.agent_run_command == "submit":
-                emit(agent_workspace.submit_agent_stage(
-                    args.run_id, args.stage, load_json(args.file)
-                ), args.output)
+                value = _prepare_agent_stage_workspace(agent_workspace.submit_agent_stage(
+                    args.run_id, args.stage,
+                    _load_agent_stage_result(args.run_id, args.stage, args.file),
+                ))
+                emit(value, _agent_output_path(args.run_id, args.output))
             elif args.agent_run_command == "status":
-                emit(agent_workspace.agent_run_status(args.run_id), args.output)
+                emit(
+                    agent_workspace.agent_run_status(args.run_id),
+                    _agent_output_path(args.run_id, args.output),
+                )
             elif args.agent_run_command == "finalize":
-                emit(agent_workspace.finalize_agent_run(args.run_id), args.output)
+                emit(
+                    agent_workspace.finalize_agent_run(args.run_id),
+                    _agent_output_path(args.run_id, args.output),
+                )
             else:
-                emit(agent_workspace.accept_agent_run(args.run_id), args.output)
+                emit(
+                    agent_workspace.accept_agent_run(args.run_id),
+                    _agent_output_path(args.run_id, args.output),
+                )
         elif args.command == "user-model":
             if args.user_model_command == "list":
                 emit(agent_workspace.list_claims(include_inactive=True))
