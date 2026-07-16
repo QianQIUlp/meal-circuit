@@ -405,3 +405,11 @@
 - 仍未实现：无新增产品缺口。
 - 下一任务：Draft PR #14 保持 Draft，等待 reviewer 审阅；不自动合并或标记 Ready。
 - 用户用法：无变化；CLI 在 Windows 重定向或子进程调用时也稳定输出 UTF-8 JSON。
+
+## 2026-07-16：系统主题与中英文界面偏好
+
+- 目标：让桌面 Web 界面的亮暗主题默认匹配操作系统，并在“我的”设置中提供英文/简体中文选择，首次使用默认英文。
+- 改动文件：`mealcircuit/static/theme-init.js`、`mealcircuit/static/app.js`、`mealcircuit/static/app.css`、`mealcircuit/server.py`、`tests/test_mealcircuit.py`、`DEVELOPMENT.md`。
+- 核心功能：主题偏好升级为“跟随系统 / 浅色 / 深色”三态；跟随系统时监听 `prefers-color-scheme` 的实时变化；保留旧版已保存的亮暗选择。新增当前设备级语言偏好，默认 `en`，可在“我的 → 外观与语言”切换 `English` 或 `简体中文`；共享导航、设备状态、日期、操作按钮和该设置页随语言即时更新。
+- 验证：`python3 -m py_compile mealcircuit/server.py`、`git diff --check` 与 `WebAppTest.test_pages_and_material_form` 通过；该测试新增主题三态、默认英文和语言设置入口断言。运行整个 `WebAppTest` 时，18 项通过，2 项既有菜单夹具断言因共享测试状态失败（缺少 `BEGINNER LUNCH` 等预期文案），与本轮外观/语言改动无关；全仓库 `unittest` 发现还会因未安装同步服务可选依赖而报告 `sync_server` 导入错误。
+- 剩余风险：当前英文覆盖共享应用外壳和“我的”设置入口；计划、记录、初始化等领域页面仍保留原始内容语言，后续应逐页迁移为相同的稳定翻译键，用户或模型生成的饮食内容则应保持原语言，避免误译事实记录。
