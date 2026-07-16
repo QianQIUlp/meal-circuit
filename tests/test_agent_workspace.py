@@ -10,7 +10,7 @@ from datetime import date, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
-from mealcircuit import adaptive, agent_intelligence, agent_workspace, personalization, server, service
+from mealcircuit import adaptive, agent_cli, agent_intelligence, agent_workspace, personalization, server, service
 from mealcircuit.configuration import load_resolved_settings
 from mealcircuit.db import connect, init_db
 from mealcircuit.validation import ValidationError
@@ -131,11 +131,11 @@ class ScriptedProvider:
                 "planning_priorities": ["可执行", "训练恢复", "饱腹"],
             }
         if request.kind == "strategy_comparison":
-            required = [
-                "可执行", "训练恢复", "饱腹",
-                *request.context.get("required_goal_dimensions", []),
-                *request.context.get("required_non_negotiables", []),
-            ]
+            coverage = [{
+                "requirement_ref": item["ref"],
+                "approach": f"在计划中落实：{item['statement']}",
+                "tradeoff": "不牺牲安全边界，并在现实限制内取舍。",
+            } for item in request.context["requirement_catalog"]]
             return {
                 "options": [
                     {
@@ -144,7 +144,7 @@ class ScriptedProvider:
                             "safety", "goal_coverage", "budget", "time", "satiety", "taste",
                             "rotation", "waste", "execution_probability",
                         )},
-                        "tradeoffs": ["不是最低成本"], "solves_priorities": required,
+                        "tradeoffs": ["不是最低成本"], "coverage": deepcopy(coverage),
                     },
                     {
                         "id": "cheapest", "label": "最低成本", "summary": "优先成本。",
@@ -152,7 +152,7 @@ class ScriptedProvider:
                             "safety", "goal_coverage", "budget", "time", "satiety", "taste",
                             "rotation", "waste", "execution_probability",
                         )},
-                        "tradeoffs": ["口味和便利性较弱"], "solves_priorities": required,
+                        "tradeoffs": ["口味和便利性较弱"], "coverage": deepcopy(coverage),
                     },
                 ],
                 "selected_id": "balanced", "selection_reason": "更适合长期执行。",
@@ -160,26 +160,35 @@ class ScriptedProvider:
             }
         if request.kind in {"daily_plan_v3", "daily_plan_v3_revision"}:
             plan = deepcopy(self.plan)
-            source_id = request.context["today"]["records"][0]["id"]
+            plan["problem_responses"] = [{
+                "problem_ref": item["ref"], "response": f"计划已具体回应：{item['statement']}",
+            } for item in request.context["problem_catalog"]]
+            source_ref = next(
+                item["ref"] for item in request.context["evidence_catalog"]
+                if item["kind"] == "user_context"
+            )
             plan["advice_evidence"] = [{
-                "advice": advice, "basis_kind": "user_context", "source_ids": [source_id],
+                "advice": advice, "basis_kind": "user_context", "source_refs": [source_ref],
             } for advice in plan["core_advice"]]
             return plan
         if request.kind == "plan_review":
             candidate = request.context["candidate_plan"]
+            catalog = request.context["review_catalog"]
             return {
                 "approved": True,
                 "human_fit_summary": "份量、执行性和当天目标相互一致。",
                 "problem_coverage": [{
-                    "problem": item, "addressed": True, "evidence": "计划有对应餐次与调整条件。",
-                } for item in request.context["case_formulation"]["planning_priorities"]],
+                    "problem_ref": item["ref"], "addressed": True,
+                    "evidence": "计划有对应餐次与调整条件。",
+                } for item in catalog["problems"]],
                 "dimension_coverage": [{
-                    "dimension": item, "addressed": True, "evidence": "所选策略和餐次安排有对应体现。",
-                } for item in request.context.get("required_dimensions", [])],
+                    "dimension_ref": item["ref"], "addressed": True,
+                    "evidence": "所选策略和餐次安排有对应体现。",
+                } for item in catalog["dimensions"]],
                 "evidence_checks": [{
-                    "claim": advice, "supported": True,
+                    "advice_ref": item["ref"], "supported": True,
                     "source_or_boundary": "对应 advice_evidence 中的当天用户记录。",
-                } for advice in candidate["core_advice"]],
+                } for item in catalog["advice"]],
                 "issues": [],
                 "claim_candidates": deepcopy(self.review_claims),
             }
@@ -302,6 +311,18 @@ class AgentWorkspaceTest(unittest.TestCase):
             item["kind"] == "user_statement" and "今天完成力量训练" in item["value"]
             for item in provider.requests[4].context["evidence_pack"]["user_facts"]
         ))
+        receipts = {
+            item["stage_key"]: item["result_json"]
+            for item in agent_workspace.agent_run_status(draft["run_id"])["receipts"]
+        }
+        self.assertIn("可执行", receipts["strategy_comparison"]["options"][0]["solves_priorities"])
+        self.assertTrue(all(
+            item["ref"].startswith(("case:", "outcome:"))
+            for item in provider.requests[3].context["problem_catalog"]
+        ))
+        source_ids = receipts["plan_design"]["advice_evidence"][0]["source_ids"]
+        self.assertEqual([service.list_daily_records(self.review_date)[0]["id"]], source_ids)
+        self.assertIn("problem", receipts["independent_review"]["problem_coverage"][0])
         self.assertEqual("pending", service.get_daily_review(self.review_date)["status"])
         plan_date = (date.fromisoformat(self.review_date) + timedelta(days=1)).isoformat()
         self.assertIsNone(__import__("mealcircuit.adaptive", fromlist=["get_plan_for_date"]).get_plan_for_date(plan_date))
@@ -317,6 +338,8 @@ class AgentWorkspaceTest(unittest.TestCase):
         self.assertEqual(draft["run_id"], manifest["agent_run_id"])
         self.assertEqual(7, len(manifest["agent_stage_receipts"]))
         self.assertIn("user_model_claims", manifest)
+        self.assertEqual(draft["context_hash"], manifest["decision_context_hash"])
+        self.assertTrue(manifest["audit_context_hash"])
         self.assertIsNotNone(__import__("mealcircuit.adaptive", fromlist=["get_plan_for_date"]).get_plan_for_date(plan_date))
         self.assertEqual("accepted", agent_workspace.get_draft(self.review_date)["status"])
         workspace_html = server.render_today_workspace(self.review_date)
@@ -382,15 +405,17 @@ class AgentWorkspaceTest(unittest.TestCase):
                         "approved": False,
                         "human_fit_summary": "午餐修改后仍没有覆盖预算约束。",
                         "problem_coverage": [{
-                            "problem": item, "addressed": True, "evidence": "其余问题已有对应安排。",
-                        } for item in request.context["case_formulation"]["planning_priorities"]],
+                            "problem_ref": item["ref"], "addressed": True,
+                            "evidence": "其余问题已有对应安排。",
+                        } for item in request.context["review_catalog"]["problems"]],
                         "dimension_coverage": [{
-                            "dimension": item, "addressed": True, "evidence": "其余维度已有对应安排。",
-                        } for item in request.context.get("required_dimensions", [])],
+                            "dimension_ref": item["ref"], "addressed": True,
+                            "evidence": "其余维度已有对应安排。",
+                        } for item in request.context["review_catalog"]["dimensions"]],
                         "evidence_checks": [{
-                            "claim": advice, "supported": True,
+                            "advice_ref": item["ref"], "supported": True,
                             "source_or_boundary": "对应草案已绑定的当天记录。",
-                        } for advice in request.context["candidate_plan"]["core_advice"]],
+                        } for item in request.context["review_catalog"]["advice"]],
                         "issues": [{
                             "severity": "repair", "dimension": "budget",
                             "description": "外食选择仍缺少预算边界。",
@@ -537,6 +562,25 @@ class AgentWorkspaceTest(unittest.TestCase):
             ).fetchone()
         self.assertEqual("interrupted", run["status"])
 
+    def test_audit_only_claim_revision_does_not_interrupt_a_valid_run(self):
+        service.add_daily_record(self.review_date, "牛肉太贵，以后不要默认安排。")
+        claim = next(
+            item for item in agent_workspace.list_claims()
+            if item.get("claim_dimension") == "resource_constraint"
+        )
+        started = agent_workspace.begin_agent_run(self.review_date, force=True)
+        before = agent_workspace.build_agent_context(self.review_date)
+        with connect() as conn:
+            conn.execute(
+                "UPDATE user_model_claims SET version=version+1 WHERE id=?",
+                (claim["id"],),
+            )
+        after = agent_workspace.build_agent_context(self.review_date)
+        self.assertEqual(before["context_hash"], after["context_hash"])
+        self.assertNotEqual(before["audit_context_hash"], after["audit_context_hash"])
+        current = agent_workspace.next_agent_stage(started["run_id"])
+        self.assertEqual("intent_learning", current["stage"])
+
     def test_new_evidence_marks_unpublished_draft_stale_without_touching_formal_history(self):
         draft = agent_workspace.run_agent_draft(self.review_date, self._provider())
         self.assertEqual("ready_draft", draft["status"])
@@ -562,6 +606,15 @@ class AgentWorkspaceTest(unittest.TestCase):
             item["id"] for item in context["person"]["active_user_model"]
         })
 
+        allowed = self._provider().plan
+        allowed["tomorrow_menu"]["meals"][2]["why_today"] = (
+            "牛肉太贵，因此本餐不安排牛肉，改用现实可负担的来源。"
+        )
+        draft = agent_workspace.run_agent_draft(
+            self.review_date, ScriptedProvider(self.review_date, plan=allowed), force=True
+        )
+        self.assertEqual("ready_draft", draft["status"])
+
         bad = self._provider().plan
         bad["tomorrow_menu"]["meals"][2]["foods"] = ["牛肉", "米饭", "蔬菜"]
         with self.assertRaisesRegex(ValidationError, "不作为默认项"):
@@ -569,6 +622,46 @@ class AgentWorkspaceTest(unittest.TestCase):
                 self.review_date, ScriptedProvider(self.review_date, plan=bad), force=True
             )
         self.assertEqual("pending", service.get_daily_review(self.review_date)["status"])
+
+    def test_small_protein_floor_gap_is_reviewed_with_uncertainty_not_mechanically_blocked(self):
+        context = agent_workspace.build_agent_context(self.review_date)
+        target = next(
+            item["value_json"] for item in context["person"]["targets"]
+            if item["target_key"] == "protein_g"
+        )
+        plan = self._provider().plan
+        plan["day_nutrition"]["protein_g"] = [target[0] - 6, target[0] + 15]
+        draft = agent_workspace.run_agent_draft(
+            self.review_date, ScriptedProvider(self.review_date, plan=plan), force=True
+        )
+        self.assertEqual("ready_draft", draft["status"])
+        reality = draft["result_json"]["portion_reality"]
+        self.assertEqual("reasonable_overlap_with_estimation_uncertainty", reality["coverage"])
+        self.assertIn("食欲", reality["review_question"])
+
+    def test_relative_agent_stage_files_default_to_private_workspace(self):
+        parsed = agent_cli.build_parser().parse_args([
+            "agent-run", "submit", "agent_run_private_test", "--stage", "plan_design",
+        ])
+        self.assertIsNone(parsed.file)
+        prepared = agent_cli._prepare_agent_stage_workspace({
+            "run_id": "agent_run_private_test",
+            "stage": "plan_design",
+            "stage_context": {"private": "context"},
+            "stage_schema": {"type": "object"},
+        })
+        workspace = prepared["private_workspace"]
+        root = self.home / "agent-runs" / "agent_run_private_test"
+        self.assertTrue(Path(workspace["context_file"]).is_relative_to(root))
+        result_path = Path(workspace["result_file"])
+        result_path.write_text('{"ok": true}\n', encoding="utf-8")
+        self.assertEqual(
+            {"ok": True},
+            agent_cli._load_agent_stage_result("agent_run_private_test", "plan_design", None),
+        )
+        self.assertTrue(Path(
+            agent_cli._agent_output_path("agent_run_private_test", "draft.json")
+        ).is_relative_to(root))
 
     def test_explicit_high_price_product_need_names_the_real_item(self):
         service.add_daily_record(self.review_date, "不需要高价酸奶，以后优先普通食物。")
@@ -652,19 +745,47 @@ class AgentWorkspaceTest(unittest.TestCase):
             )
         self.assertEqual("pending", service.get_daily_review(self.review_date)["status"])
 
+    def test_case_formulation_accepts_natural_lists_and_compiles_them_for_audit(self):
+        class NaturalFormulationProvider(ScriptedProvider):
+            def generate(self, request):
+                result = super().generate(request)
+                if request.kind == "case_formulation":
+                    result["underlying_needs"] = ["早餐需要低摩擦且能长期执行"]
+                    result["historical_patterns"] = ["时间紧时，复杂早餐更容易被替换"]
+                return result
+
+        draft = agent_workspace.run_agent_draft(
+            self.review_date,
+            NaturalFormulationProvider(self.review_date, plan=self._provider().plan),
+            force=True,
+        )
+        self.assertEqual("ready_draft", draft["status"])
+        receipt = next(
+            item for item in agent_workspace.agent_run_status(draft["run_id"])["receipts"]
+            if item["stage_key"] == "case_formulation"
+        )
+        self.assertEqual(
+            "早餐需要低摩擦且能长期执行",
+            receipt["result_json"]["underlying_needs"][0]["need"],
+        )
+
     def test_weak_model_cannot_omit_a_goal_contract_dimension(self):
         class WeakStrategyProvider(ScriptedProvider):
             def generate(self, request):
                 result = super().generate(request)
                 if request.kind == "strategy_comparison":
-                    missing = request.context["required_goal_dimensions"][0]
+                    missing = next(
+                        item["ref"] for item in request.context["requirement_catalog"]
+                        if item["kind"] == "goal_program"
+                    )
                     for option in result["options"]:
-                        option["solves_priorities"] = [
-                            item for item in option["solves_priorities"] if item != missing
+                        option["coverage"] = [
+                            item for item in option["coverage"]
+                            if item["requirement_ref"] != missing
                         ]
                 return result
 
-        with self.assertRaisesRegex(ValidationError, "必需目标维度"):
+        with self.assertRaisesRegex(ValidationError, "真实要求"):
             agent_workspace.run_agent_draft(
                 self.review_date, WeakStrategyProvider(self.review_date, plan=self._provider().plan),
                 force=True,
@@ -684,7 +805,14 @@ class AgentWorkspaceTest(unittest.TestCase):
                         self.kinds.append(request.kind)
                         self.requests.append(request)
                         invalid = deepcopy(self.plan)
-                        invalid["problems_to_solve"] = ["只覆盖一个无关问题"]
+                        invalid["problem_responses"] = [{
+                            "problem_ref": "unknown:1", "response": "只覆盖一个无关问题",
+                        }]
+                        source_ref = request.context["evidence_catalog"][0]["ref"]
+                        invalid["advice_evidence"] = [{
+                            "advice": advice, "basis_kind": "user_context",
+                            "source_refs": [source_ref],
+                        } for advice in invalid["core_advice"]]
                         return invalid
                 return super().generate(request)
 
@@ -704,7 +832,7 @@ class AgentWorkspaceTest(unittest.TestCase):
                     result["advice_evidence"] = [{
                         "advice": advice,
                         "basis_kind": "user_context",
-                        "source_ids": ["invented-source"],
+                        "source_refs": ["invented-source"],
                     } for advice in result["core_advice"]]
                 return result
 
@@ -801,6 +929,7 @@ class AgentWorkspaceTest(unittest.TestCase):
             actual_text="今天起晚了，所以没时间煮鸡蛋，改成了豆浆和面包。",
             actor_source="web",
         )
+        self.assertFalse(feedback["outcome_attribution"]["likely_repeat"])
         claim = next(
             item for item in agent_workspace.list_claims()
             if item.get("claim_dimension") == "execution_friction"
@@ -912,3 +1041,54 @@ class AgentWorkspaceTest(unittest.TestCase):
             version = feedback["version"]
             attribution = agent_intelligence.list_outcome_attributions(plan_date, plan_date)[0]
             self.assertEqual(expected, attribution["attribution_json"]["primary_cause"])
+
+    def test_durable_execution_outcome_becomes_a_required_next_plan_adjustment(self):
+        first_date = (date.fromisoformat(self.review_date) - timedelta(days=1)).isoformat()
+        service.add_daily_record(first_date, "今天按计划吃饭，但午餐价格需要观察。")
+        settings = load_resolved_settings()
+        first_plan = _v3_result(first_date)
+        first_plan["tomorrow_menu"]["protein_target_g"] = settings["protein_target_g"]
+        first_plan["tomorrow_menu"]["environment"] = settings["meal_environment"]
+        first_draft = agent_workspace.run_agent_draft(
+            first_date, ScriptedProvider(first_date, plan=first_plan)
+        )
+        accepted = agent_workspace.accept_agent_run(first_draft["run_id"])
+        plan_date = accepted["result_json"]["tomorrow_menu"]["date"]
+        plan = adaptive.get_plan_for_date(plan_date)
+        lunch = next(item for item in plan["menu"]["meals"] if item["name"] == "午餐")
+        feedback = adaptive.save_plan_feedback(
+            plan_date,
+            lunch["plan_item_id"],
+            "modified",
+            reason_codes=["too_expensive"],
+            actual_text="这顿价格太贵，以后默认改用长期买得起的同功能食材。",
+            actor_source="web",
+        )
+        self.assertTrue(feedback["outcome_attribution"]["likely_repeat"])
+        service.add_daily_record(plan_date, "今天其余饮食和身体状态正常。")
+        next_context = agent_workspace.build_agent_context(plan_date)
+        adjustments = next_context["decision_task"]["required_outcome_adjustments"]
+        self.assertEqual(1, len(adjustments))
+        self.assertEqual("price", adjustments[0]["cause"])
+
+        next_plan = _v3_result(plan_date)
+        next_plan["tomorrow_menu"]["protein_target_g"] = settings["protein_target_g"]
+        next_plan["tomorrow_menu"]["environment"] = settings["meal_environment"]
+        next_plan["tomorrow_menu"]["meals"][0]["foods"] = ["燕麦", "豆浆"]
+        next_plan["tomorrow_menu"]["meals"][0]["substitutions"] = ["鸡蛋"]
+        next_plan["tomorrow_menu"]["meals"][1]["foods"] = ["食堂鱼类", "杂粮饭", "绿叶菜"]
+        next_plan["tomorrow_menu"]["meals"][1]["substitutions"] = ["豆腐"]
+        next_plan["tomorrow_menu"]["meals"][2]["foods"] = ["香菇豆腐", "红薯", "西兰花"]
+        next_plan["tomorrow_menu"]["meals"][2]["substitutions"] = ["鸡肉"]
+        next_draft = agent_workspace.run_agent_draft(
+            plan_date, ScriptedProvider(plan_date, plan=next_plan), force=True
+        )
+        self.assertEqual("ready_draft", next_draft["status"])
+        receipt = next(
+            item for item in agent_workspace.agent_run_status(next_draft["run_id"])["receipts"]
+            if item["stage_key"] == "plan_design"
+        )
+        self.assertIn(
+            adjustments[0]["required_change"],
+            receipt["result_json"]["problems_to_solve"],
+        )

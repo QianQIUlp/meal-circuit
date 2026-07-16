@@ -627,21 +627,22 @@ def refresh_meal_episodes(event_date: str) -> list[dict]:
 def attribute_feedback(feedback: dict, *, learning_links: list[str] | None = None) -> dict:
     reasons = set(feedback.get("reason_codes_json") or [])
     actual = str(feedback.get("actual_text") or "")
+    durable_request = any(marker in actual for marker in _DURABLE_MARKERS)
     snapshot = feedback.get("planned_snapshot_json") or {}
     if "too_expensive" in reasons or any(marker in actual for marker in _COST_MARKERS):
-        cause, stable = "price", True
+        cause, stable = "price", durable_request
         next_change = "默认改用长期负担得起的同功能食材，不把高价食材当作执行前提。"
     elif "missing_ingredient" in reasons:
         cause, stable = "inventory", False
         next_change = "先核对现有库存，并提供不额外采购的替代。"
     elif "not_enough_time" in reasons:
-        cause, stable = "time", True
+        cause, stable = "time", durable_request
         next_change = "减少主动操作时间，保留更短执行路径。"
     elif "too_complex" in reasons:
-        cause, stable = "complexity", True
+        cause, stable = "complexity", durable_request
         next_change = "减少步骤和持续看火，只保留一个新技巧。"
     elif "hunger_mismatch" in reasons or any(marker in actual for marker in _PORTION_LOW_MARKERS + _PORTION_HIGH_MARKERS):
-        cause, stable = "portion", True
+        cause, stable = "portion", durable_request
         next_change = "调整这类餐次的总体积，并明确加减量顺序。"
     elif "did_not_want_it" in reasons or any(marker in actual for marker in _TASTE_MARKERS):
         cause, stable = "taste", False
