@@ -113,11 +113,12 @@ python -m mealcircuit.agent_cli complete <TASK_ID> --file result.json
 # Optional: use your configured API key to generate and complete the task
 python -m mealcircuit.agent_cli generate <TASK_ID>
 
-# 2b. Process a daily review through the mandatory Agent run
-python -m mealcircuit.agent_cli agent-run begin 2026-01-01 --output stage.json
-# Repeat next + submit for the returned stage until all seven receipts are complete:
-python -m mealcircuit.agent_cli agent-run next <RUN_ID> --output stage.json
-python -m mealcircuit.agent_cli agent-run submit <RUN_ID> --stage <STAGE> --file stage-result.json
+# 2b. Process a daily review through the mandatory Agent run.
+# begin / next return a private workspace under MEALCIRCUIT_HOME/agent-runs/<RUN_ID>/.
+python -m mealcircuit.agent_cli agent-run begin 2026-01-01
+# Edit the returned result_file, then submit without a repository-local JSON file.
+# Repeat submit for the returned stage until all seven receipts are complete:
+python -m mealcircuit.agent_cli agent-run submit <RUN_ID> --stage <STAGE>
 python -m mealcircuit.agent_cli agent-run finalize <RUN_ID>
 python -m mealcircuit.agent_cli agent-run accept <RUN_ID>
 
@@ -324,10 +325,11 @@ python -m mealcircuit.agent_cli complete <任务ID> --file result.json
 python -m mealcircuit.agent_cli generate <任务ID>
 
 # 2b. 通过强制 Agent 流程处理每日复盘
-python -m mealcircuit.agent_cli agent-run begin 2026-01-01 --output stage.json
-# 按返回顺序重复 next 与 submit，直到七个阶段全部完成
-python -m mealcircuit.agent_cli agent-run next <RUN_ID> --output stage.json
-python -m mealcircuit.agent_cli agent-run submit <RUN_ID> --stage <STAGE> --file stage-result.json
+# begin / next 会在 MEALCIRCUIT_HOME/agent-runs/<RUN_ID>/ 返回私人工作目录
+python -m mealcircuit.agent_cli agent-run begin 2026-01-01
+# 编辑返回的 result_file，然后直接提交；无需在仓库根目录创建 JSON
+# 按返回顺序重复 submit，直到七个阶段全部完成
+python -m mealcircuit.agent_cli agent-run submit <RUN_ID> --stage <STAGE>
 python -m mealcircuit.agent_cli agent-run finalize <RUN_ID>
 python -m mealcircuit.agent_cli agent-run accept <RUN_ID>
 
