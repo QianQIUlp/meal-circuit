@@ -428,6 +428,49 @@ def _render_today_core_advice(work_date: str, draft: dict | None = None) -> str:
     )
 
 
+def _learning_nudge_copy(claim: dict) -> dict:
+    scope = claim.get("scope_json") or {}
+    dimension = claim.get("claim_dimension") or claim.get("claim_type") or ""
+    meal = {"breakfast": "早餐", "lunch": "午餐", "dinner": "晚餐"}.get(
+        str(scope.get("meal") or ""), str(scope.get("meal") or "这类餐次")
+    )
+    evidence = next((
+        item for item in claim.get("evidence") or []
+        if item.get("active") and item.get("stance") == "support" and item.get("excerpt")
+    ), None)
+    excerpt = str((evidence or {}).get("excerpt") or "").strip()
+    if len(excerpt) > 140:
+        excerpt = excerpt[:139].rstrip() + "…"
+    pending = claim.get("status") == "pending_confirmation"
+    copy = {
+        "eyebrow": "我想确认一下" if pending else "我准备这样调整",
+        "question": f'“{claim.get("statement") or "这条理解"}”会影响之后的安排，这样理解对吗？',
+        "impact": "确认后，之后的安排会按这个方向调整；你也可以把它只留在今天。",
+        "confirm": "对，就这样",
+        "today": "只是今天",
+        "reject": "不用这样调整",
+        "excerpt": excerpt,
+    }
+    if dimension == "execution_friction":
+        copy.update({
+            "question": f"以后需要给{meal}准备一个不用开火或更快的备选吗？",
+            "impact": f"选择“以后都准备”后，之后的{meal}会优先减少需要开火、等待或持续操作的步骤。",
+            "confirm": "以后都准备",
+        })
+    elif dimension == "resource_constraint":
+        item_name = str(scope.get("item") or "食材")
+        copy.update({
+            "question": f"以后安排{item_name}时，要优先考虑长期负担得起的选择吗？",
+            "impact": f"选择“对，就这样”后，{item_name}不会再作为默认采购，除非你主动提出或价格条件发生变化。",
+        })
+    elif dimension == "satiety_pattern":
+        copy.update({
+            "question": f"以后安排{meal}时，需要按这次的食量调整默认份量吗？",
+            "impact": "确认后，之后的份量和加减量顺序会参考这次真实的饱腹反馈。",
+        })
+    return copy
+
+
 def render_today_workspace(work_date: str) -> str:
     current = personalization.active_personalization()
     if current["status"] == "setup_required":
@@ -492,36 +535,51 @@ def render_today_workspace(work_date: str) -> str:
             'placeholder="例如：明天中午外食，晚上自己做；今天训练后特别饿。"></textarea></label>'
             '<button>记下来</button></form>'
         )
-    today_evidence_ids = {item["id"] for item in saved_records}
-    today_evidence_ids.update(
-        item["id"] for item in adaptive.list_plan_feedback(work_date)
-    )
-    learned_today = next((
+    feedback_today = adaptive.list_plan_feedback(work_date)
+    today_evidence = [*saved_records, *feedback_today]
+    evidence_rank = {item["id"]: index for index, item in enumerate(today_evidence)}
+    today_evidence_ids = set(evidence_rank)
+    learned_today_candidates = [
         item for item in state.get("claims") or []
-        if item.get("status") == "active"
+        if item.get("status") in {"active", "pending_confirmation"}
         and item.get("risk_level") == "low"
         and any(evidence.get("evidence_id") in today_evidence_ids for evidence in item.get("evidence") or [])
-    ), None)
+    ]
+    learned_today = max(
+        learned_today_candidates,
+        key=lambda item: (
+            max((
+                evidence_rank.get(evidence.get("evidence_id"), -1)
+                for evidence in item.get("evidence") or []
+            ), default=-1),
+            1 if (item.get("scope_json") or {}).get("meal") else 0,
+            1 if (item.get("scope_json") or {}).get("item") else 0,
+            1 if item.get("status") == "pending_confirmation" else 0,
+            str(item.get("updated_at") or ""),
+        ),
+        default=None,
+    )
     learning_prompt = ""
     if learned_today:
-        scope = learned_today.get("scope_json") or {}
-        if learned_today.get("claim_dimension") == "resource_constraint":
-            item_name = str(scope.get("item") or "高价食材")
-            learned_text = f"我会优先选择长期负担得起的食材，不再默认安排{item_name}。"
-        else:
-            learned_text = str(learned_today.get("statement") or "")
+        nudge = _learning_nudge_copy(learned_today)
+        evidence_html = (
+            f'<p class="learning-evidence">你刚才提到：“{esc(nudge["excerpt"])}”</p>'
+            if nudge["excerpt"] else ""
+        )
         learning_prompt = (
-            '<section class="panel learning-nudge"><p class="muted">我从这次记录里记住了</p>'
-            f'<h2>{esc(learned_text)}</h2><div class="actions">'
+            '<section class="panel learning-nudge" aria-labelledby="learning-nudge-title">'
+            f'<p class="muted">{esc(nudge["eyebrow"])}</p>'
+            f'<h2 id="learning-nudge-title">{esc(nudge["question"])}</h2>{evidence_html}'
+            f'<p class="muted">{esc(nudge["impact"])}</p><div class="actions">'
             f'<form method="post" action="/learning/claims/{esc(learned_today["id"])}/action">'
             '<input type="hidden" name="action" value="confirm"><input type="hidden" name="return_to" value="/">'
-            '<button class="secondary">对</button></form>'
-            f'<form method="post" action="/learning/claims/{esc(learned_today["id"])}/action">'
-            '<input type="hidden" name="action" value="reject"><input type="hidden" name="return_to" value="/">'
-            '<button class="secondary">不对</button></form>'
+            f'<button class="secondary">{esc(nudge["confirm"])}</button></form>'
             f'<form method="post" action="/learning/claims/{esc(learned_today["id"])}/action">'
             '<input type="hidden" name="action" value="today"><input type="hidden" name="return_to" value="/">'
-            '<button class="secondary">只适用于今天</button></form></div></section>'
+            f'<button class="secondary">{esc(nudge["today"])}</button></form>'
+            f'<form method="post" action="/learning/claims/{esc(learned_today["id"])}/action">'
+            '<input type="hidden" name="action" value="reject"><input type="hidden" name="return_to" value="/">'
+            f'<button class="secondary">{esc(nudge["reject"])}</button></form></div></section>'
         )
 
     question_cards = []

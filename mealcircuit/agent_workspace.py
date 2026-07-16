@@ -45,6 +45,16 @@ WORKSPACE_STATUSES = {
 }
 _TIMERS: dict[str, threading.Timer] = {}
 _TIMER_LOCK = threading.Lock()
+_DURABLE_FEEDBACK_MARKERS = (
+    "以后", "今后", "经常", "总是", "每次", "通常", "一直", "长期", "默认",
+)
+_AUDIT_ONLY_CONTEXT_KEYS = {
+    "audit_context_hash", "context_hash", "source_manifest", "context_inspector",
+    "created_at", "updated_at", "completed_at", "started_at", "accepted_at",
+    "first_observed_at", "last_observed_at", "last_used_at", "revision_id",
+    "version", "schema_version", "context_schema_version", "result_schema_version",
+    "validator_version", "bundle_hash",
+}
 
 
 def _now() -> str:
@@ -63,6 +73,41 @@ def _hash(value: object) -> str:
     return hashlib.sha256(
         json.dumps(value, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
     ).hexdigest()
+
+
+def _without_audit_metadata(value: object) -> object:
+    """Keep decision content stable when only receipts, timestamps, or revisions change."""
+    if isinstance(value, dict):
+        return {
+            key: _without_audit_metadata(item)
+            for key, item in value.items()
+            if key not in _AUDIT_ONLY_CONTEXT_KEYS
+        }
+    if isinstance(value, list):
+        return [_without_audit_metadata(item) for item in value]
+    return value
+
+
+def _decision_context_projection(context: dict) -> dict:
+    """Return only information whose meaning can change the plan."""
+    projection = deepcopy(context)
+    projection.pop("source_manifest", None)
+    projection.pop("context_inspector", None)
+    projection.pop("context_hash", None)
+    projection.pop("audit_context_hash", None)
+    claims = ((projection.get("person") or {}).get("active_user_model") or [])
+    if projection.get("person") is not None:
+        projection["person"]["active_user_model"] = [
+            {
+                key: claim.get(key)
+                for key in (
+                    "id", "type", "claim_type", "statement", "scope", "effect",
+                    "planning_impact",
+                )
+            }
+            for claim in claims
+        ]
+    return _without_audit_metadata(projection)
 
 
 def _provider_metadata(provider: ai.AIProvider) -> tuple[str, str]:
@@ -362,11 +407,67 @@ def _recover_recent_user_learning_once() -> None:
         )
 
 
+def _feedback_requests_durable_change(text: str) -> bool:
+    clean = str(text or "").strip()
+    return bool(clean) and any(marker in clean for marker in _DURABLE_FEEDBACK_MARKERS)
+
+
+def _repair_overeager_single_feedback_claims() -> None:
+    """Return one-off friction observations to confirmation without erasing evidence."""
+    timestamp = _now()
+    changed = False
+    with connect() as conn:
+        rows = [row_dict(row) for row in conn.execute(
+            """SELECT * FROM user_model_claims
+               WHERE status='active' AND risk_level='low'
+                 AND claim_dimension='execution_friction' AND source='execution_feedback'"""
+        ).fetchall()]
+        for claim in rows:
+            user_decision = conn.execute(
+                """SELECT 1 FROM user_model_claim_versions
+                   WHERE claim_id=? AND change_reason IN (
+                       'user_confirm','user_stable','user_resume','user_today'
+                   ) LIMIT 1""",
+                (claim["id"],),
+            ).fetchone()
+            if user_decision:
+                continue
+            evidence = [row_dict(row) for row in conn.execute(
+                """SELECT * FROM user_model_evidence
+                   WHERE claim_id=? AND stance='support' AND active=1""",
+                (claim["id"],),
+            ).fetchall()]
+            if (
+                len(evidence) != 1
+                or evidence[0]["evidence_type"] != "execution_feedback"
+                or _feedback_requests_durable_change(evidence[0].get("excerpt") or "")
+            ):
+                continue
+            conn.execute(
+                "UPDATE user_model_evidence SET explicit=0 WHERE id=?",
+                (evidence[0]["id"],),
+            )
+            conn.execute(
+                """UPDATE user_model_claims
+                   SET status='pending_confirmation',confidence=MIN(confidence,0.55),
+                       version=version+1,updated_at=? WHERE id=?""",
+                (timestamp, claim["id"]),
+            )
+            updated = row_dict(conn.execute(
+                "SELECT * FROM user_model_claims WHERE id=?", (claim["id"],)
+            ).fetchone())
+            _append_claim_version(conn, updated, "single_feedback_needs_confirmation", timestamp)
+            changed = True
+        if changed:
+            _refresh_user_model_projection(conn, timestamp)
+
+
 def list_claims(*, include_inactive: bool = True) -> list[dict]:
     init_db()
     _migrate_legacy_rules_once()
     _hydrate_user_model_projection()
     _recover_recent_user_learning_once()
+    _repair_overeager_single_feedback_claims()
     timestamp = _now()
     with connect() as conn:
         expired = conn.execute(
@@ -697,6 +798,39 @@ def _compact_claims(*, effective_on: str | None = None) -> list[dict]:
     return result
 
 
+def _required_outcome_adjustments(rows: list[dict]) -> list[dict]:
+    """Select recent, repeatable execution lessons that the next plan must address."""
+    selected: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    for row in reversed(rows):
+        attribution = row.get("attribution_json") or {}
+        cause = str(attribution.get("primary_cause") or "")
+        next_change = str(attribution.get("next_change") or "").strip()
+        meal_slot = str(row.get("meal_slot") or "unknown")
+        key = (meal_slot, cause)
+        if (
+            key in seen
+            or cause in {"", "none", "unknown", "temporary_event", "body_state"}
+            or not next_change
+            or attribution.get("likely_repeat") is not True
+        ):
+            continue
+        seen.add(key)
+        selected.append({
+            "outcome_id": row.get("id") or attribution.get("feedback_id"),
+            "feedback_id": attribution.get("feedback_id"),
+            "plan_date": row.get("plan_date"),
+            "meal_slot": meal_slot,
+            "cause": cause,
+            "purpose": attribution.get("purpose") or "",
+            "required_change": next_change,
+            "evidence": attribution.get("evidence") or {},
+        })
+        if len(selected) >= 5:
+            break
+    return list(reversed(selected))
+
+
 def build_agent_context(review_date: str) -> dict:
     _validate_date(review_date)
     require_generation("daily")
@@ -782,6 +916,9 @@ def build_agent_context(review_date: str) -> dict:
         ],
         "clarification_answers": answered,
     }
+    outcome_attributions = intelligence.list_outcome_attributions(
+        (date.fromisoformat(review_date) - timedelta(days=30)).isoformat(), review_date
+    )
     longitudinal = {
         "selected_execution_feedback": feedback[-30:],
         "relevant_meal_evidence": base.get("meal_evidence") or [],
@@ -791,9 +928,7 @@ def build_agent_context(review_date: str) -> dict:
         "active_experiment": base.get("active_experiment"),
         "transient_adaptations": base.get("transient_adaptations") or [],
         "meal_episodes": [item.get("projection_json") or {} for item in episodes],
-        "outcome_attributions": intelligence.list_outcome_attributions(
-            (date.fromisoformat(review_date) - timedelta(days=30)).isoformat(), review_date
-        ),
+        "outcome_attributions": outcome_attributions,
     }
     immutable = {
         "effective_meal_modes": (base.get("meal_mode_resolution") or {}).get("effective_meal_modes") or {},
@@ -853,6 +988,7 @@ def build_agent_context(review_date: str) -> dict:
                 for dimension in program.get("required_dimensions") or []
             )),
             "required_non_negotiables": goal_contract.get("non_negotiables") or [],
+            "required_outcome_adjustments": _required_outcome_adjustments(outcome_attributions),
         },
         "source_manifest": source_manifest,
         "context_inspector": {
@@ -873,7 +1009,10 @@ def build_agent_context(review_date: str) -> dict:
     context["fact_bundle"] = intelligence.compile_fact_bundle(
         context, episodes=context["longitudinal"]["meal_episodes"]
     )
-    context["context_hash"] = _hash(context)
+    context["audit_context_hash"] = _hash(context)
+    context["context_hash"] = _hash(_decision_context_projection(context))
+    context["source_manifest"]["audit_context_hash"] = context["audit_context_hash"]
+    context["source_manifest"]["decision_context_hash"] = context["context_hash"]
     return context
 
 
@@ -888,10 +1027,20 @@ def case_formulation_schema() -> dict:
         "properties": {
             "current_state": {"type": "array", "items": {"type": "string"}},
             "explicit_goals": {"type": "array", "items": {"type": "string"}},
-            "underlying_needs": {"type": "array", "items": {"type": "object", "additionalProperties": True}},
+            "underlying_needs": {
+                "type": "array", "items": {"anyOf": [
+                    {"type": "string"},
+                    {"type": "object", "additionalProperties": True},
+                ]},
+            },
             "tensions": {"type": "array", "items": {"type": "string"}},
             "decisive_constraints": {"type": "array", "items": {"type": "string"}},
-            "historical_patterns": {"type": "array", "items": {"type": "object", "additionalProperties": True}},
+            "historical_patterns": {
+                "type": "array", "items": {"anyOf": [
+                    {"type": "string"},
+                    {"type": "object", "additionalProperties": True},
+                ]},
+            },
             "soft_assumptions": {"type": "array", "items": _claim_candidate_schema()},
             "uncertainties": {"type": "array", "items": {"type": "string"}},
             "intake_classifications": {
@@ -986,7 +1135,7 @@ def strategy_comparison_schema() -> dict:
                 "type": "array", "minItems": 2, "maxItems": 3,
                 "items": {
                     "type": "object", "additionalProperties": False,
-                    "required": ["id", "label", "summary", "scores", "tradeoffs", "solves_priorities"],
+                    "required": ["id", "label", "summary", "scores", "tradeoffs", "coverage"],
                     "properties": {
                         "id": {"type": "string"}, "label": {"type": "string"},
                         "summary": {"type": "string"},
@@ -995,6 +1144,18 @@ def strategy_comparison_schema() -> dict:
                             "required": list(score_properties), "properties": score_properties,
                         },
                         "tradeoffs": {"type": "array", "items": {"type": "string"}},
+                        "coverage": {
+                            "type": "array", "minItems": 1,
+                            "items": {
+                                "type": "object", "additionalProperties": False,
+                                "required": ["requirement_ref", "approach", "tradeoff"],
+                                "properties": {
+                                    "requirement_ref": {"type": "string"},
+                                    "approach": {"type": "string"},
+                                    "tradeoff": {"type": "string"},
+                                },
+                            },
+                        },
                         "solves_priorities": {"type": "array", "items": {"type": "string"}},
                     },
                 },
@@ -1062,7 +1223,18 @@ def daily_plan_v3_schema(context: dict) -> dict:
     base_context["settings"] = _daily_settings_from_agent_context(context)
     schema = deepcopy(result_json_schema("daily", base_context))
     schema["properties"].update({
-        "problems_to_solve": {"type": "array", "minItems": 1, "maxItems": 3, "items": {"type": "string"}},
+        "problems_to_solve": {"type": "array", "minItems": 1, "items": {"type": "string"}},
+        "problem_responses": {
+            "type": "array", "minItems": 1,
+            "items": {
+                "type": "object", "additionalProperties": False,
+                "required": ["problem_ref", "response"],
+                "properties": {
+                    "problem_ref": {"type": "string"},
+                    "response": {"type": "string"},
+                },
+            },
+        },
         "selected_strategy": {"type": "string"},
         "strategy_tradeoffs": {"type": "array", "items": {"type": "string"}},
         "predictions": {
@@ -1098,12 +1270,16 @@ def daily_plan_v3_schema(context: dict) -> dict:
             "type": "array", "minItems": 1, "maxItems": 3,
             "items": {
                 "type": "object", "additionalProperties": False,
-                "required": ["advice", "basis_kind", "source_ids"],
+                "required": ["advice", "basis_kind", "source_refs"],
                 "properties": {
                     "advice": {"type": "string"},
                     "basis_kind": {
                         "type": "string",
                         "enum": ["user_context", "professional_principle"],
+                    },
+                    "source_refs": {
+                        "type": "array", "minItems": 1,
+                        "items": {"type": "string"},
                     },
                     "source_ids": {
                         "type": "array", "minItems": 1,
@@ -1112,9 +1288,10 @@ def daily_plan_v3_schema(context: dict) -> dict:
                 },
             },
         },
+        "portion_reality": {"type": "object", "additionalProperties": True},
     })
     schema["required"].extend([
-        "problems_to_solve", "selected_strategy", "strategy_tradeoffs", "predictions",
+        "problem_responses", "selected_strategy", "strategy_tradeoffs", "predictions",
         "case_summary", "planning_rationale", "evidence_summary", "possible_resistance", "adjustment_conditions",
         "day_nutrition", "advice_evidence",
     ])
@@ -1166,9 +1343,10 @@ def plan_review_schema() -> dict:
             "problem_coverage": {
                 "type": "array", "items": {
                     "type": "object", "additionalProperties": False,
-                    "required": ["problem", "addressed", "evidence"],
+                    "required": ["problem_ref", "addressed", "evidence"],
                     "properties": {
-                        "problem": {"type": "string"}, "addressed": {"type": "boolean"},
+                        "problem_ref": {"type": "string"}, "problem": {"type": "string"},
+                        "addressed": {"type": "boolean"},
                         "evidence": {"type": "string"},
                     },
                 },
@@ -1176,9 +1354,10 @@ def plan_review_schema() -> dict:
             "dimension_coverage": {
                 "type": "array", "items": {
                     "type": "object", "additionalProperties": False,
-                    "required": ["dimension", "addressed", "evidence"],
+                    "required": ["dimension_ref", "addressed", "evidence"],
                     "properties": {
-                        "dimension": {"type": "string"}, "addressed": {"type": "boolean"},
+                        "dimension_ref": {"type": "string"}, "dimension": {"type": "string"},
+                        "addressed": {"type": "boolean"},
                         "evidence": {"type": "string"},
                     },
                 },
@@ -1186,9 +1365,10 @@ def plan_review_schema() -> dict:
             "evidence_checks": {
                 "type": "array", "items": {
                     "type": "object", "additionalProperties": False,
-                    "required": ["claim", "supported", "source_or_boundary"],
+                    "required": ["advice_ref", "supported", "source_or_boundary"],
                     "properties": {
-                        "claim": {"type": "string"}, "supported": {"type": "boolean"},
+                        "advice_ref": {"type": "string"}, "claim": {"type": "string"},
+                        "supported": {"type": "boolean"},
                         "source_or_boundary": {"type": "string"},
                     },
                 },
@@ -1253,6 +1433,16 @@ def _validate_formulation(result: dict, question_budget: int) -> dict:
             continue
         filtered.append(item)
     result = deepcopy(result)
+    result["underlying_needs"] = [
+        {"need": item, "reason": "由个案阶段提出，具体依据见本次事实包。"}
+        if isinstance(item, str) else item
+        for item in result.get("underlying_needs") or []
+    ]
+    result["historical_patterns"] = [
+        {"pattern": item, "evidence_ids": []}
+        if isinstance(item, str) else item
+        for item in result.get("historical_patterns") or []
+    ]
     result["clarification_questions"] = filtered
     priorities = result.get("planning_priorities")
     if not isinstance(priorities, list) or not 1 <= len(priorities) <= 3:
@@ -1260,7 +1450,7 @@ def _validate_formulation(result: dict, question_budget: int) -> dict:
     return result
 
 
-def _validate_portions(result: dict, context: dict) -> None:
+def _validate_portions(result: dict, context: dict) -> dict:
     meals = ((result.get("tomorrow_menu") or {}).get("meals") or [])
     if len(meals) != 3:
         raise ValidationError("DailyPlanV3 必须包含三餐")
@@ -1305,8 +1495,20 @@ def _validate_portions(result: dict, context: dict) -> None:
             raise ValidationError("三餐蛋白范围与全天蛋白范围没有合理重叠")
     targets = context["person"].get("targets") or []
     protein_target = next((item.get("value_json") for item in targets if item.get("target_key") == "protein_g"), None)
-    if isinstance(protein_target, list) and len(protein_target) == 2 and planned_protein[0] < protein_target[0]:
-        raise ValidationError(f"全天计划蛋白下界必须覆盖已确认目标下界 {protein_target[0]}g")
+    confidence = str(day_nutrition.get("confidence") or "low")
+    uncertainty_ratio = {"high": 0.05, "medium": 0.10, "low": 0.15}.get(confidence, 0.15)
+    coverage = "no_confirmed_numeric_target"
+    if isinstance(protein_target, list) and len(protein_target) == 2:
+        target_floor = float(protein_target[0])
+        tolerated_floor = target_floor * (1 - uncertainty_ratio)
+        if planned_protein[0] >= target_floor:
+            coverage = "covers_confirmed_floor"
+        elif planned_protein[1] >= target_floor and planned_protein[0] >= tolerated_floor:
+            coverage = "reasonable_overlap_with_estimation_uncertainty"
+        else:
+            raise ValidationError(
+                "全天计划蛋白范围明显低于已确认目标；不能用宽区间或单个高估值伪装覆盖"
+            )
     energy_target = next((item.get("value_json") for item in targets if item.get("target_key") == "energy_kcal"), None)
     energy = day_nutrition.get("energy_kcal")
     if isinstance(energy_target, list) and len(energy_target) == 2:
@@ -1314,6 +1516,37 @@ def _validate_portions(result: dict, context: dict) -> None:
             raise ValidationError("数值辅助模式有有效能量目标时，全天能量必须提供范围")
         if energy[1] < energy_target[0] or energy[0] > energy_target[1]:
             raise ValidationError("全天能量范围与当前有效目标没有合理重叠")
+    hunger_module = (((context.get("today") or {}).get("checkin") or {}).get("modules") or {}).get("hunger") or {}
+    hunger_answers = hunger_module.get("answers_json") or hunger_module.get("answers") or hunger_module
+    if not isinstance(hunger_answers, dict):
+        hunger_answers = {}
+    appetite_context = {
+        "hunger_level": hunger_answers.get("hunger_level"),
+        "satiety": hunger_answers.get("satiety"),
+        "cravings": hunger_answers.get("cravings"),
+    }
+    cost_context = [
+        item.get("statement") for item in context["person"].get("active_user_model") or []
+        if item.get("type") == "resource_constraint"
+    ]
+    execution_context = [
+        item.get("statement") for item in context["person"].get("active_user_model") or []
+        if item.get("type") in {"execution_friction", "satiety_pattern"}
+    ]
+    return {
+        "protein_target_g": protein_target,
+        "planned_protein_g": planned_protein,
+        "estimate_confidence": confidence,
+        "uncertainty_ratio": uncertainty_ratio,
+        "coverage": coverage,
+        "appetite_context": appetite_context,
+        "cost_context": [item for item in cost_context if item],
+        "execution_context": [item for item in execution_context if item],
+        "review_question": (
+            "这组份量是否在合理估算误差内支持已确认目标，同时尊重当天食欲、预算、"
+            "实际可执行性和长期负担，而不是为了碰到一个精确下界机械加量？"
+        ),
+    }
 
 
 def _stage_generate(provider: ai.AIProvider, kind: str, context: dict, schema: dict, attempts: list[dict]) -> dict:
@@ -1637,6 +1870,102 @@ def _review_evidence_pack(context: dict) -> dict:
     }
 
 
+def _planning_requirement_catalog(formulation: dict, context: dict) -> list[dict]:
+    catalog: list[dict] = []
+    for index, statement in enumerate(formulation.get("planning_priorities") or [], 1):
+        catalog.append({"ref": f"case:{index}", "kind": "case_priority", "statement": str(statement)})
+    programs = ((context.get("person") or {}).get("goal_program") or {}).get("programs") or []
+    if programs:
+        for index, program in enumerate(programs, 1):
+            dimensions = [str(item) for item in program.get("required_dimensions") or []]
+            catalog.append({
+                "ref": f"goal:{index}",
+                "kind": "goal_program",
+                "statement": f"{program.get('label') or '当前目标'}：{'、'.join(dimensions)}",
+                "dimensions": dimensions,
+            })
+    else:
+        for index, statement in enumerate(context["decision_task"].get("required_goal_dimensions") or [], 1):
+            catalog.append({
+                "ref": f"goal:{index}", "kind": "goal_program", "statement": str(statement),
+                "dimensions": [str(statement)],
+            })
+    for index, statement in enumerate(context["decision_task"].get("required_non_negotiables") or [], 1):
+        catalog.append({"ref": f"boundary:{index}", "kind": "non_negotiable", "statement": str(statement)})
+    for index, item in enumerate(context["decision_task"].get("required_outcome_adjustments") or [], 1):
+        catalog.append({
+            "ref": f"outcome:{index}",
+            "kind": "execution_learning",
+            "statement": str(item.get("required_change") or ""),
+            "evidence": {
+                "feedback_id": item.get("feedback_id"),
+                "plan_date": item.get("plan_date"),
+                "meal_slot": item.get("meal_slot"),
+                "cause": item.get("cause"),
+            },
+        })
+    return catalog
+
+
+def _plan_problem_catalog(formulation: dict, context: dict) -> list[dict]:
+    return [
+        item for item in _planning_requirement_catalog(formulation, context)
+        if item["kind"] in {"case_priority", "execution_learning"}
+    ]
+
+
+def _evidence_catalog(context: dict) -> list[dict]:
+    catalog: list[dict] = []
+    for index, item in enumerate(context["fact_bundle"].get("facts") or [], 1):
+        catalog.append({
+            "ref": f"evidence.fact:{index}", "kind": "user_context",
+            "source_id": item.get("source_id"), "summary": item.get("value"),
+        })
+    for index, item in enumerate(context["person"].get("active_user_model") or [], 1):
+        catalog.append({
+            "ref": f"evidence.understanding:{index}", "kind": "user_context",
+            "source_id": item.get("id"), "summary": item.get("statement"),
+        })
+    contract = context["person"].get("goal_contract") or {}
+    catalog.append({
+        "ref": "evidence.goal:1", "kind": "user_context",
+        "source_id": contract.get("contract_id"),
+        "summary": {
+            "goals": contract.get("goals") or [],
+            "non_negotiables": contract.get("non_negotiables") or [],
+        },
+    })
+    for index, item in enumerate(context["professional_basis"].get("principles") or [], 1):
+        catalog.append({
+            "ref": f"evidence.principle:{index}", "kind": "professional_principle",
+            "source_id": item.get("id"), "summary": item.get("principle"),
+            "boundary": item.get("boundary"),
+        })
+    return [item for item in catalog if item.get("source_id")]
+
+
+def _review_catalog(formulation: dict, context: dict, candidate: dict) -> dict:
+    requirements = _planning_requirement_catalog(formulation, context)
+    dimensions = [
+        item for item in requirements
+        if item["kind"] in {"goal_program", "non_negotiable"}
+    ]
+    portion = candidate.get("portion_reality") or {}
+    dimensions.append({
+        "ref": "system:portion_reality",
+        "kind": "system_review",
+        "statement": str(portion.get("review_question") or "份量要兼顾目标区间、估算误差、食欲、成本和长期执行。"),
+    })
+    return {
+        "problems": _plan_problem_catalog(formulation, context),
+        "dimensions": dimensions,
+        "advice": [
+            {"ref": f"advice:{index}", "statement": str(statement)}
+            for index, statement in enumerate(candidate.get("core_advice") or [], 1)
+        ],
+    }
+
+
 def _stage_input(run: dict, context: dict, stage: str) -> tuple[dict, dict]:
     receipts = _stage_receipt_map(run["id"])
     state = run.get("stage_state_json") or {}
@@ -1680,6 +2009,7 @@ def _stage_input(run: dict, context: dict, stage: str) -> tuple[dict, dict]:
         }
         schema = {"type": "object", "additionalProperties": True}
     elif stage == "strategy_comparison":
+        requirement_catalog = _planning_requirement_catalog(formulation, context)
         payload = {
             "context_schema": "StrategyComparisonV1Input",
             "generation_policy": context["generation_policy"],
@@ -1687,13 +2017,17 @@ def _stage_input(run: dict, context: dict, stage: str) -> tuple[dict, dict]:
             "professional_boundary": (receipts.get("professional_boundary") or {}).get("result_json") or {},
             "active_user_model": context["person"]["active_user_model"],
             "immutable_constraints": context["decision_task"]["immutable_constraints"],
-            "required_goal_dimensions": context["decision_task"]["required_goal_dimensions"],
-            "required_non_negotiables": context["decision_task"]["required_non_negotiables"],
+            "requirement_catalog": requirement_catalog,
             "goal_contract": context["person"]["goal_contract"],
-            "instruction": "比较2–3个现实可行方向，只选择一个；不能把选择负担交还给用户。",
+            "instruction": (
+                "比较2–3个现实可行方向，只选择一个；不能把选择负担交还给用户。"
+                "用 requirement_ref 说明每项现实要求怎样被处理，不要复制原文凑覆盖。"
+            ),
         }
         schema = strategy_comparison_schema()
     elif stage == "plan_design":
+        problem_catalog = _plan_problem_catalog(formulation, context)
+        evidence_catalog = _evidence_catalog(context)
         payload = {
             "context_schema": "DailyPlanV3Input",
             "generation_policy": context["generation_policy"],
@@ -1702,12 +2036,22 @@ def _stage_input(run: dict, context: dict, stage: str) -> tuple[dict, dict]:
             "longitudinal": context["longitudinal"],
             "professional_basis": context["professional_basis"],
             "decision_task": context["decision_task"],
+            "problem_catalog": problem_catalog,
+            "evidence_catalog": [
+                {key: item.get(key) for key in ("ref", "kind", "summary", "boundary") if item.get(key) is not None}
+                for item in evidence_catalog
+            ],
+            "compiler_contract": (
+                "problem_responses 使用 problem_ref；advice_evidence 使用 source_refs。"
+                "系统会把引用编译为真实问题和来源 ID，模型不得填写数据库 ID。"
+            ),
         }
         if state.get("review_feedback"):
             payload["independent_review_feedback"] = state["review_feedback"]
             payload["revision_instruction"] = "只修复审查指出的问题，保留已满足需求的部分。"
         schema = daily_plan_v3_schema(context)
     elif stage == "independent_review":
+        review_catalog = _review_catalog(formulation, context, candidate)
         payload = {
             "context_schema": "PlanReviewV1Input",
             "generation_policy": context["generation_policy"],
@@ -1717,10 +2061,7 @@ def _stage_input(run: dict, context: dict, stage: str) -> tuple[dict, dict]:
             "professional_boundary": (receipts.get("professional_boundary") or {}).get("result_json") or {},
             "evidence_pack": _review_evidence_pack(context),
             "decision_task": context["decision_task"],
-            "required_dimensions": list(dict.fromkeys([
-                *(context["decision_task"].get("required_goal_dimensions") or []),
-                *(context["decision_task"].get("required_non_negotiables") or []),
-            ])),
+            "review_catalog": review_catalog,
             "review_dimensions": [
                 "真实需求", "专业与安全", "菜量与量具", "训练和恢复", "食欲睡眠肠胃",
                 "预算", "时间与复杂度", "历史纠正", "菜单语义", "人的接受度",
@@ -1800,30 +2141,142 @@ def _validate_stage_schema(value: object, schema: dict, path: str = "结果") ->
             raise ValidationError(f"{path}超过允许上界")
 
 
-def _validate_strategy_result(result: dict, context: dict, formulation: dict) -> None:
+def _compile_strategy_result(result: dict, context: dict, formulation: dict) -> dict:
     options = result.get("options")
     if not isinstance(options, list) or not 2 <= len(options) <= 3:
         raise ValidationError("策略比较必须提供 2–3 个现实可行方向")
     ids = [str(item.get("id") or "") for item in options if isinstance(item, dict)]
     if not all(ids) or len(ids) != len(set(ids)) or result.get("selected_id") not in ids:
         raise ValidationError("策略比较必须明确选择一个有效方向")
-    selected = next(item for item in options if item.get("id") == result.get("selected_id"))
-    covered = {str(item) for item in selected.get("solves_priorities") or []}
-    required = {
-        *(str(item) for item in formulation.get("planning_priorities") or []),
-        *(str(item) for item in context["decision_task"].get("required_goal_dimensions") or []),
-        *(str(item) for item in context["decision_task"].get("required_non_negotiables") or []),
-    }
-    missing = sorted(required - covered)
+    compiled = deepcopy(result)
+    catalog = _planning_requirement_catalog(formulation, context)
+    by_ref = {item["ref"]: item for item in catalog}
+    if not by_ref:
+        raise ValidationError("系统没有形成可供策略比较的真实要求")
+    for option in compiled["options"]:
+        rows = option.get("coverage") or []
+        refs = [str(item.get("requirement_ref") or "") for item in rows if isinstance(item, dict)]
+        if len(refs) != len(set(refs)) or any(ref not in by_ref for ref in refs):
+            raise ValidationError("策略覆盖引用了未知或重复的现实要求")
+        option["solves_priorities"] = [by_ref[ref]["statement"] for ref in refs]
+    selected = next(
+        item for item in compiled["options"] if item.get("id") == result.get("selected_id")
+    )
+    selected_rows = selected.get("coverage") or []
+    covered = {str(item.get("requirement_ref") or "") for item in selected_rows if isinstance(item, dict)}
+    missing = sorted(set(by_ref) - covered)
     if missing:
-        raise ValidationError("所选策略没有覆盖本次必需目标维度：" + "、".join(missing))
+        labels = [by_ref[ref]["statement"] for ref in missing]
+        raise ValidationError("所选策略没有说明怎样处理本次真实要求：" + "、".join(labels))
+    if any(
+        not str(item.get("approach") or "").strip()
+        or not str(item.get("tradeoff") or "").strip()
+        for item in selected_rows
+    ):
+        raise ValidationError("所选策略必须说明每项真实要求的做法和代价，不能只复制引用")
+    return compiled
+
+
+def _compile_plan_references(result: dict, context: dict, formulation: dict) -> dict:
+    compiled = deepcopy(result)
+    problems = {item["ref"]: item for item in _plan_problem_catalog(formulation, context)}
+    responses = compiled.get("problem_responses") or []
+    response_refs = [str(item.get("problem_ref") or "") for item in responses if isinstance(item, dict)]
+    if len(response_refs) != len(set(response_refs)) or any(ref not in problems for ref in response_refs):
+        raise ValidationError("计划引用了未知或重复的真实问题")
+    missing = sorted(set(problems) - set(response_refs))
+    if missing:
+        raise ValidationError(
+            "计划没有说明怎样回应这些真实问题：" + "、".join(problems[ref]["statement"] for ref in missing)
+        )
+    if any(not str(item.get("response") or "").strip() for item in responses):
+        raise ValidationError("计划必须写清每个真实问题如何落实，不能只复制引用")
+    compiled["problems_to_solve"] = [problems[ref]["statement"] for ref in response_refs]
+
+    evidence_catalog = {item["ref"]: item for item in _evidence_catalog(context)}
+    evidence_rows = compiled.get("advice_evidence") or []
+    for row in evidence_rows:
+        refs = [str(item) for item in row.get("source_refs") or []]
+        if len(refs) != len(set(refs)) or any(ref not in evidence_catalog for ref in refs):
+            raise ValidationError("核心建议引用了本次上下文中不存在的证据")
+        expected_kind = str(row.get("basis_kind") or "")
+        if not any(evidence_catalog[ref]["kind"] == expected_kind for ref in refs):
+            raise ValidationError("核心建议的依据类型与所引用证据不一致")
+        row["source_ids"] = [str(evidence_catalog[ref]["source_id"]) for ref in refs]
+    return compiled
+
+
+def _positive_plan_food_texts(result: dict) -> list[str]:
+    menu = result.get("tomorrow_menu") or {}
+    texts: list[str] = []
+
+    def add(value: object) -> None:
+        if isinstance(value, str) and value.strip():
+            texts.append(value.strip())
+        elif isinstance(value, list):
+            for item in value:
+                add(item)
+
+    for meal in menu.get("meals") or []:
+        add(meal.get("foods") or [])
+        add(meal.get("substitutions") or [])
+        for item in meal.get("portion_contracts") or []:
+            if isinstance(item, dict):
+                add(item.get("item"))
+        recipe = meal.get("recipe_card") or {}
+        for item in recipe.get("ingredients") or []:
+            if isinstance(item, dict):
+                add(item.get("name") or item.get("item") or item.get("ingredient"))
+            else:
+                add(item)
+        guidance = meal.get("eat_out_guidance") or {}
+        if isinstance(guidance, dict):
+            for value in guidance.values():
+                add(value)
+    for collection_name in ("shopping_list", "online_options"):
+        for item in menu.get(collection_name) or []:
+            if isinstance(item, dict):
+                for key in ("name", "item", "ingredient", "product", "search_keywords", "specification"):
+                    add(item.get(key))
+            else:
+                add(item)
+    reuse = menu.get("reuse_plan") or {}
+    for item in ((reuse.get("items") or []) if isinstance(reuse, dict) else []):
+        if isinstance(item, dict):
+            add(item.get("ingredient") or item.get("item"))
+            add(item.get("later_uses") or [])
+    return texts
+
+
+def _plan_affirmatively_uses_item(result: dict, item: str) -> bool:
+    needle = item.casefold()
+    negative_markers = ("不", "避免", "无需", "取消", "别", "排除", "跳过", "不用")
+    for text in _positive_plan_food_texts(result):
+        value = text.casefold()
+        cursor = 0
+        while True:
+            index = value.find(needle, cursor)
+            if index < 0:
+                break
+            prefix = value[max(0, index - 12):index]
+            suffix = value[index + len(needle):index + len(needle) + 6]
+            explanatory_tail = value[index + len(needle):index + len(needle) + 24]
+            repeated_as_negative = (
+                needle in explanatory_tail
+                and any(marker in explanatory_tail for marker in negative_markers)
+            )
+            if (
+                not any(marker in prefix for marker in negative_markers)
+                and "除外" not in suffix
+                and not repeated_as_negative
+            ):
+                return True
+            cursor = index + len(needle)
+    return False
 
 
 def _validate_plan_result(result: dict, context: dict, formulation: dict, strategy: dict) -> dict:
-    priorities = {str(item) for item in formulation.get("planning_priorities") or []}
-    solved = {str(item) for item in result.get("problems_to_solve") or []}
-    if priorities - solved:
-        raise ValidationError("计划没有逐项回应个案阶段提出的真实问题")
+    result = _compile_plan_references(result, context, formulation)
     selected = str(strategy.get("selected_id") or "")
     selected_option = next(
         (item for item in strategy.get("options") or [] if item.get("id") == selected), {}
@@ -1857,50 +2310,88 @@ def _validate_plan_result(result: dict, context: dict, formulation: dict, strate
             raise ValidationError("一般专业建议必须引用本次适用的专业原则")
         if row.get("basis_kind") == "user_context" and not source_ids.intersection(user_context_ids):
             raise ValidationError("个案建议必须引用本次真实用户上下文")
-    menu_text = json.dumps(result.get("tomorrow_menu") or {}, ensure_ascii=False)
     for claim in context["person"].get("active_user_model") or []:
         scope = claim.get("scope") or {}
         if claim.get("type") in {"resource_constraint", "stable_preference", "temporary_state"}:
             item = str(scope.get("item") or "").strip()
-            if item and item not in {"日常食材", "这类食物"} and item in menu_text:
+            if (
+                item and item not in {"日常食材", "这类食物"}
+                and _plan_affirmatively_uses_item(result, item)
+            ):
                 raise ValidationError(
                     f"用户已明确要求 {item} 不作为默认项；当前计划仍在默认安排它"
                 )
-    _validate_portions(result, context)
+    result["portion_reality"] = _validate_portions(result, context)
     from . import service
 
     return service.validate_daily_review_candidate(context["today"]["date"], result)
 
 
+def _compile_review_result(
+    result: dict, formulation: dict, context: dict, candidate: dict | None = None
+) -> dict:
+    candidate = candidate or {}
+    catalog = _review_catalog(formulation, context, candidate)
+    compiled = deepcopy(result)
+    mappings = (
+        ("problem_coverage", "problem_ref", "problem", "problems"),
+        ("dimension_coverage", "dimension_ref", "dimension", "dimensions"),
+        ("evidence_checks", "advice_ref", "claim", "advice"),
+    )
+    for collection, ref_key, text_key, catalog_key in mappings:
+        by_ref = {item["ref"]: item["statement"] for item in catalog[catalog_key]}
+        rows = compiled.get(collection) or []
+        refs = [str(item.get(ref_key) or "") for item in rows if isinstance(item, dict)]
+        if len(refs) != len(set(refs)) or any(ref not in by_ref for ref in refs):
+            raise ValidationError("独立审查引用了未知或重复的审查项")
+        for row in rows:
+            row[text_key] = by_ref[str(row[ref_key])]
+    return compiled
+
+
 def _validate_review_result(
     result: dict, formulation: dict, context: dict, candidate: dict | None = None
-) -> None:
-    expected = {str(item) for item in formulation.get("planning_priorities") or []}
+) -> dict:
+    result = _compile_review_result(result, formulation, context, candidate)
+    catalog = _review_catalog(formulation, context, candidate or {})
+    expected_problem_refs = {item["ref"] for item in catalog["problems"]}
     coverage = result.get("problem_coverage") or []
-    covered = {str(item.get("problem") or "") for item in coverage if item.get("addressed") is True}
-    if expected - covered:
-        raise ValidationError("独立审查没有确认计划逐项解决个案问题")
-    required_dimensions = {
-        *(str(item) for item in context["decision_task"].get("required_goal_dimensions") or []),
-        *(str(item) for item in context["decision_task"].get("required_non_negotiables") or []),
+    covered_problem_refs = {
+        str(item.get("problem_ref") or "") for item in coverage if item.get("addressed") is True
     }
+    if expected_problem_refs - covered_problem_refs:
+        raise ValidationError("独立审查没有确认计划逐项解决个案问题与执行学习")
+    if any(
+        item.get("addressed") is True and not str(item.get("evidence") or "").strip()
+        for item in coverage
+    ):
+        raise ValidationError("独立审查必须说明计划在哪里实际回应了问题")
+    required_dimension_refs = {item["ref"] for item in catalog["dimensions"]}
     dimension_coverage = result.get("dimension_coverage") or []
-    covered_dimensions = {
-        str(item.get("dimension") or "")
+    covered_dimension_refs = {
+        str(item.get("dimension_ref") or "")
         for item in dimension_coverage if item.get("addressed") is True
     }
-    if required_dimensions - covered_dimensions:
-        raise ValidationError("独立审查没有确认计划覆盖目标契约与不可牺牲项")
-    expected_advice = {
-        str(item).strip() for item in (candidate or {}).get("core_advice") or [] if str(item).strip()
-    }
+    if required_dimension_refs - covered_dimension_refs:
+        raise ValidationError("独立审查没有确认计划覆盖目标边界和现实份量")
+    if any(
+        item.get("addressed") is True and not str(item.get("evidence") or "").strip()
+        for item in dimension_coverage
+    ):
+        raise ValidationError("独立审查必须说明目标边界和现实份量如何落实")
+    expected_advice_refs = {item["ref"] for item in catalog["advice"]}
     evidence_checks = result.get("evidence_checks") or []
-    checked_advice = {
-        str(item.get("claim") or "").strip()
+    checked_advice_refs = {
+        str(item.get("advice_ref") or "")
         for item in evidence_checks if item.get("supported") is True
     }
-    if expected_advice - checked_advice:
+    if expected_advice_refs - checked_advice_refs:
         raise ValidationError("独立审查没有逐条核对核心建议的事实或专业依据")
+    if any(
+        item.get("supported") is True and not str(item.get("source_or_boundary") or "").strip()
+        for item in evidence_checks
+    ):
+        raise ValidationError("独立审查必须说明核心建议由什么事实或专业边界支持")
     if any(item.get("supported") is not True for item in evidence_checks):
         if result.get("approved") is True:
             raise ValidationError("存在无证据建议时，独立审查不能批准计划")
@@ -1909,6 +2400,7 @@ def _validate_review_result(
     blocking = [item for item in result.get("issues") or [] if item.get("severity") in {"block", "repair"}]
     if blocking and result.get("approved") is True:
         raise ValidationError("独立审查仍有必须修复的问题，不能批准计划")
+    return result
 
 
 def _finding_for_error(stage: str, exc: Exception) -> dict:
@@ -2030,13 +2522,13 @@ def submit_agent_stage(
             result = _validate_formulation(result, int(context["decision_task"].get("question_budget") or 0))
             _apply_intake_classifications(run["review_date"], result, context)
         elif stage == "strategy_comparison":
-            _validate_strategy_result(result, context, formulation)
+            result = _compile_strategy_result(result, context, formulation)
         elif stage == "plan_design":
             strategy = (receipts.get("strategy_comparison") or {}).get("result_json") or {}
             result = _validate_plan_result(result, context, formulation, strategy)
         elif stage == "independent_review":
             candidate = (receipts.get("plan_design") or {}).get("result_json") or {}
-            _validate_review_result(result, formulation, context, candidate)
+            result = _validate_review_result(result, formulation, context, candidate)
     except Exception as exc:
         findings.append(_finding_for_error(stage, exc))
         _save_stage_receipt(
@@ -2522,10 +3014,7 @@ def revise_draft(review_date: str, instruction: str, client: ai.AIProvider | Non
             "professional_boundary": professional_boundary,
             "evidence_pack": _review_evidence_pack(context),
             "decision_task": context["decision_task"],
-            "required_dimensions": list(dict.fromkeys([
-                *(context["decision_task"].get("required_goal_dimensions") or []),
-                *(context["decision_task"].get("required_non_negotiables") or []),
-            ])),
+            "review_catalog": _review_catalog(formulation, context, after),
             "review_dimensions": [
                 "真实需求", "专业与安全", "菜量与量具", "训练和恢复", "食欲睡眠肠胃",
                 "预算", "时间与复杂度", "历史纠正", "菜单语义", "人的接受度",
@@ -2534,7 +3023,7 @@ def revise_draft(review_date: str, instruction: str, client: ai.AIProvider | Non
         }
         review = _stage_generate(review_provider, "plan_review", review_context, review_schema, attempts)
         _validate_stage_schema(review, review_schema)
-        _validate_review_result(review, formulation, context, after)
+        review = _validate_review_result(review, formulation, context, after)
         if review.get("approved") is True:
             break
         if review_attempt == 1:
@@ -2816,7 +3305,7 @@ def note_feedback_signal(feedback: dict) -> dict | None:
             scope={"meal": feedback.get("meal_name") or "unknown"},
             effect={"complexity": "减少持续看火步骤并提供更短备选"},
             evidence_type="execution_feedback", evidence_id=feedback["id"], excerpt=actual,
-            explicit=bool(actual), source="execution_feedback",
+            explicit=_feedback_requests_durable_change(actual), source="execution_feedback",
         )
     if "did_not_want_it" in reasons:
         return upsert_claim(
