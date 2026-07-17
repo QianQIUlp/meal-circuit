@@ -4,6 +4,12 @@
 
 > 本文件只记录开发历史，不是 Agent 的需求输入。当前行为以代码、测试、`AGENTS.md`、`README.md` 和 `docs/agent-workbench.md` 为准。
 
+## 2026-07-17：Windows 桌面端首启补齐私人配置
+
+- 问题：打包后的 Windows 桌面程序走 `mealcircuit.desktop`，此前只创建数据库；首次使用的私人模板与 Web 启动入口不一致，页面虽可打开，但后续配置或 Agent 功能可能缺少 `profile.md`、`settings.json` 等必需文件。
+- 改动：桌面入口现在先调用既有的私人目录初始化，再创建或迁移数据库；不改变端口、WebView 优先/浏览器回退、打包格式或发布流程。新增子进程冒烟测试，在全新私人目录实际启动桌面入口并校验模板被创建。
+- 验证：`uv run --no-sync python -m unittest tests.test_mealcircuit.DesktopEntryPointTest -v` 通过；`uv run --no-sync python -m py_compile mealcircuit/desktop.py tests/test_mealcircuit.py` 与 `git diff --check` 通过。Linux 无法验证原生 Windows WebView 或浏览器启动，需在 Windows 设备最终确认。
+
 ## 2026-07-16：从词面过关改为语义个案编译
 
 - 问题：完整 Agent 流程已经能强制分阶段，但外部模型仍需照抄目标长句、个案问题和数据库来源 ID；“不安排牛肉”会因出现“牛肉”二字被误判，轻微蛋白估算差异会迫使模型机械加量，回执或版本元数据变化还可能让整轮规划失效。手动阶段 JSON 也容易落在仓库根目录。
