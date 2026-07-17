@@ -1118,18 +1118,22 @@ def render_me_page() -> str:
     else:
         progress = ""
     return (
-        '<section class="section-header"><div><h1>我的</h1><p class="muted">长期目标、偏好和设备设置都放在这里。</p></div></section>'
+        '<section class="section-header"><div><h1 data-i18n="page.me">我的</h1><p class="muted" data-i18n="me.description">长期目标、偏好和设备设置都放在这里。</p></div></section>'
         '<div class="me-grid">'
-        '<a class="me-card" href="/profile"><h2>目标与饮食偏好</h2><p>目标、用餐方式和需要注意的健康边界。</p></a>'
-        '<a class="me-card" href="/learning"><h2>MealCircuit了解的你</h2><p>查看正在影响安排的偏好和需要。</p></a>'
-        '<a class="me-card" href="/inventory"><h2>库存与常用食物</h2><p>家里有什么、哪些食材需要优先吃。</p></a>'
+        '<a class="me-card" href="/profile"><h2 data-i18n="me.profile">目标与饮食偏好</h2><p data-i18n="me.profile.help">目标、用餐方式和需要注意的健康边界。</p></a>'
+        '<a class="me-card" href="/learning"><h2 data-i18n="me.learning">MealCircuit了解的你</h2><p data-i18n="me.learning.help">查看正在影响安排的偏好和需要。</p></a>'
+        '<a class="me-card" href="/inventory"><h2 data-i18n="me.inventory">库存与常用食物</h2><p data-i18n="me.inventory.help">家里有什么、哪些食材需要优先吃。</p></a>'
         '</div>'
         f'{progress}'
-        '<details class="panel advanced-settings" id="advanced"><summary>高级设置</summary><div class="settings-links">'
-        '<a href="/ai"><strong>智能规划设置</strong><span>连接模型和调整生成方式</span></a>'
-        '<a href="/sync"><strong>同步与设备</strong><span>在自己的设备之间同步</span></a>'
-        '<a href="/data"><strong>备份与迁移</strong><span>导出、恢复或迁移本地数据</span></a>'
-        '<a href="/foods"><strong>食品营养库</strong><span>维护包装食品和常用原料</span></a>'
+        '<section class="panel interface-settings"><h2 data-i18n="settings.appearance">外观与语言</h2><p class="muted" data-i18n="settings.appearance.help">这些偏好保存在当前设备上。</p><div class="settings-list">'
+        '<label class="settings-row"><span data-i18n="settings.theme">主题</span><select data-theme-select><option value="system" data-i18n="settings.theme.system">跟随系统</option><option value="light" data-i18n="settings.theme.light">浅色</option><option value="dark" data-i18n="settings.theme.dark">深色</option></select></label>'
+        '<label class="settings-row"><span data-i18n="settings.language">语言</span><select data-language-select><option value="en" data-i18n="settings.language.en">English</option><option value="zh-CN" data-i18n="settings.language.zh">简体中文</option></select></label>'
+        '</div></section>'
+        '<details class="panel advanced-settings" id="advanced"><summary data-i18n="settings.advanced">高级设置</summary><div class="settings-links">'
+        '<a href="/ai"><strong data-i18n="settings.ai">智能规划设置</strong><span data-i18n="settings.ai.help">连接模型和调整生成方式</span></a>'
+        '<a href="/sync"><strong data-i18n="settings.sync">同步与设备</strong><span data-i18n="settings.sync.help">在自己的设备之间同步</span></a>'
+        '<a href="/data"><strong data-i18n="settings.backup">备份与迁移</strong><span data-i18n="settings.backup.help">导出、恢复或迁移本地数据</span></a>'
+        '<a href="/foods"><strong data-i18n="settings.foods">食品营养库</strong><span data-i18n="settings.foods.help">维护包装食品和常用原料</span></a>'
         '</div></details>'
     )
 
@@ -1173,11 +1177,12 @@ def layout(title: str, body: str) -> bytes:
     links = []
     for href, item_label, icon_name, current in nav_items:
         current_attr = ' aria-current="page"' if current else ""
+        nav_key = "today" if href == "/" else "plans" if href == "/plans" else "me"
         links.append(
-            f'<a class="nav-link" href="{href}"{current_attr} title="{esc(item_label)}">'
-            f'{icon(icon_name)}<span class="nav-label">{esc(item_label)}</span></a>'
+            f'<a class="nav-link" href="{href}"{current_attr} title="{esc(item_label)}" data-i18n-label="nav.{nav_key}">'
+            f'{icon(icon_name)}<span class="nav-label" data-i18n="nav.{nav_key}">{esc(item_label)}</span></a>'
         )
-    nav_sections = [f'<section class="nav-group primary-nav" aria-label="主要页面">{"".join(links)}</section>']
+    nav_sections = [f'<section class="nav-group primary-nav" aria-label="主要页面" data-i18n-label="nav.primary">{"".join(links)}</section>']
     page_titles = {
         "今天": "今天", "计划": "计划", "执行计划": "计划", "记录": "今天", "洞察": "我的",
         "我的": "我的", "MealCircuit了解的你": "MealCircuit了解的你", "学习确认": "MealCircuit了解的你",
@@ -1191,7 +1196,8 @@ def layout(title: str, body: str) -> bytes:
         "操作失败": "操作失败", "未找到": "未找到",
     }
     top_action = "" if title == "初始化" else (
-        f'<a class="button" href="/#record" aria-label="记一笔" title="记一笔">{icon("checkin")}记一笔</a>'
+        f'<a class="button" href="/#record" aria-label="记一笔" title="记一笔" data-i18n-label="action.record">'
+        f'{icon("checkin")}<span data-i18n="action.record">记一笔</span></a>'
     )
     date_label = f"{today.month}月{today.day}日 周{'一二三四五六日'[today.weekday()]}"
     try:
@@ -1199,11 +1205,13 @@ def layout(title: str, body: str) -> bytes:
     except Exception:
         sync_enabled = False
     storage_label = "本地优先 · 同步已启用" if sync_enabled else "仅存于本机"
-    page = f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{esc(title)} · MealCircuit</title><link rel="icon" href="/assets/ui/favicon.svg" type="image/svg+xml"><script src="/assets/ui/theme-init.js?v=20260714d"></script><link rel="stylesheet" href="/assets/ui/app.css?v=20260714g"><script src="/assets/ui/app.js?v=20260714e" defer></script></head><body>
-    <a class="skip-link" href="#main-content">跳到主要内容</a>
-    <div class="app-shell"><aside class="app-sidebar" id="app-sidebar" aria-label="主导航"><a class="sidebar-brand" href="/">MealCircuit</a><nav class="sidebar-nav">{"".join(nav_sections)}</nav><div class="sidebar-footer"><button class="icon-button" type="button" data-nav-collapse aria-label="收起侧栏" title="收起侧栏">{icon("collapse")}</button></div></aside>
-    <button class="nav-scrim" type="button" data-nav-close aria-label="关闭导航"></button>
-    <header class="app-topbar"><div class="topbar-start"><button class="icon-button mobile-menu" type="button" data-nav-open aria-controls="app-sidebar" aria-expanded="false" aria-label="打开导航">{icon("menu")}</button><p class="topbar-title">{esc(page_titles.get(title, title))}</p></div><div class="topbar-end"><button class="icon-button theme-toggle" type="button" data-theme-toggle aria-label="切换到浅色主题" title="切换到浅色主题" hidden><span class="icon icon-sun theme-target-light" aria-hidden="true"></span><span class="icon icon-moon theme-target-dark" aria-hidden="true"></span></button><span class="utility muted">{date_label}</span><span class="local-status">{icon("local")}<span>{esc(storage_label)}</span></span>{top_action}</div></header>
+    topbar_i18n = ' data-i18n="page.me"' if page_titles.get(title, title) == "我的" else ""
+    body_title_i18n = ' data-i18n-title="title.me"' if title == "我的" else ""
+    page = f"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{esc(title)} · MealCircuit</title><link rel="icon" href="/assets/ui/favicon.svg" type="image/svg+xml"><script src="/assets/ui/theme-init.js?v=20260716a"></script><link rel="stylesheet" href="/assets/ui/app.css?v=20260716a"><script src="/assets/ui/app.js?v=20260716a" defer></script></head><body{body_title_i18n}>
+    <a class="skip-link" href="#main-content" data-i18n="skip.main">跳到主要内容</a>
+    <div class="app-shell"><aside class="app-sidebar" id="app-sidebar" aria-label="主导航"><a class="sidebar-brand" href="/">MealCircuit</a><nav class="sidebar-nav">{"".join(nav_sections)}</nav><div class="sidebar-footer"><button class="icon-button" type="button" data-nav-collapse aria-label="收起侧栏" title="收起侧栏" data-i18n-label="nav.collapse">{icon("collapse")}</button></div></aside>
+    <button class="nav-scrim" type="button" data-nav-close aria-label="关闭导航" data-i18n-label="nav.close"></button>
+    <header class="app-topbar"><div class="topbar-start"><button class="icon-button mobile-menu" type="button" data-nav-open aria-controls="app-sidebar" aria-expanded="false" aria-label="打开导航" data-i18n-label="nav.open">{icon("menu")}</button><p class="topbar-title"{topbar_i18n}>{esc(page_titles.get(title, title))}</p></div><div class="topbar-end"><button class="icon-button theme-toggle" type="button" data-theme-toggle aria-label="切换到浅色主题" title="切换到浅色主题" hidden><span class="icon icon-sun theme-target-light" aria-hidden="true"></span><span class="icon icon-moon theme-target-dark" aria-hidden="true"></span></button><span class="utility muted" data-local-date="{today.isoformat()}">{date_label}</span><span class="local-status">{icon("local")}<span data-i18n="storage.{"sync" if sync_enabled else "local"}">{esc(storage_label)}</span></span>{top_action}</div></header>
     <main class="app-content" id="main-content" tabindex="-1">{body}</main></div></body></html>"""
     return page.encode("utf-8")
 

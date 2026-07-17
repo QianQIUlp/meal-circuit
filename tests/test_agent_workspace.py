@@ -639,6 +639,37 @@ class AgentWorkspaceTest(unittest.TestCase):
         self.assertEqual("reasonable_overlap_with_estimation_uncertainty", reality["coverage"])
         self.assertIn("食欲", reality["review_question"])
 
+    def test_portion_validation_accepts_list_and_legacy_checkin_module_shapes(self):
+        answers = {"hunger_level": "3", "satiety": "too_full", "cravings": "none"}
+        cases = (
+            (
+                "current list with answers",
+                [
+                    "ignored",
+                    {"module_key": "sleep", "answers": {}},
+                    {"module_key": "hunger", "answers": answers},
+                ],
+                answers,
+            ),
+            ("legacy mapping with answers_json", {"hunger": {"answers_json": answers}}, answers),
+            ("legacy mapping with direct answers", {"hunger": answers}, answers),
+            ("list without hunger", [{"module_key": "sleep", "answers": {}}], {}),
+            ("unknown container", "hunger", {}),
+            ("empty modules", None, {}),
+        )
+        for label, modules, expected in cases:
+            with self.subTest(label=label):
+                context = {
+                    "person": {"targets": [], "active_user_model": []},
+                    "today": {"checkin": {"modules": modules}},
+                }
+                reality = agent_workspace._validate_portions(_v3_result(self.review_date), context)
+                self.assertEqual({
+                    "hunger_level": expected.get("hunger_level"),
+                    "satiety": expected.get("satiety"),
+                    "cravings": expected.get("cravings"),
+                }, reality["appetite_context"])
+
     def test_relative_agent_stage_files_default_to_private_workspace(self):
         parsed = agent_cli.build_parser().parse_args([
             "agent-run", "submit", "agent_run_private_test", "--stage", "plan_design",

@@ -1516,7 +1516,18 @@ def _validate_portions(result: dict, context: dict) -> dict:
             raise ValidationError("数值辅助模式有有效能量目标时，全天能量必须提供范围")
         if energy[1] < energy_target[0] or energy[0] > energy_target[1]:
             raise ValidationError("全天能量范围与当前有效目标没有合理重叠")
-    hunger_module = (((context.get("today") or {}).get("checkin") or {}).get("modules") or {}).get("hunger") or {}
+    modules = ((context.get("today") or {}).get("checkin") or {}).get("modules")
+    if isinstance(modules, dict):
+        hunger_module = modules.get("hunger") or {}
+    elif isinstance(modules, list):
+        hunger_module = next((
+            item for item in modules
+            if isinstance(item, dict) and item.get("module_key") == "hunger"
+        ), {})
+    else:
+        hunger_module = {}
+    if not isinstance(hunger_module, dict):
+        hunger_module = {}
     hunger_answers = hunger_module.get("answers_json") or hunger_module.get("answers") or hunger_module
     if not isinstance(hunger_answers, dict):
         hunger_answers = {}
