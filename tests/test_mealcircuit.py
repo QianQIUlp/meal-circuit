@@ -1304,6 +1304,28 @@ class FirstRunWebAppTest(unittest.TestCase):
         self.assertFalse((self.home / "settings.json").exists())
 
 
+class DesktopEntryPointTest(unittest.TestCase):
+    def test_first_run_smoke_initializes_private_home(self):
+        with tempfile.TemporaryDirectory() as home_name:
+            home = Path(home_name)
+            environment = os.environ.copy()
+            environment["MEALCIRCUIT_HOME"] = str(home)
+            environment.pop("MEALCIRCUIT_DB", None)
+            completed = subprocess.run(
+                [sys.executable, "-m", "mealcircuit.desktop", "--smoke-test"],
+                cwd=Path(__file__).resolve().parent.parent,
+                env=environment,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=15,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertTrue((home / "profile.md").is_file())
+            self.assertTrue((home / "settings.json").is_file())
+
+
 class WebAppTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
