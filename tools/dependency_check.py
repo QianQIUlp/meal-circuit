@@ -127,10 +127,12 @@ def check_release_workflow(workflow: str) -> None:
             "- name: Warn when macOS tagged release lacks Developer ID signing",
             "if: startsWith(github.ref, 'refs/tags/v') && env.APPLE_SIGNING_AVAILABLE != 'true'",
         ),
-        "Android tagged-release signing gate": (
-            "- name: Require Android signing secrets for tagged releases",
-            "test -n \"$ANDROID_KEYSTORE_BASE64\" && test -n \"$ANDROID_KEYSTORE_PASSWORD\"",
-            "test -n \"$ANDROID_KEY_ALIAS\" && test -n \"$ANDROID_KEY_PASSWORD\"",
+        "Android tagged-release omission policy": (
+            "- name: Warn when Android assets are omitted from unsigned tagged release",
+            "if: startsWith(github.ref, 'refs/tags/v') && env.ANDROID_SIGNING_AVAILABLE != 'true'",
+            "Android APK and AAB are omitted from this tagged release",
+            "if: ${{ !startsWith(github.ref, 'refs/tags/v') || env.ANDROID_SIGNING_AVAILABLE == 'true' }}",
+            "if-no-files-found: error",
         ),
         "release build dependencies": (
             "needs: [windows, macos-universal, linux, android]",

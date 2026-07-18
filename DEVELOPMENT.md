@@ -4,6 +4,13 @@
 
 > 本文件只记录开发历史，不是 Agent 的需求输入。当前行为以代码、测试、`AGENTS.md`、`README.md` 和 `docs/agent-workbench.md` 为准。
 
+## 2026-07-18：Windows EXE 发布与 Android 资产安全降级
+
+- 目标：在没有 Android 正式签名密钥的当前仓库条件下，完成可运行 Windows EXE 与 Linux 产物的正式 tag/Release；保留 Android 的构建验证，但绝不把未签名 APK/AAB 放入公开发布。
+- 改动：发行工作流仍在原生 Windows runner 中生成、冒烟运行 Windows `MealCircuit.exe`，并产出便携 ZIP 与安装器 EXE。tag 上若 Android 四项签名 secret 不完整，Android job 会给出明确 warning、继续执行无签名构建检查并跳过 Android artifact 上传；完整密钥存在时才上传并验证签名 APK/AAB。发布 job 继续等待全部平台 job，Windows/Linux（及可用的 macOS）资产会照常生成 SBOM 和 `SHA256SUMS.txt`。同步更新发布说明、跨端验收说明、静态策略检查和回归测试。
+- 验证：`uv run --no-sync python -m unittest tests.test_release_workflow -v` 的 7 项策略测试通过；`uv run --no-sync python tools/dependency_check.py` 与 `uv run --no-sync python tools/release_check.py` 均通过；`git diff --check` 通过。tag 前仍需由 GitHub 的原生 Windows runner 实际构建和冒烟运行 EXE，并在 Release 后核对公开资产与校验和。
+- 剩余风险：没有 Authenticode 证书时 Windows EXE/安装器仍可运行，但会显示 `Unknown Publisher`；Android 正式签名产物仍需仓库所有者之后配置四项 Android signing secrets。
+
 ## 2026-07-18：Android 对齐 Windows 已发布计划与跨端重审
 
 - 目标：以 Windows 的七阶段工作流为唯一计划发布端，把 Android 从旧的“总览/记录/更多”和粗略复盘展示收束为可执行的同步客户端；手机可以记录真实经过、填写状态、查看已发布的计划依据、份量和调整条件，但不能在本地生成或发布竞争性的每日复盘。

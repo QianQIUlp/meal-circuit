@@ -33,13 +33,21 @@ class ReleaseWorkflowPolicyTest(unittest.TestCase):
         with self.assertRaisesRegex(SystemExit, "APPLE_SIGNING_AVAILABLE"):
             check_release_workflow(incomplete)
 
-    def test_android_tag_gate_requires_all_credentials(self):
+    def test_partial_android_credentials_are_rejected(self):
         incomplete = self.workflow.replace(
             " && secrets.ANDROID_KEY_PASSWORD != '' }}",
             " }}",
         )
         with self.assertRaisesRegex(SystemExit, "ANDROID_SIGNING_AVAILABLE"):
             check_release_workflow(incomplete)
+
+    def test_unsigned_android_artifacts_cannot_reach_a_tagged_release(self):
+        invalid = self.workflow.replace(
+            "if: ${{ !startsWith(github.ref, 'refs/tags/v') || env.ANDROID_SIGNING_AVAILABLE == 'true' }}",
+            "if: always()",
+        )
+        with self.assertRaisesRegex(SystemExit, "Android tagged-release omission policy"):
+            check_release_workflow(invalid)
 
     def test_desktop_hard_gate_is_rejected(self):
         invalid = self.workflow + "\n# Require Authenticode secrets for tagged releases\n"
