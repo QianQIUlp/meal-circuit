@@ -6,9 +6,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.outlined.AddCircle
 import androidx.compose.material.icons.outlined.Home
-import androidx.compose.material.icons.outlined.Inventory2
 import androidx.compose.material.icons.outlined.MoreHoriz
 import androidx.compose.material.icons.outlined.Today
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -36,17 +34,15 @@ import androidx.compose.ui.unit.dp
 import org.mealcircuit.app.MainViewModel
 
 enum class Destination(val label: String, val icon: ImageVector) {
-    HOME("总览", Icons.Outlined.Home),
-    DAILY("今日", Icons.Outlined.Today),
-    CAPTURE("记录", Icons.Outlined.AddCircle),
-    LIBRARY("食品库", Icons.Outlined.Inventory2),
-    MORE("更多", Icons.Outlined.MoreHoriz),
+    TODAY("今天", Icons.Outlined.Today),
+    PLANS("计划", Icons.Outlined.Home),
+    ME("我的", Icons.Outlined.MoreHoriz),
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun MealCircuitApp(viewModel: MainViewModel) {
-    var destination by rememberSaveable { mutableStateOf(Destination.HOME) }
+    var destination by rememberSaveable { mutableStateOf(Destination.TODAY) }
     val host = remember { SnackbarHostState() }
     val message by viewModel.message.collectAsState()
     LaunchedEffect(message) {
@@ -86,11 +82,9 @@ fun MealCircuitApp(viewModel: MainViewModel) {
                 }
                 Box(Modifier.weight(1f)) {
                     when (destination) {
-                        Destination.HOME -> HomeScreen(viewModel)
-                        Destination.DAILY -> DailyScreen(viewModel)
-                        Destination.CAPTURE -> CaptureScreen(viewModel)
-                        Destination.LIBRARY -> FoodLibraryScreen(viewModel)
-                        Destination.MORE -> MoreScreen(viewModel)
+                        Destination.TODAY -> TodayScreen(viewModel)
+                        Destination.PLANS -> PlansScreen(viewModel)
+                        Destination.ME -> MoreScreen(viewModel)
                     }
                 }
             }

@@ -18,6 +18,7 @@ import org.mealcircuit.app.domain.preferenceId
 import org.mealcircuit.app.domain.CheckinContract
 import org.mealcircuit.app.domain.STATE_TRANSITIONS
 import org.mealcircuit.app.domain.normalize
+import org.mealcircuit.app.data.MaterializedRecordEntity
 import org.mealcircuit.app.io.readUpTo
 import org.mealcircuit.app.io.readBounded
 import org.mealcircuit.app.sync.AccountCipher
@@ -28,6 +29,8 @@ import org.mealcircuit.app.sync.SyncHttpException
 import org.mealcircuit.app.sync.syncFailureDisposition
 import org.mealcircuit.app.ui.CAMERA_FAILURE_MESSAGE
 import org.mealcircuit.app.ui.finalizeCameraResult
+import org.mealcircuit.app.ui.mealModeLabel
+import org.mealcircuit.app.ui.publishedPlan
 import java.util.Base64
 import java.io.ByteArrayInputStream
 import java.nio.file.Files
@@ -239,6 +242,59 @@ class DomainContractTest {
         }
         runCatching { ResultValidator.task("photo", invalidPhoto) }
             .onSuccess { error("blank result string accepted") }
+    }
+
+    @Test
+    fun publishedPythonPlanKeepsExecutionDetailsVisibleOnAndroid() {
+        val record = MaterializedRecordEntity(
+            entityId = "review_fixture",
+            entityKind = "daily_review",
+            payloadJson = """
+                {
+                  "review": {
+                    "id": "review_fixture", "review_date": "2026-07-18", "status": "completed",
+                    "source_record_ids_json": [], "result_version": 1,
+                    "created_at": "2026-07-18T00:00:00Z", "updated_at": "2026-07-18T00:00:00Z",
+                    "result_json": {
+                      "case_summary": "优先保证饱腹和执行性",
+                      "core_advice": ["晚餐先保证主蛋白"],
+                      "problems_to_solve": ["晚间容易饿"],
+                      "selected_strategy": "balanced",
+                      "strategy_tradeoffs": ["不压低主食"],
+                      "day_nutrition": {"protein_g": [110, 130], "confidence": "medium"},
+                      "adjustment_conditions": ["睡眠不足时不继续减量"],
+                      "tomorrow_menu": {
+                        "date": "2026-07-19",
+                        "meals": [{
+                          "name": "午餐", "mode": "eat_out", "foods": ["鱼", "米饭", "蔬菜"],
+                          "purpose": "稳定下午精力", "whole_day_role": "保留训练前主食",
+                          "portion_contracts": [{
+                            "item": "鱼", "gram_range": [120, 160], "measurement_basis": "cooked",
+                            "household_measure": "一掌", "increase_if": "仍饿时加半拳主食",
+                            "decrease_if": "食欲低时先减主食"
+                          }],
+                          "eat_out_guidance": {"protein_anchor": "优先清蒸鱼", "sauce_rule": "酱汁分开"},
+                          "adjustment_logic": {"if_gut_unwell": "改软烂少油"}
+                        }]
+                      }
+                    }
+                  }, "history": []
+                }
+            """.trimIndent(),
+            deleted = false,
+            sortKey = "2026-07-18",
+            updatedAt = "2026-07-18T00:00:00Z",
+        )
+
+        val plan = requireNotNull(publishedPlan(record))
+        assertEquals("2026-07-19", plan.planDate)
+        assertEquals("110–130 g 蛋白质 · 中等把握", plan.nutrition)
+        assertEquals("在家下厨", mealModeLabel("home_cook"))
+        val lunch = plan.meals.single()
+        assertEquals("午餐", lunch.name)
+        assertEquals("120–160 g · 熟重 · 一掌", lunch.portions.single().amount)
+        assertTrue(lunch.eatOutGuidance.any { it.contains("清蒸鱼") })
+        assertTrue(lunch.adjustments.any { it.contains("少油") })
     }
 
     private fun resource(name: String) =

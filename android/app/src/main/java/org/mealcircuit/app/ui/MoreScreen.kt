@@ -11,7 +11,10 @@ import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
+import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.FilterChip
+import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -24,17 +27,20 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import org.mealcircuit.app.MainViewModel
 import org.mealcircuit.app.domain.EntityKind
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 
 private enum class MoreTab(val label: String) {
-    HISTORY("历史"), MEMORY("记忆"), SETTINGS("AI 与导入"), SYNC("同步"), CONFLICTS("冲突")
+    OVERVIEW("概览"), TASKS("照片与食材"), FOODS("食品库"), HISTORY("历史"), MEMORY("理解与调整"),
+    SETTINGS("设置"), SYNC("同步"), CONFLICTS("冲突")
 }
 
 @Composable
 fun MoreScreen(viewModel: MainViewModel) {
-    var tab by remember { mutableStateOf(MoreTab.HISTORY) }
+    var tab by remember { mutableStateOf(MoreTab.OVERVIEW) }
     Column(Modifier.fillMaxSize()) {
         Row(
             Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 16.dp, vertical = 8.dp),
@@ -45,11 +51,51 @@ fun MoreScreen(viewModel: MainViewModel) {
             }
         }
         when (tab) {
+            MoreTab.OVERVIEW -> ProfileOverview(viewModel)
+            MoreTab.TASKS -> CaptureScreen(viewModel)
+            MoreTab.FOODS -> FoodLibraryScreen(viewModel)
             MoreTab.HISTORY -> HistoryScreen(viewModel)
             MoreTab.MEMORY -> MemoryScreen(viewModel)
             MoreTab.SETTINGS -> SettingsScreen(viewModel)
             MoreTab.SYNC -> SyncSettingsScreen(viewModel)
             MoreTab.CONFLICTS -> ConflictScreen(viewModel)
+        }
+    }
+}
+
+@Composable
+private fun ProfileOverview(viewModel: MainViewModel) {
+    val preferences by viewModel.repository.observe(EntityKind.PREFERENCES).collectAsState(emptyList())
+    val tasks by viewModel.repository.observe(EntityKind.TASK).collectAsState(emptyList())
+    val foods by viewModel.repository.observe(EntityKind.FOOD_ITEM).collectAsState(emptyList())
+    val profile = preferenceContent(preferences, "profile")
+    val goals = goalSummaries(preferenceContent(preferences, "goal_contract"))
+    val claims = activeClaimStatements(preferenceContent(preferences, "agent_user_model"))
+    Column(
+        Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp).widthIn(max = 880.dp),
+        verticalArrangement = Arrangement.spacedBy(16.dp),
+    ) {
+        SectionTitle("我的", "长期目标、已确认的理解和跨端资料都在这里；当天变化请在“今天”里记录。")
+        Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer)) {
+            Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                Text("已同步的资料", style = MaterialTheme.typography.titleMedium)
+                Text("照片/原材料任务 ${tasks.size} 项 · 食品库 ${foods.count { !it.deleted }} 项")
+            }
+        }
+        profile?.let {
+            SectionTitle("你的档案")
+            Text(it)
+        }
+        if (goals.isNotEmpty()) {
+            SectionTitle("当前目标")
+            goals.forEach { Text("• $it") }
+        }
+        if (claims.isNotEmpty()) {
+            SectionTitle("MealCircuit 已了解的你", "这些内容来自 Windows 已处理并同步的真实记录；需要纠正时在 Windows 的学习确认中处理。")
+            claims.forEach { Text("• $it") }
+        }
+        if (profile == null && goals.isEmpty() && claims.isEmpty()) {
+            EmptyState("还没有同步到个人资料", "先在 Windows 完成初始化并启用同步，手机会只读展示已确认的目标和理解。")
         }
     }
 }
@@ -115,3 +161,39 @@ private fun MemoryScreen(viewModel: MainViewModel) {
         }
     }
 }
+
+private fun preferenceContent(
+    records: List<org.mealcircuit.app.data.MaterializedRecordEntity>,
+    kind: String,
+): String? = records.firstNotNullOfOrNull { record ->
+    runCatching {
+        val payload = Json.parseToJsonElement(record.payloadJson).jsonObject
+        if (payload["kind"]?.jsonPrimitive?.content == kind) payload["content"]?.jsonPrimitive?.contentOrNull else null
+    }.getOrNull()
+}
+
+private fun goalSummaries(content: String?): List<String> = runCatching {
+    Json.parseToJsonElement(content.orEmpty()).jsonObject["goals"]?.jsonArray.orEmpty().mapNotNull { element ->
+        val goal = element.jsonObject
+        val label = when (goal["type"]?.jsonPrimitive?.contentOrNull) {
+            "body_recomposition" -> "体型重组"
+            "fat_loss" -> "减脂"
+            "muscle_gain" -> "增肌"
+            "maintenance" -> "维持"
+            "health_support" -> "健康支持"
+            else -> goal["type"]?.jsonPrimitive?.contentOrNull
+        }
+        val why = goal["why"]?.jsonPrimitive?.contentOrNull?.trim()
+        listOfNotNull(label?.takeIf { it.isNotBlank() }, why?.takeIf { it.isNotBlank() })
+            .joinToString(" · ").takeIf { it.isNotBlank() }
+    }
+}.getOrDefault(emptyList())
+
+private fun activeClaimStatements(content: String?): List<String> = runCatching {
+    Json.parseToJsonElement(content.orEmpty()).jsonObject["claims"]?.jsonArray.orEmpty().mapNotNull { element ->
+        val claim = element.jsonObject
+        claim["statement"]?.jsonPrimitive?.contentOrNull?.trim()?.takeIf {
+            it.isNotEmpty() && claim["status"]?.jsonPrimitive?.contentOrNull == "active"
+        }
+    }
+}.getOrDefault(emptyList())
