@@ -5,7 +5,7 @@
 **Local-first long-horizon meal feedback workbench. Capture facts. Keep the context. Calibrate the next choice.**
 
 <p>
-  <img src="https://img.shields.io/badge/development-v0.3.0-8DB8A4?style=flat-square&labelColor=202321" alt="Development version 0.3.0">
+  <a href="https://github.com/QianQIUlp/meal-circuit/releases/tag/v0.3.0"><img src="https://img.shields.io/badge/release-v0.3.0-8DB8A4?style=flat-square&labelColor=202321" alt="Release version 0.3.0"></a>
   <img src="https://img.shields.io/badge/Python-3.11%2B-8DB8A4?style=flat-square&labelColor=202321" alt="Python 3.11 or newer">
   <a href="https://github.com/QianQIUlp/meal-circuit/actions/workflows/test.yml"><img src="https://github.com/QianQIUlp/meal-circuit/actions/workflows/test.yml/badge.svg" alt="CI status"></a>
   <a href="LICENSE"><img src="https://img.shields.io/github/license/QianQIUlp/meal-circuit?style=flat-square&labelColor=202321&color=8DB8A4" alt="MIT license"></a>
@@ -43,6 +43,19 @@ python -m mealcircuit.agent_cli doctor
 ```
 
 Open [http://127.0.0.1:8765](http://127.0.0.1:8765). The first run guides you through goals, safety boundaries, training needs, and per-meal preparation preferences. `doctor` shows the private data location; stop the server with `Ctrl+C`.
+
+## Install v0.3.0
+
+Prebuilt applications are available from the [v0.3.0 release](https://github.com/QianQIUlp/meal-circuit/releases/tag/v0.3.0). Choose the asset for your platform rather than trying to run an Android bundle or a Linux AppImage on another system.
+
+| Platform | Asset | What to do |
+| :--- | :--- | :--- |
+| Windows x64 | `MealCircuit-0.3.0-windows-x64-setup.exe` or `MealCircuit-0.3.0-windows-x64-portable.zip` | Run the installer, or extract the ZIP and launch `MealCircuit.exe`. The current Windows artifacts are runnable but not Authenticode-signed, so Windows may show `Unknown Publisher`. |
+| Linux x86_64 | `MealCircuit-0.3.0-linux-x86_64.AppImage` | Download it, run `chmod +x MealCircuit-0.3.0-linux-x86_64.AppImage`, then launch it. |
+| Android 8.0+ | `app-release.apk` or `app-release.aab` | Install the signed APK directly. The AAB is for Play Console or another bundle distributor and is not installed directly on a device. |
+| macOS | `MealCircuit-0.3.0-macos-universal.dmg` | The universal DMG supports Apple silicon and Intel Macs. It is ad-hoc signed and not notarized, so Gatekeeper may require a deliberate user override. |
+
+Download `SHA256SUMS.txt` with the asset and verify it before opening the file. On Linux, run `sha256sum -c SHA256SUMS.txt --ignore-missing` in the download directory; on Windows, compare `Get-FileHash <file> -Algorithm SHA256` with the matching entry. See the [full v0.3.0 release notes](docs/releases/v0.3.0.md) for signing and recovery boundaries.
 
 ## How It Works
 
@@ -254,6 +267,19 @@ python -m mealcircuit.agent_cli doctor
 ```
 
 打开 [http://127.0.0.1:8765](http://127.0.0.1:8765)。首次使用会进入可恢复的目标与安全初始化；原有记录入口不会因初始化门禁消失。`doctor` 仍可查看私人数据位置；停止服务使用 `Ctrl+C`。
+
+## 安装 v0.3.0
+
+预编译应用见 [v0.3.0 Release](https://github.com/QianQIUlp/meal-circuit/releases/tag/v0.3.0)。请按系统选择对应资产，不要尝试在其他系统上直接运行 Android bundle 或 Linux AppImage。
+
+| 平台 | 资产 | 使用方式 |
+| :--- | :--- | :--- |
+| Windows x64 | `MealCircuit-0.3.0-windows-x64-setup.exe` 或 `MealCircuit-0.3.0-windows-x64-portable.zip` | 运行安装器，或解压 ZIP 后启动 `MealCircuit.exe`。当前 Windows 产物可运行但没有 Authenticode 签名，Windows 可能提示 `Unknown Publisher`。 |
+| Linux x86_64 | `MealCircuit-0.3.0-linux-x86_64.AppImage` | 下载后执行 `chmod +x MealCircuit-0.3.0-linux-x86_64.AppImage`，再启动它。 |
+| Android 8.0+ | `app-release.apk` 或 `app-release.aab` | 直接安装已签名的 APK。AAB 用于上传 Play Console 或其他 bundle 分发渠道，不能直接安装到设备。 |
+| macOS | `MealCircuit-0.3.0-macos-universal.dmg` | 通用 DMG 同时支持 Apple silicon 与 Intel Mac。它仅 ad-hoc 签名、未 notarize，Gatekeeper 可能要求用户明确放行。 |
+
+请同时下载 `SHA256SUMS.txt`，并在打开文件前校验。Linux 可在下载目录运行 `sha256sum -c SHA256SUMS.txt --ignore-missing`；Windows 可用 `Get-FileHash <文件> -Algorithm SHA256` 对照对应条目。签名与恢复边界见 [v0.3.0 完整发行说明](docs/releases/v0.3.0.md)。
 
 ## 它如何工作
 
