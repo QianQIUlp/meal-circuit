@@ -49,6 +49,14 @@ class ReleaseWorkflowPolicyTest(unittest.TestCase):
         with self.assertRaisesRegex(SystemExit, "Android tagged-release omission policy"):
             check_release_workflow(invalid)
 
+    def test_strict_aab_verification_uses_the_restored_release_key(self):
+        invalid = self.workflow.replace(
+            'android/app/build/outputs/bundle/release/app-release.aab "$ANDROID_KEY_ALIAS"',
+            'android/app/build/outputs/bundle/release/app-release.aab "$UNTRUSTED_ALIAS"',
+        )
+        with self.assertRaisesRegex(SystemExit, "Android strict AAB signer verification"):
+            check_release_workflow(invalid)
+
     def test_desktop_hard_gate_is_rejected(self):
         invalid = self.workflow + "\n# Require Authenticode secrets for tagged releases\n"
         with self.assertRaisesRegex(SystemExit, "must not hard-fail"):

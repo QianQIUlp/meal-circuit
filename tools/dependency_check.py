@@ -134,6 +134,15 @@ def check_release_workflow(workflow: str) -> None:
             "if: ${{ !startsWith(github.ref, 'refs/tags/v') || env.ANDROID_SIGNING_AVAILABLE == 'true' }}",
             "if-no-files-found: error",
         ),
+        "Android strict AAB signer verification": (
+            "- name: Verify Android signatures when configured",
+            "ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}",
+            "ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}",
+            "jarsigner -verify -strict \\",
+            "-keystore \"$RUNNER_TEMP/mealcircuit.jks\" \\",
+            "-storepass \"$ANDROID_KEYSTORE_PASSWORD\" \\",
+            "android/app/build/outputs/bundle/release/app-release.aab \"$ANDROID_KEY_ALIAS\"",
+        ),
         "release build dependencies": (
             "needs: [windows, macos-universal, linux, android]",
         ),
