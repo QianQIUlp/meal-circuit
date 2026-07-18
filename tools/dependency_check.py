@@ -143,6 +143,13 @@ def check_release_workflow(workflow: str) -> None:
             "-storepass \"$ANDROID_KEYSTORE_PASSWORD\" \\",
             "android/app/build/outputs/bundle/release/app-release.aab \"$ANDROID_KEY_ALIAS\"",
         ),
+        "Android release assets are flattened": (
+            "- name: Stage Android release assets",
+            "mkdir -p \"$RUNNER_TEMP/android-release\"",
+            "install -m 644 android/app/build/outputs/apk/release/app-release.apk \"$RUNNER_TEMP/android-release/app-release.apk\"",
+            "install -m 644 android/app/build/outputs/bundle/release/app-release.aab \"$RUNNER_TEMP/android-release/app-release.aab\"",
+            "path: ${{ runner.temp }}/android-release/*",
+        ),
         "release build dependencies": (
             "needs: [windows, macos-universal, linux, android]",
         ),

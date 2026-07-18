@@ -4,6 +4,13 @@
 
 > 本文件只记录开发历史，不是 Agent 的需求输入。当前行为以代码、测试、`AGENTS.md`、`README.md` 和 `docs/agent-workbench.md` 为准。
 
+## 2026-07-18：Android 正式发行资产平铺修复
+
+- 问题：`v0.3.0` 的 tag workflow（`29646367792`）已成功生成并严格验签 `app-release.apk` 与 `app-release.aab`，但 Android artifact 保留了 `apk/release/`、`bundle/release/` 子目录；Release job 的 `release-assets/*` 与顶层校验和扫描因此没有发布这两项。该 tag 的公开 Release 已从同一成功工作流下载签名产物，补齐 APK/AAB，并用包含全部 9 项公开文件的新 `SHA256SUMS.txt` 覆盖旧清单；回读后逐项 `sha256sum -c` 通过，APK 的 `apksigner verify --verbose` 也通过。
+- 改动：Android job 现在在上传前将已构建的 APK/AAB 复制到 `$RUNNER_TEMP/android-release` 的顶层；artifact 下载合并后，现有的顶层 checksum 与 Release glob 会自然包含这两个文件。`dependency_check` 和 Release 策略测试新增此平铺契约，防止以后静默回归。
+- 验证：`uv run --no-sync python -m unittest tests.test_release_workflow -v` 的 9 项通过；`uv run --no-sync python tools/release_check.py`、`uv run --no-sync python tools/dependency_check.py` 与 `git diff --check` 均通过。
+- 剩余风险：该工作流修复尚待独立受保护分支 PR 合入，因而影响下一个 tag；已发布的 `v0.3.0` 资产不依赖该未来合入，且其公开清单已回读核验。
+
 ## 2026-07-18：v0.3.0 发布说明与下载指引
 
 - 目标：在正式 `v0.3.0` tag 前，将 README、Android 签名说明和 GitHub Release 正文同步为用户可执行的跨平台安装、校验和信任边界说明，而不把“可运行”误写成商业签名或公证。

@@ -57,6 +57,14 @@ class ReleaseWorkflowPolicyTest(unittest.TestCase):
         with self.assertRaisesRegex(SystemExit, "Android strict AAB signer verification"):
             check_release_workflow(invalid)
 
+    def test_android_release_assets_must_be_flattened_for_the_release_job(self):
+        invalid = self.workflow.replace(
+            "path: ${{ runner.temp }}/android-release/*",
+            "path: android/app/build/outputs/apk/release/*.apk",
+        )
+        with self.assertRaisesRegex(SystemExit, "Android release assets are flattened"):
+            check_release_workflow(invalid)
+
     def test_desktop_hard_gate_is_rejected(self):
         invalid = self.workflow + "\n# Require Authenticode secrets for tagged releases\n"
         with self.assertRaisesRegex(SystemExit, "must not hard-fail"):
