@@ -23,4 +23,4 @@ This matrix defines the required multi-device coverage; it is not a claim about 
 
 ## External release gates
 
-PostgreSQL 18, macOS universal DMG, Linux AppImage and Windows installer builds run on their native GitHub Actions environments. Production Android signing, Play upload, macOS notarization and Windows Authenticode remain intentionally gated on the repository owner's platform accounts and CI secrets. These account-holder actions are not claimed as locally completed.
+PostgreSQL 18, macOS universal DMG, Linux AppImage and Windows installer builds run on their native GitHub Actions environments. Production Android signing and Play upload remain gated on the repository owner's platform account and CI secrets; when those Android secrets are absent, a tagged release omits Android assets rather than publishing unsigned ones. macOS notarization and Windows Authenticode remain optional trust enhancements gated on their respective platform credentials. These account-holder actions are not claimed as locally completed.

@@ -221,16 +221,10 @@ jobs:
       ANDROID_SIGNING_AVAILABLE: ${{ secrets.ANDROID_KEYSTORE_BASE64 != '' && secrets.ANDROID_KEYSTORE_PASSWORD != '' && secrets.ANDROID_KEY_ALIAS != '' && secrets.ANDROID_KEY_PASSWORD != '' }}
     steps:
       - uses: actions/checkout@v4
-      - name: Require Android signing secrets for tagged releases
-        if: startsWith(github.ref, 'refs/tags/v')
-        env:
-          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
-          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
-          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
-          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+      - name: Warn when Android assets are omitted from unsigned tagged release
+        if: startsWith(github.ref, 'refs/tags/v') && env.ANDROID_SIGNING_AVAILABLE != 'true'
         run: |
-          test -n "$ANDROID_KEYSTORE_BASE64" && test -n "$ANDROID_KEYSTORE_PASSWORD"
-          test -n "$ANDROID_KEY_ALIAS" && test -n "$ANDROID_KEY_PASSWORD"
+          echo "::warning::Android APK and AAB are omitted from this tagged release because complete Android signing secrets are unavailable."
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -253,12 +247,21 @@ jobs:
         run: ./gradlew --no-daemon testDebugUnitTest lintRelease assembleRelease bundleRelease
       - name: Verify Android signatures when configured
         if: env.ANDROID_SIGNING_AVAILABLE == 'true'
+        env:
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
         run: |
           "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --verbose android/app/build/outputs/apk/release/app-release.apk
-          jarsigner -verify -strict android/app/build/outputs/bundle/release/app-release.aab
-      - uses: actions/upload-artifact@v4
+          jarsigner -verify -strict \
+            -keystore "$RUNNER_TEMP/mealcircuit.jks" \
+            -storepass "$ANDROID_KEYSTORE_PASSWORD" \
+            android/app/build/outputs/bundle/release/app-release.aab "$ANDROID_KEY_ALIAS"
+      - name: Upload Android artifacts
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') || env.ANDROID_SIGNING_AVAILABLE == 'true' }}
+        uses: actions/upload-artifact@v4
         with:
           name: android-release
+          if-no-files-found: error
           path: |
             android/app/build/outputs/apk/release/*.apk
             android/app/build/outputs/bundle/release/*.aab
