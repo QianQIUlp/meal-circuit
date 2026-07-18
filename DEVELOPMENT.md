@@ -8,7 +8,7 @@
 
 - 目标：在没有 Android 正式签名密钥的当前仓库条件下，完成可运行 Windows EXE 与 Linux 产物的正式 tag/Release；保留 Android 的构建验证，但绝不把未签名 APK/AAB 放入公开发布。
 - 改动：发行工作流仍在原生 Windows runner 中生成、冒烟运行 Windows `MealCircuit.exe`，并产出便携 ZIP 与安装器 EXE。tag 上若 Android 四项签名 secret 不完整，Android job 会给出明确 warning、继续执行无签名构建检查并跳过 Android artifact 上传；完整密钥存在时才上传并验证签名 APK/AAB。发布 job 继续等待全部平台 job，Windows/Linux（及可用的 macOS）资产会照常生成 SBOM 和 `SHA256SUMS.txt`。同步更新发布说明、跨端验收说明、静态策略检查和回归测试。
-- 验证：`uv run --no-sync python -m unittest tests.test_release_workflow -v` 的 7 项策略测试通过；`uv run --no-sync python tools/dependency_check.py` 与 `uv run --no-sync python tools/release_check.py` 均通过；`git diff --check` 通过。tag 前仍需由 GitHub 的原生 Windows runner 实际构建和冒烟运行 EXE，并在 Release 后核对公开资产与校验和。
+- 验证：`uv run --no-sync python -m unittest tests.test_release_workflow -v` 的 7 项策略测试通过；`uv run --no-sync python tools/dependency_check.py` 与 `uv run --no-sync python tools/release_check.py` 均通过；`git diff --check` 通过。Draft PR #28 的 GitHub Actions `release-builds`（`29643012187`）已在原生 Windows、Linux、Android 和 macOS runner 全部成功，tag 专属 `release` job 按预期跳过；常规 `test`（`29643012203`）的 Android、Android instrumentation、Python 3.11/3.13、PostgreSQL sync 和 supply-chain 也全部成功。下载 `desktop-windows` artifact 后确认便携 ZIP 内含 `MealCircuit.exe`，其为 x86-64 Windows GUI PE 文件；安装器 EXE 也为 Windows GUI PE 文件。
 - 剩余风险：没有 Authenticode 证书时 Windows EXE/安装器仍可运行，但会显示 `Unknown Publisher`；Android 正式签名产物仍需仓库所有者之后配置四项 Android signing secrets。
 
 ## 2026-07-18：Android 对齐 Windows 已发布计划与跨端重审
