@@ -6,10 +6,10 @@
 
 ## 2026-07-18：发布前 CI 回归修复与 Linux 产物核验
 
-- 问题：主分支最新提交的 GitHub Actions `test` 工作流失败。两个 Python 版本仍用单步每日生成假设验证已经切换到强制分阶段 Agent 流程的路径；Web 断言还保留旧的 `BEGINNER` 餐次标签。Windows Web 测试在拥挤 runner 上的 5 秒本地 HTTP 超时会让测试清理先于请求结束，从而引发后续 SQLite 临时库错误。
-- 改动：测试改为分别验证 Anthropic 当前单步请求协议，并用确定性的分阶段 provider 覆盖真实的语义拒绝后草案重试；同步当前餐次文案断言，并将仅测试用的本地 HTTP 等待时间调至 15 秒，避免竞态而不改变运行时服务超时。未改变产品功能、领域规则、Android 源码或发布版本号。
+- 问题：主分支最新提交的 GitHub Actions `test` 工作流失败。两个 Python 版本仍用单步每日生成假设验证已经切换到强制分阶段 Agent 流程的路径；Web 断言还保留旧的 `BEGINNER` 餐次标签。Windows Web 测试在拥挤 runner 上的 5 秒本地 HTTP 超时会让测试清理先于请求结束，从而引发后续 SQLite 临时库错误。首次远端复跑还暴露了 Agent 工作目录测试将未规范化的 Windows 临时路径和 `app_home().resolve()` 的规范化路径直接比较，遇到 junction 或 8.3 路径时误报越界。
+- 改动：测试改为分别验证 Anthropic 当前单步请求协议，并用确定性的分阶段 provider 覆盖真实的语义拒绝后草案重试；同步当前餐次文案断言，并将仅测试用的本地 HTTP 等待时间调至 15 秒，避免竞态而不改变运行时服务超时。Agent 私人工作目录断言现在两端都使用规范化路径，仍验证真实的目录边界。未改变产品功能、领域规则、Android 源码或发布版本号。
 - 验证：`uv run --no-sync python -m unittest discover -s tests -v` 结果为 176 项通过、1 项按设计跳过（未提供 PostgreSQL 集成地址）；`pyinstaller --noconfirm --clean packaging/mealcircuit.spec` 成功生成 `dist/MealCircuit/MealCircuit`，其 `--smoke-test` 通过。随后用 release 工作流同款 AppImage 工具生成 `dist/MealCircuit-0.3.0-linux-x86_64.AppImage`，以 `--appimage-extract-and-run --smoke-test` 实际启动成功，SHA-256 为 `112bc9637c39af219c635bf945508a6a1d3d2399d2f40356b14e18a6d4174153`。本地安装临时 JDK 17 与 Android 36 SDK 后，`./gradlew --no-daemon testDebugUnitTest assembleDebug lintDebug compileDebugAndroidTestKotlin` 通过；`app-debug.apk` 用 `apksigner verify --verbose` 确认为 v2 签名、可启动包 `org.mealcircuit.app`（`minSdk 26`、`targetSdk 36`），但其证书为 Android Debug，不能替代正式发布签名。
-- 剩余风险：Android 客户端相对 Windows 核心端的功能落后，不能仅因 Debug APK 可构建就把它标为当前正式客户端；需决定是否纳入本次正式 release。远端 CI 尚待推送修复后复跑。
+- 剩余风险：Android 客户端相对 Windows 核心端的功能落后，不能仅因 Debug APK 可构建就把它标为当前正式客户端；用户已决定先以 Windows 为基线补齐 Android，完成前不创建正式 tag/release。远端 CI 尚待推送最新 Windows 兼容性修复后复跑。
 
 ## 2026-07-17：Windows 桌面端首启补齐私人配置
 

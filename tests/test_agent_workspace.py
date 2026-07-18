@@ -682,7 +682,10 @@ class AgentWorkspaceTest(unittest.TestCase):
             "stage_schema": {"type": "object"},
         })
         workspace = prepared["private_workspace"]
-        root = self.home / "agent-runs" / "agent_run_private_test"
+        # app_home() resolves the configured temporary directory. On Windows that
+        # can canonicalize a junction or an 8.3 path segment, so compare canonical
+        # paths when asserting the private-workspace boundary.
+        root = (self.home / "agent-runs" / "agent_run_private_test").resolve()
         self.assertTrue(Path(workspace["context_file"]).is_relative_to(root))
         result_path = Path(workspace["result_file"])
         result_path.write_text('{"ok": true}\n', encoding="utf-8")
