@@ -4,6 +4,13 @@
 
 > 本文件只记录开发历史，不是 Agent 的需求输入。当前行为以代码、测试、`AGENTS.md`、`README.md` 和 `docs/agent-workbench.md` 为准。
 
+## 2026-07-18：v0.3.0 发布说明与下载指引
+
+- 目标：在正式 `v0.3.0` tag 前，将 README、Android 签名说明和 GitHub Release 正文同步为用户可执行的跨平台安装、校验和信任边界说明，而不把“可运行”误写成商业签名或公证。
+- 改动：README 新增中英文 v0.3.0 下载区，区分 Windows 安装器/便携包、Linux AppImage、可直接安装的 Android APK、仅供分发渠道上传的 AAB，以及 macOS universal DMG；同时给出 `SHA256SUMS.txt` 校验入口。`docs/releases/v0.3.0.md` 现在直接作为 Release 正文，列出资产用途、SBOM、升级恢复和各平台签名状态。Android README 明确 release keystore 无论文件扩展名均以 PKCS12 打开，和 CI 的实际签名契约一致。
+- 验证：`uv run --no-sync python -m unittest tests.test_release_workflow -v` 的 8 项通过；`uv run --no-sync python tools/release_check.py`、`uv run --no-sync python tools/dependency_check.py` 和 `git diff --check` 均通过。
+- 剩余风险：文档分支尚未合入受保护 main，未创建 tag 或 GitHub Release；最终发布仍须等待该 PR 的 CI 通过，并在合入后的 main 提交上触发 `v0.3.0` workflow。Windows/macOS/Linux 的分发信任限制已经在面向用户的说明中如实标明。
+
 ## 2026-07-18：Windows EXE 发布与 Android 资产安全降级
 
 - 目标：在没有 Android 正式签名密钥的当前仓库条件下，完成可运行 Windows EXE 与 Linux 产物的正式 tag/Release；保留 Android 的构建验证，但绝不把未签名 APK/AAB 放入公开发布。

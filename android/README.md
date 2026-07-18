@@ -14,6 +14,6 @@ Structured revisions always synchronize. Media policy can be `all`, `all_wifi` o
 
 The application implements records, daily advice, five status modules with drafts/publication, photo and ingredient tasks, food library, memories, adjustments, profile/settings/doctrine, per-device AI providers, Portable Data, synchronization, media policy, device management, QR pairing, conflicts and safe account-key rotation.
 
-Release signing reads `MEALCIRCUIT_KEYSTORE_PATH`, `MEALCIRCUIT_KEYSTORE_PASSWORD`, `MEALCIRCUIT_KEY_ALIAS` and `MEALCIRCUIT_KEY_PASSWORD`. Unsigned local release builds work without them; official APK/AAB publishing requires the account holder's secrets.
+Release signing reads `MEALCIRCUIT_KEYSTORE_PATH`, `MEALCIRCUIT_KEYSTORE_PASSWORD`, `MEALCIRCUIT_KEY_ALIAS` and `MEALCIRCUIT_KEY_PASSWORD`. The release keystore is explicitly opened as PKCS12 (`storeType = "PKCS12"`) regardless of its filename, so local Gradle builds and CI use the same keystore format. Unsigned local release builds work without those values; official APK/AAB publishing requires the account holder's complete release-key secrets and verifies both outputs before upload.
 
 CI also runs a real cross-client acceptance path: Python creates and uploads an offline task, Android restores it and uploads its own offline record, then a fresh Python profile restores that Android record through the same E2EE service.
