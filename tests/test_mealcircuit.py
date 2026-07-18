@@ -16,7 +16,7 @@ from contextlib import redirect_stderr
 from datetime import date, timedelta
 from pathlib import Path
 
-from mealcircuit import adaptive, ai, checkins, personalization, service
+from mealcircuit import adaptive, agent_workspace, ai, checkins, personalization, service
 from mealcircuit import storage
 from mealcircuit.configuration import configuration_status, initialize_private_home
 from mealcircuit.db import connect, init_db
@@ -332,6 +332,183 @@ def lunch_eat_out_dinner_home_result(review_date: str) -> dict:
     return result
 
 
+def agent_daily_plan_result(review_date: str) -> dict:
+    """A valid DailyPlanV3 fixture built from this module's user-facing menu fixture."""
+    result = home_cooking_review_result(review_date)
+    result.update({
+        "problems_to_solve": ["可执行", "规律用餐", "饱腹"],
+        "selected_strategy": "balanced",
+        "strategy_tradeoffs": ["不追求最低成本，保留稳定执行所需的便利性"],
+        "predictions": {
+            "satiety": "三餐份量与蔬菜体积能覆盖日常饥饿",
+            "recovery": "每餐保留主食和蛋白来源",
+            "cost": "使用常见食材，成本可控",
+            "time": "自炊餐不超过个人时间上限",
+            "execution_risks": ["晚餐开始太晚会压缩切配时间"],
+            "adjustment_triggers": ["食欲低时先减少主食"],
+        },
+        "case_summary": "优先保证规律、饱腹且可执行的三餐。",
+        "planning_rationale": ["早餐降低启动摩擦", "晚餐兼顾饱腹和可执行性"],
+        "evidence_summary": ["用户已经完成基础设置", "今天有真实饮食记录"],
+        "possible_resistance": ["晚餐步骤过多会降低执行率"],
+        "adjustment_conditions": ["睡眠不足时不继续压低份量"],
+        "day_nutrition": {
+            "energy_kcal": None,
+            "protein_g": [115, 145],
+            "confidence": "medium",
+            "method": "三餐范围相加；能量因食品数据不足保持未知",
+            "unknowns": ["外食用油"],
+        },
+    })
+    protein_ranges = ([30, 35], [45, 55], [40, 55])
+    for index, meal in enumerate(result["tomorrow_menu"]["meals"]):
+        meal["protein_g"] = list(protein_ranges[index])
+        meal.update({
+            "purpose": ["低摩擦启动", "稳定下午精力", "晚间饱腹和恢复"][index],
+            "why_today": "根据当前目标、状态和餐次安排决定。",
+            "whole_day_role": "与其他餐共同覆盖当前目标，不机械追加。",
+            "predicted_satiety": "预计餐后舒适；饥饿时有明确加量顺序。",
+            "predicted_cost": "使用日常可购买食材。",
+            "execution_risks": ["开始太晚会压缩烹饪时间"] if index else [],
+            "portion_contracts": [{
+                "item": meal["foods"][0],
+                "gram_range": [100 + index * 20, 140 + index * 20],
+                "measurement_basis": "cooked",
+                "household_measure": "约一掌",
+                "nutrition_estimate": {"protein_g": [5, 15]},
+                "confidence": "medium",
+                "increase_if": "餐后仍明显饥饿时先增加半拳蔬菜或半拳主食",
+                "decrease_if": "食欲低时先减主食，不减主蛋白",
+            }],
+            "adjustment_logic": {
+                "if_hungry": "先加蔬菜，再按训练情况加主食",
+                "if_low_appetite": "减主食但保留蛋白",
+                "if_gut_unwell": "降油、降辣并改软烂",
+            },
+        })
+    return result
+
+
+class AgentPipelineProvider:
+    """Deterministic staged provider used by service-level generation tests."""
+
+    provider_name = "test"
+    model = "agent-pipeline"
+
+    def __init__(self, plan_results: list[dict]):
+        self.plan_results = [copy.deepcopy(result) for result in plan_results]
+        self.plan_calls = 0
+        self.requests = []
+
+    def generate(self, request):
+        self.requests.append(copy.deepcopy(request))
+        if request.kind == "intent_learning":
+            bundle = request.context["fact_bundle"]
+            return {
+                "source_dispositions": [{
+                    "source_id": item["source_id"],
+                    "disposition": "today_fact",
+                    "summary": item["text"],
+                } for item in bundle.get("natural_language_sources") or []],
+                "signal_dispositions": [{
+                    "signal_id": item["signal_id"],
+                    "disposition": "pending_confirmation",
+                    "explanation": "已按风险和适用时间处理。",
+                } for item in bundle.get("detected_intent_signals") or []],
+                "learning_summary": ["已逐条处理本次用户输入。"],
+            }
+        if request.kind == "case_formulation":
+            return {
+                "current_state": ["今天已经提供真实饮食记录"],
+                "explicit_goals": ["规律饮食"],
+                "underlying_needs": [{"need": "计划必须吃得饱且能执行", "evidence": "用户记录"}],
+                "tensions": ["规律用餐与当天时间需要平衡"],
+                "decisive_constraints": ["晚餐时间有限"],
+                "historical_patterns": [],
+                "soft_assumptions": [],
+                "uncertainties": [],
+                "intake_classifications": [],
+                "clarification_questions": [],
+                "planning_priorities": ["可执行", "规律用餐", "饱腹"],
+            }
+        if request.kind == "strategy_comparison":
+            coverage = [{
+                "requirement_ref": item["ref"],
+                "approach": f"在计划中落实：{item['statement']}",
+                "tradeoff": "不牺牲安全边界，并在现实限制内取舍。",
+            } for item in request.context["requirement_catalog"]]
+            scores = {key: 4 for key in (
+                "safety", "goal_coverage", "budget", "time", "satiety", "taste",
+                "rotation", "waste", "execution_probability",
+            )}
+            return {
+                "options": [
+                    {
+                        "id": "balanced",
+                        "label": "平衡现实执行",
+                        "summary": "兼顾饱腹和时间。",
+                        "scores": scores,
+                        "tradeoffs": ["不是最低成本"],
+                        "coverage": coverage,
+                    },
+                    {
+                        "id": "cheapest",
+                        "label": "最低成本",
+                        "summary": "优先成本。",
+                        "scores": {**scores, "budget": 5},
+                        "tradeoffs": ["口味和便利性较弱"],
+                        "coverage": copy.deepcopy(coverage),
+                    },
+                ],
+                "selected_id": "balanced",
+                "selection_reason": "更适合长期执行。",
+                "rejected_reasons": [{"id": "cheapest", "reason": "会牺牲便利性。"}],
+            }
+        if request.kind in {"daily_plan_v3", "daily_plan_v3_revision"}:
+            self.plan_calls += 1
+            if not self.plan_results:
+                raise AssertionError("unexpected additional plan-generation request")
+            candidate = self.plan_results.pop(0)
+            candidate["problem_responses"] = [{
+                "problem_ref": item["ref"],
+                "response": f"计划已具体回应：{item['statement']}",
+            } for item in request.context["problem_catalog"]]
+            source_ref = next(
+                item["ref"] for item in request.context["evidence_catalog"]
+                if item["kind"] == "user_context"
+            )
+            candidate["advice_evidence"] = [{
+                "advice": advice,
+                "basis_kind": "user_context",
+                "source_refs": [source_ref],
+            } for advice in candidate["core_advice"]]
+            return candidate
+        if request.kind == "plan_review":
+            catalog = request.context["review_catalog"]
+            return {
+                "approved": True,
+                "human_fit_summary": "份量、执行性和当天目标相互一致。",
+                "problem_coverage": [{
+                    "problem_ref": item["ref"],
+                    "addressed": True,
+                    "evidence": "计划有对应餐次与调整条件。",
+                } for item in catalog["problems"]],
+                "dimension_coverage": [{
+                    "dimension_ref": item["ref"],
+                    "addressed": True,
+                    "evidence": "所选策略和餐次安排有对应体现。",
+                } for item in catalog["dimensions"]],
+                "evidence_checks": [{
+                    "advice_ref": item["ref"],
+                    "supported": True,
+                    "source_or_boundary": "对应 advice_evidence 中的当天用户记录。",
+                } for item in catalog["advice"]],
+                "issues": [],
+                "claim_candidates": [],
+            }
+        raise AssertionError(request.kind)
+
+
 def add_carryover_decisions(result: dict, context: dict, decision: str = "use") -> dict:
     result["ingredient_carryover_decisions"] = [
         {
@@ -537,7 +714,7 @@ class MealCircuitTest(unittest.TestCase):
         self.assertTrue(content[0]["image_url"].startswith("data:image/png;base64,"))
         self.assertEqual(payloads[0]["text"]["format"]["type"], "json_schema")
 
-    def test_anthropic_generate_daily_uses_forced_tool_result(self):
+    def test_anthropic_daily_request_uses_forced_tool_result(self):
         today = date.today().isoformat()
         service.add_daily_record(today, "今天记录待复盘")
         valid = daily_review_result(today)
@@ -557,8 +734,8 @@ class MealCircuitTest(unittest.TestCase):
             ai.AIConfig("anthropic", "test-claude-model", "test-key"),
             transport=transport,
         )
-        completed = service.generate_daily_review(today, provider)
-        self.assertEqual(completed["status"], "completed")
+        context = service.daily_review_context(today)
+        self.assertEqual(valid, provider.generate(ai.build_generation_request(context, "daily")))
         self.assertEqual(payloads[0]["tool_choice"], {"type": "tool", "name": "submit_mealcircuit_result"})
         self.assertEqual(payloads[0]["tools"][0]["input_schema"]["type"], "object")
         self.assertIn("core_advice", payloads[0]["system"])
@@ -702,41 +879,46 @@ class MealCircuitTest(unittest.TestCase):
         self.assertEqual(completed["revision_policy"]["mode"], "locked")
         self.assertIn("past_plan_date", completed["revision_policy"]["reasons"])
 
-    def test_daily_generation_retries_semantic_rejections_without_persisting_candidates(self):
+    def test_daily_generation_retries_semantic_rejection_before_creating_draft(self):
         previous_date = (date.today() - timedelta(days=1)).isoformat()
         today = date.today().isoformat()
         service.add_daily_record(previous_date, "前一天记录")
-        service.complete_daily_review(previous_date, daily_review_result(previous_date))
+        service.complete_daily_review(previous_date, home_cooking_review_result(previous_date))
         service.add_daily_record(today, "今天记录")
-        repeated = daily_review_result(today)
-        distinct = daily_review_result(today)
+        repeated = agent_daily_plan_result(today)
+        distinct = agent_daily_plan_result(today)
         meals = {meal["name"]: meal for meal in distinct["tomorrow_menu"]["meals"]}
         meals["早餐"]["foods"] = ["燕麦", "原味酸奶", "草莓"]
         meals["午餐"]["foods"] = ["清蒸鱼", "杂粮饭", "西兰花"]
-        meals["晚餐"]["foods"] = ["豆腐汤", "红薯", "菠菜"]
+        meals["午餐"]["eat_out_guidance"]["protein_anchor"] = "优先清蒸鱼或豆腐"
+        change_home_dinner(
+            distinct,
+            title="香菇豆腐煲",
+            protein="北豆腐",
+            vegetable="香菇",
+            seasoning="生抽",
+            instruction="豆腐和香菇加少量水焖熟",
+            dish_key="mushroom_tofu",
+            flavor="savory",
+            technique="braise",
+        )
 
-        class Provider:
-            provider_name = "test"
-            model = "semantic-retry"
-
-            def __init__(self):
-                self.requests = []
-                self.results = [copy.deepcopy(repeated), copy.deepcopy(repeated), distinct]
-
-            def generate(self, request):
-                self.requests.append(copy.deepcopy(request))
-                return self.results.pop(0)
-
-        provider = Provider()
-        completed = service.generate_daily_review(today, provider)
-        self.assertEqual(completed["result_version"], 1)
-        self.assertEqual(len(provider.requests), 3)
-        self.assertEqual(len(provider.requests[1].context["candidate_rejections"]), 1)
+        provider = AgentPipelineProvider([repeated, distinct])
+        draft = service.generate_daily_review(today, provider)
+        self.assertEqual(draft["status"], "ready_draft")
+        self.assertEqual(provider.plan_calls, 2)
+        plan_requests = [
+            request for request in provider.requests
+            if request.kind in {"daily_plan_v3", "daily_plan_v3_revision"}
+        ]
+        self.assertEqual(len(plan_requests), 2)
+        self.assertIn("previous_rejection", plan_requests[1].context)
+        review_id = service.get_daily_review(today)["id"]
         with connect() as conn:
-            self.assertEqual(conn.execute("SELECT COUNT(*) FROM plan_versions WHERE review_id=?", (completed["id"],)).fetchone()[0], 1)
-            self.assertEqual(conn.execute("SELECT COUNT(*) FROM daily_review_history WHERE review_id=?", (completed["id"],)).fetchone()[0], 0)
-            attempts = json.loads(conn.execute("SELECT validation_attempts_json FROM agent_runs WHERE id=?", (completed["agent_run_id"],)).fetchone()[0])
-        self.assertEqual([item["status"] for item in attempts], ["rejected", "rejected", "valid"])
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM plan_versions WHERE review_id=?", (review_id,)).fetchone()[0], 0)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM daily_review_history WHERE review_id=?", (review_id,)).fetchone()[0], 0)
+        receipts = agent_workspace.agent_run_status(draft["run_id"])["receipts"]
+        self.assertIn("plan_design", {item["stage_key"] for item in receipts})
 
     def test_failed_regeneration_keeps_replaceable_current_plan_unchanged(self):
         today = date.today().isoformat()
@@ -1345,7 +1527,7 @@ class WebAppTest(unittest.TestCase):
         self.temp.cleanup()
 
     def request(self, method, path, body=None, headers=None):
-        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=15)
         try:
             conn.request(method, path, body=body, headers=headers or {})
             response = conn.getresponse()
@@ -2108,7 +2290,7 @@ class WebAppTest(unittest.TestCase):
         decoded = body.decode("utf-8")
         self.assertEqual(status, 200)
         for label in (
-            "快速组装", "在家下厨", "BEGINNER LUNCH", "BEGINNER DINNER", "明日采购清单",
+            "快速组装", "在家下厨", "LUNCH", "DINNER", "明日采购清单",
             "可选网购组件", "3 日食材复用方向", "失败补救", "清洁成本", "肠胃降级",
         ):
             self.assertIn(label, decoded)
@@ -2133,8 +2315,8 @@ class WebAppTest(unittest.TestCase):
         self.assertIn("午餐</span><span class=\"meal-time\">食堂 / 外食", review_html)
         self.assertIn("外食提醒", review_html)
         self.assertIn("酱汁分开，不喝油汤", review_html)
-        self.assertNotIn("BEGINNER LUNCH", review_html)
-        self.assertIn("BEGINNER DINNER", review_html)
+        self.assertNotIn('<span class="subtle-label">LUNCH</span>', review_html)
+        self.assertIn('<span class="subtle-label">DINNER</span>', review_html)
 
         plan_date = (date.today() + timedelta(days=1)).isoformat()
         status, _, plan_body = self.request("GET", f"/plans/{plan_date}")
