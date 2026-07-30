@@ -1,0 +1,297 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#173d35">
+    <meta name="color-scheme" content="light">
+    <meta name="description" content="MealCircuit 食回路是一款本地优先的开源长期饮食反馈工作台，把饮食记录、当天状态和真实执行反馈连接成更安全的下一步选择。">
+    <meta name="robots" content="index, follow">
+    <meta property="og:type" content="website">
+    <meta property="og:site_name" content="MealCircuit 食回路">
+    <meta property="og:title" content="MealCircuit 食回路 — 从真实生活中学习的饮食决策">
+    <meta property="og:description" content="记录事实、保留上下文、校准下一餐，同时始终掌握自己的数据和最终决定。">
+    <meta name="twitter:card" content="summary">
+    <meta name="twitter:title" content="MealCircuit 食回路 — 从真实生活中学习的饮食决策">
+    <meta name="twitter:description" content="本地优先的长期饮食反馈工作台。">
+    <link rel="alternate" hreflang="en" href="/">
+    <link rel="alternate" hreflang="zh-CN" href="/zh/">
+    <link rel="alternate" hreflang="x-default" href="/">
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg">
+    <link rel="manifest" href="/site.webmanifest">
+    <link rel="stylesheet" href="/assets/site.css">
+    <title>MealCircuit 食回路 — 从真实生活中学习的饮食决策</title>
+  </head>
+  <body>
+    <a class="skip-link" href="#main">跳到主要内容</a>
+
+    <header class="site-header">
+      <div class="page-shell header-inner">
+        <a class="wordmark" href="/zh/" aria-label="MealCircuit 食回路首页">
+          <img class="brand-mark" src="/favicon.svg" alt="" width="34" height="34">
+          <span>MealCircuit 食回路</span>
+        </a>
+        <nav class="primary-nav" aria-label="主导航">
+          <a href="#loop">反馈回路</a>
+          <a href="#privacy">数据自主</a>
+          <a href="#product">产品入口</a>
+          <a href="#boundaries">能力边界</a>
+          <a href="#source">开放源码</a>
+        </nav>
+        <a class="language-link" href="/" lang="en" hreflang="en">EN</a>
+      </div>
+    </header>
+
+    <main id="main">
+      <section class="page-shell hero" aria-labelledby="hero-title">
+        <div class="hero-copy">
+          <p class="eyebrow">本地优先 · 开放源码 · 0.3 正式版</p>
+          <h1 id="hero-title">饮食不是一场打分。<strong>它是你的<em>反馈回路。</em></strong></h1>
+          <p class="hero-body">MealCircuit 把你实际吃了什么、当天真实感受、临时发生的变化和下一步能做到什么连接起来；每项判断都保留来源，最终由你决定是否接受。</p>
+          <div class="hero-actions">
+            <a class="button button--primary" href="https://github.com/QianQIUlp/meal-circuit/releases/tag/v0.3.0" target="_blank" rel="noreferrer">下载 v0.3.0 <span aria-hidden="true">↗</span></a>
+            <a class="button button--secondary" href="https://github.com/QianQIUlp/meal-circuit" target="_blank" rel="noreferrer">查看源代码 <span aria-hidden="true">↗</span></a>
+          </div>
+          <p class="release-note"><span aria-hidden="true">i</span> 桌面端和 Android 端均离线优先；可选同步服务由用户自行托管。</p>
+        </div>
+
+        <figure class="circuit-board" aria-label="饮食记录、个人上下文、审查后的计划和真实执行结果构成反馈回路">
+          <div class="circuit-board__topbar">
+            <span>每日饮食反馈回路</span>
+            <span class="circuit-board__status">由用户掌控</span>
+          </div>
+          <div class="circuit-board__body">
+            <div class="loop-ring" aria-hidden="true"></div>
+            <div class="loop-core" aria-hidden="true">
+              <svg viewBox="0 0 32 32"><path d="M7 11a11 11 0 1 1-2 12M4 17l1 7 7-2" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+              <strong>下一步选择</strong>
+              <small>持续校准</small>
+            </div>
+            <article class="signal signal--capture">
+              <span>01 · 记录</span>
+              <strong>发生了什么</strong>
+              <small>饮食 · 照片 · 状态</small>
+            </article>
+            <article class="signal signal--understand">
+              <span>02 · 上下文</span>
+              <strong>意味着什么</strong>
+              <small>14 天 · 目标 · 需求</small>
+            </article>
+            <article class="signal signal--plan">
+              <span>03 · 审查</span>
+              <strong>什么能做到</strong>
+              <small>边界 · 权衡 · 计划</small>
+            </article>
+            <article class="signal signal--learn">
+              <span>04 · 反馈</span>
+              <strong>什么有效</strong>
+              <small>结果 · 更正 · 学习</small>
+            </article>
+          </div>
+          <figcaption>系统负责准备草案，只有你能决定什么成为正式计划。</figcaption>
+        </figure>
+      </section>
+
+      <section class="fact-strip" aria-label="产品关键信息">
+        <div class="page-shell fact-strip__inner">
+          <div class="fact">
+            <span>默认存储</span>
+            <strong>本地 SQLite</strong>
+            <small>无需注册账户</small>
+          </div>
+          <div class="fact">
+            <span>决策窗口</span>
+            <strong>最近 14 天上下文</strong>
+            <small>不孤立评价某一餐</small>
+          </div>
+          <div class="fact">
+            <span>模型调用</span>
+            <strong>主动选择，自带配置</strong>
+            <small>默认无需 API Key</small>
+          </div>
+        </div>
+      </section>
+
+      <section class="page-shell section" id="loop" aria-labelledby="loop-title">
+        <div class="section-heading section-heading--split">
+          <div>
+            <p class="eyebrow">长期反馈回路</p>
+            <h2 id="loop-title">先看事实，再读上下文，最后才给建议。</h2>
+          </div>
+          <div class="section-heading__aside">
+            <p>每日计划不能从一份模型回复直接发布。MealCircuit 会依次分开事实、个案理解、专业边界、策略选择、计划设计和独立审查，之后再交给你接受。</p>
+          </div>
+        </div>
+        <ol class="steps">
+          <li class="step">
+            <span class="step__index" aria-hidden="true">01</span>
+            <span class="step__label">记录现实</span>
+            <h3>事实保持事实</h3>
+            <p>记录餐食、照片、原材料、饥饿、睡眠、训练、身体反应和用户更正，不用伪造的精确数值填补未知。</p>
+          </li>
+          <li class="step">
+            <span class="step__index" aria-hidden="true">02</span>
+            <span class="step__label">理解个体</span>
+            <h3>读懂具体的人</h3>
+            <p>把当前目标、个人总纲、近期趋势、当天约束和已确认偏好放入同一份决策上下文。</p>
+          </li>
+          <li class="step">
+            <span class="step__index" aria-hidden="true">03</span>
+            <span class="step__label">设计选择</span>
+            <h3>比较真实方案</h3>
+            <p>综合安全、份量、训练恢复、用餐方式、准备时间和食材承接，再设计经过审查的次日草案。</p>
+          </li>
+          <li class="step">
+            <span class="step__index" aria-hidden="true">04</span>
+            <span class="step__label">持续校准</span>
+            <h3>从执行结果学习</h3>
+            <p>保留每次更正和执行反馈；重复需求只有在证据足够时，才成为可见、可撤销的个人理解。</p>
+          </li>
+        </ol>
+      </section>
+
+      <section class="section section--privacy" id="privacy" aria-labelledby="privacy-title">
+        <div class="page-shell privacy-layout">
+          <div class="privacy-copy">
+            <p class="eyebrow eyebrow--light">默认保留数据主权</p>
+            <h2 id="privacy-title">让历史持续发挥作用，不必先交给别人的云。</h2>
+            <p>本地数据库始终是事实来源。同步和模型调用是彼此独立的选择，哪些数据会离开设备都有明确边界。</p>
+            <a href="https://github.com/QianQIUlp/meal-circuit/blob/main/PRIVACY.md" target="_blank" rel="noreferrer">阅读隐私说明 <span aria-hidden="true">↗</span></a>
+          </div>
+          <div class="privacy-board">
+            <article class="privacy-card">
+              <span class="privacy-card__icon" aria-hidden="true">本地</span>
+              <div>
+                <h3>默认本地运行</h3>
+                <p>桌面端和 Android 端只读写各自本地数据库，核心功能离线可用。</p>
+              </div>
+              <span class="privacy-card__status">默认启用</span>
+            </article>
+            <article class="privacy-card">
+              <span class="privacy-card__icon" aria-hidden="true">密</span>
+              <div>
+                <h3>可选端到端加密同步</h3>
+                <p>兼容的自托管中继只保存加密修订和照片分块，不执行饮食规划逻辑。</p>
+              </div>
+              <span class="privacy-card__status">按需配置</span>
+            </article>
+            <article class="privacy-card">
+              <span class="privacy-card__icon" aria-hidden="true">AI</span>
+              <div>
+                <h3>模型访问必须显式开启</h3>
+                <p>由你选择服务商、模型和 API Key；密钥只在当前进程存在，不写入持久化数据。</p>
+              </div>
+              <span class="privacy-card__status">主动选择</span>
+            </article>
+          </div>
+        </div>
+      </section>
+
+      <section class="page-shell section" id="product" aria-labelledby="product-title">
+        <div class="section-heading">
+          <p class="eyebrow">三个日常入口</p>
+          <h2 id="product-title">把复杂机制留在每次决定的背后。</h2>
+          <p>普通导航只聚焦现在真正重要的三件事：今天、计划，以及正在影响计划的个人上下文。</p>
+        </div>
+        <div class="surface-grid">
+          <article class="surface-card">
+            <span class="surface-card__number">01 · 今天</span>
+            <h3>发现变化。</h3>
+            <p>查看当天安排、记录实际变化、只回答真正相关的问题，并共同调整明天的草案。</p>
+          </article>
+          <article class="surface-card">
+            <span class="surface-card__number">02 · 计划</span>
+            <h3>带着上下文行动。</h3>
+            <p>查看当前和历史计划，在生活条件变化时调整一餐，并记录这次选择实际执行得怎样。</p>
+          </article>
+          <article class="surface-card">
+            <span class="surface-card__number">03 · 我的</span>
+            <h3>掌握自己的规则。</h3>
+            <p>管理目标、用餐方式、安全边界、库存、已学偏好、界面外观和高级设置。</p>
+          </article>
+        </div>
+      </section>
+
+      <section class="page-shell section" id="boundaries" aria-labelledby="boundaries-title">
+        <div class="section-heading section-heading--split">
+          <div>
+            <p class="eyebrow">诚实的能力边界</p>
+            <h2 id="boundaries-title">提供真实帮助，不制造虚假确定性。</h2>
+          </div>
+          <div class="section-heading__aside">
+            <p>MealCircuit 让未知保持可见。安全规则和用户确认是产品流程本身，而不是生成结束后的补充说明。</p>
+          </div>
+        </div>
+        <div class="boundary-grid">
+          <article class="boundary-card">
+            <span aria-hidden="true">×</span>
+            <h3>不做医学诊断</h3>
+            <p>它提供一般性的记录和决策协助，不提供诊断或治疗建议。</p>
+          </article>
+          <article class="boundary-card">
+            <span aria-hidden="true">×</span>
+            <h3>不编造不可见事实</h3>
+            <p>油、酱汁、重量、品牌、健康状态和库存，在有证据前保持未知。</p>
+          </article>
+          <article class="boundary-card">
+            <span aria-hidden="true">×</span>
+            <h3>不提供官方托管云</h3>
+            <p>账户只服务于用户自行配置的兼容自托管同步。</p>
+          </article>
+          <article class="boundary-card">
+            <span aria-hidden="true">×</span>
+            <h3>不静默发布计划</h3>
+            <p>通过审查的草案仍可替换，只有用户明确接受后才成为正式计划。</p>
+          </article>
+        </div>
+      </section>
+
+      <section class="page-shell section section--source" id="source" aria-labelledby="source-title">
+        <div class="source-card">
+          <img class="source-mark" src="/favicon.svg" alt="" width="105" height="105">
+          <div class="source-copy">
+            <p class="eyebrow">源代码现已开放</p>
+            <h2 id="source-title">在把长期记录交给它之前，先检查这条回路。</h2>
+            <p>MealCircuit 使用 MIT 许可证公开开发。产品边界、数据模型、同步协议、威胁模型、自动化测试和发布门禁都可供审阅。</p>
+            <div class="source-actions">
+              <a class="button button--primary" href="https://github.com/QianQIUlp/meal-circuit" target="_blank" rel="noreferrer">在 GitHub 查看 <span aria-hidden="true">↗</span></a>
+              <a class="button button--secondary" href="https://github.com/QianQIUlp/meal-circuit/blob/main/README.md#zh-cn" target="_blank" rel="noreferrer">从源码运行</a>
+            </div>
+          </div>
+          <dl class="source-meta">
+            <div>
+              <dt>当前版本</dt>
+              <dd>v0.3.0</dd>
+            </div>
+            <div>
+              <dt>客户端</dt>
+              <dd>桌面端 · Android</dd>
+            </div>
+            <div>
+              <dt>开源许可</dt>
+              <dd>MIT</dd>
+            </div>
+          </dl>
+        </div>
+      </section>
+    </main>
+
+    <footer class="site-footer">
+      <div class="page-shell footer-inner">
+        <div class="footer-brand">
+          <a class="wordmark" href="/zh/">
+            <img class="brand-mark" src="/favicon.svg" alt="" width="34" height="34">
+            <span>MealCircuit 食回路</span>
+          </a>
+          <p>记录事实，保留上下文，校准下一步选择。</p>
+        </div>
+        <p class="footer-status">本地优先，公开开发。</p>
+        <div class="footer-links">
+          <a href="https://github.com/QianQIUlp/meal-circuit" target="_blank" rel="noreferrer">GitHub</a>
+          <a href="https://github.com/QianQIUlp/meal-circuit/blob/main/SECURITY.md" target="_blank" rel="noreferrer">安全策略</a>
+          <a href="https://github.com/QianQIUlp/meal-circuit/blob/main/LICENSE" target="_blank" rel="noreferrer">MIT 许可证</a>
+        </div>
+      </div>
+    </footer>
+  </body>
+</html>

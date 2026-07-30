@@ -4,6 +4,14 @@
 
 > 本文件只记录开发历史，不是 Agent 的需求输入。当前行为以代码、测试、`AGENTS.md`、`README.md` 和 `docs/agent-workbench.md` 为准。
 
+## 2026-07-29：Cloudflare Pages 双语产品介绍站
+
+- 目标：让 `main` 分支可以直接连接 Cloudflare Pages，托管一份不暴露本地应用或私人数据的中英文 MealCircuit 对外介绍站；参考 `verisilo.qiu.works` 的信息组织和其公开仓库部署方式，但不把 Astro/pnpm 引入当前 Python/Android 工程。
+- 改动：新增无构建依赖的 `site/` 静态站，包含英文首页、`/zh/` 中文首页、显式 404、响应式样式、SVG 品牌图标、manifest、robots 和 Cloudflare `_headers`；根目录新增 `wrangler.jsonc`，固定项目名 `meal-circuit`、输出目录 `site`、兼容日期和关闭 Wrangler 指标上报。README 补充产品站入口和目录说明，`docs/site-deployment.md` 记录 `main` Git 集成、构建参数、预览、自定义域名与部署后检查；新增标准库站点契约测试，未增加 Python、Node 或运行时依赖。
+- 页面内容：围绕“记录事实—理解个体—比较策略—执行反馈”的长期回路介绍今天、计划、我的三个入口，本地 SQLite、可选自托管 E2EE 同步、主动配置模型等数据边界，以及不诊断、不编造未知、不提供官方托管云、不静默发布计划的真实限制；下载和源码链接指向当前公开 `v0.3.0` 与仓库。
+- 验证：`uv run --no-sync python -m unittest tests.test_product_site tests.test_release_workflow -v` 共 12 项通过；`uv run --no-sync python tools/dependency_check.py` 通过；`uv run --no-sync python tools/release_check.py` 零发现；`git diff --check` 通过。Wrangler 4.115.0 从 `site/` 启动等价 Pages 预览，解析 `_headers` 规则，`/` 返回 200，未知路径返回自定义 404，CSP、Permissions Policy、Referrer Policy、nosniff 和防嵌入响应头均实际返回。Chromium 在 320、768、1440px 检查中英文页面，均为单一 h1、无缺图、无控制台/请求错误、外链带 `noreferrer` 且无页面级横向溢出；另完成 1440px 英文和 390px 中文长页截图视觉检查。预览生成的 `.wrangler` 本地缓存已清理，发布门禁复跑通过。
+- 剩余风险：本轮没有写入 Cloudflare 账户、创建 Pages 项目或配置 DNS；PR 分支本身不会触发 `main` 的生产部署。仓库未猜测最终自定义域名，因此暂不声明 canonical、`og:url` 或 sitemap；选定并激活真实域名后应一次补齐这些绝对 URL。
+
 ## 2026-07-18：Android 正式发行资产平铺修复
 
 - 问题：`v0.3.0` 的 tag workflow（`29646367792`）已成功生成并严格验签 `app-release.apk` 与 `app-release.aab`，但 Android artifact 保留了 `apk/release/`、`bundle/release/` 子目录；Release job 的 `release-assets/*` 与顶层校验和扫描因此没有发布这两项。该 tag 的公开 Release 已从同一成功工作流下载签名产物，补齐 APK/AAB，并用包含全部 9 项公开文件的新 `SHA256SUMS.txt` 覆盖旧清单；回读后逐项 `sha256sum -c` 通过，APK 的 `apksigner verify --verbose` 也通过。

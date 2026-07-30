@@ -1,0 +1,297 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#173d35">
+    <meta name="color-scheme" content="light">
+    <meta name="description" content="MealCircuit is a local-first, open-source workbench that turns meal records, daily context, and real feedback into a safer next choice.">
+    <meta name="robots" content="index, follow">
+    <meta property="og:type" content="website">
+    <meta property="og:site_name" content="MealCircuit">
+    <meta property="og:title" content="MealCircuit — Food decisions that learn from real life">
+    <meta property="og:description" content="Capture facts, keep the context, and calibrate the next meal without giving up ownership of your data.">
+    <meta name="twitter:card" content="summary">
+    <meta name="twitter:title" content="MealCircuit — Food decisions that learn from real life">
+    <meta name="twitter:description" content="A local-first workbench for long-horizon meal feedback.">
+    <link rel="alternate" hreflang="en" href="/">
+    <link rel="alternate" hreflang="zh-CN" href="/zh/">
+    <link rel="alternate" hreflang="x-default" href="/">
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg">
+    <link rel="manifest" href="/site.webmanifest">
+    <link rel="stylesheet" href="/assets/site.css">
+    <title>MealCircuit — Food decisions that learn from real life</title>
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to content</a>
+
+    <header class="site-header">
+      <div class="page-shell header-inner">
+        <a class="wordmark" href="/" aria-label="MealCircuit home">
+          <img class="brand-mark" src="/favicon.svg" alt="" width="34" height="34">
+          <span>MealCircuit</span>
+        </a>
+        <nav class="primary-nav" aria-label="Primary navigation">
+          <a href="#loop">The loop</a>
+          <a href="#privacy">Data ownership</a>
+          <a href="#product">Product</a>
+          <a href="#boundaries">Boundaries</a>
+          <a href="#source">Source</a>
+        </nav>
+        <a class="language-link" href="/zh/" lang="zh-CN" hreflang="zh-CN">中文</a>
+      </div>
+    </header>
+
+    <main id="main">
+      <section class="page-shell hero" aria-labelledby="hero-title">
+        <div class="hero-copy">
+          <p class="eyebrow">LOCAL-FIRST · OPEN SOURCE · RELEASE 0.3</p>
+          <h1 id="hero-title">Your meals are not a score. <strong>They are a <em>feedback loop.</em></strong></h1>
+          <p class="hero-body">MealCircuit connects what you ate, how the day actually felt, what changed, and what you can realistically do next—then keeps every conclusion traceable and yours to accept.</p>
+          <div class="hero-actions">
+            <a class="button button--primary" href="https://github.com/QianQIUlp/meal-circuit/releases/tag/v0.3.0" target="_blank" rel="noreferrer">Download v0.3.0 <span aria-hidden="true">↗</span></a>
+            <a class="button button--secondary" href="https://github.com/QianQIUlp/meal-circuit" target="_blank" rel="noreferrer">Inspect the source <span aria-hidden="true">↗</span></a>
+          </div>
+          <p class="release-note"><span aria-hidden="true">i</span> Desktop and Android clients are offline-first. Optional sync remains self-hosted.</p>
+        </div>
+
+        <figure class="circuit-board" aria-label="A feedback loop connecting meal capture, personal context, reviewed plans, and real-world outcomes">
+          <div class="circuit-board__topbar">
+            <span>Daily feedback circuit</span>
+            <span class="circuit-board__status">User controlled</span>
+          </div>
+          <div class="circuit-board__body">
+            <div class="loop-ring" aria-hidden="true"></div>
+            <div class="loop-core" aria-hidden="true">
+              <svg viewBox="0 0 32 32"><path d="M7 11a11 11 0 1 1-2 12M4 17l1 7 7-2" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+              <strong>NEXT CHOICE</strong>
+              <small>calibrated</small>
+            </div>
+            <article class="signal signal--capture">
+              <span>01 · Capture</span>
+              <strong>What happened</strong>
+              <small>Meals · photos · state</small>
+            </article>
+            <article class="signal signal--understand">
+              <span>02 · Context</span>
+              <strong>What it means</strong>
+              <small>14 days · goals · needs</small>
+            </article>
+            <article class="signal signal--plan">
+              <span>03 · Review</span>
+              <strong>What is realistic</strong>
+              <small>Boundaries · tradeoffs · plan</small>
+            </article>
+            <article class="signal signal--learn">
+              <span>04 · Feedback</span>
+              <strong>What worked</strong>
+              <small>Outcome · correction · learning</small>
+            </article>
+          </div>
+          <figcaption>The system prepares a draft. You decide what becomes the plan.</figcaption>
+        </figure>
+      </section>
+
+      <section class="fact-strip" aria-label="Key product facts">
+        <div class="page-shell fact-strip__inner">
+          <div class="fact">
+            <span>DEFAULT STORAGE</span>
+            <strong>Local SQLite</strong>
+            <small>No account required</small>
+          </div>
+          <div class="fact">
+            <span>DECISION WINDOW</span>
+            <strong>14 days in context</strong>
+            <small>Not one meal in isolation</small>
+          </div>
+          <div class="fact">
+            <span>MODEL ACCESS</span>
+            <strong>Opt in, bring your own</strong>
+            <small>No API key by default</small>
+          </div>
+        </div>
+      </section>
+
+      <section class="page-shell section" id="loop" aria-labelledby="loop-title">
+        <div class="section-heading section-heading--split">
+          <div>
+            <p class="eyebrow">THE LONG-HORIZON LOOP</p>
+            <h2 id="loop-title">Facts first. Context next. Advice last.</h2>
+          </div>
+          <div class="section-heading__aside">
+            <p>A daily plan cannot be published from one model response. MealCircuit separates evidence, case understanding, professional limits, strategy, planning, and independent review before you accept anything.</p>
+          </div>
+        </div>
+        <ol class="steps">
+          <li class="step">
+            <span class="step__index" aria-hidden="true">01</span>
+            <span class="step__label">RECORD</span>
+            <h3>Capture reality</h3>
+            <p>Record meals, photos, ingredients, hunger, sleep, training, symptoms, and corrections without forcing missing details into fake precision.</p>
+          </li>
+          <li class="step">
+            <span class="step__index" aria-hidden="true">02</span>
+            <span class="step__label">UNDERSTAND</span>
+            <h3>Read the person</h3>
+            <p>Bring current goals, personal doctrine, recent patterns, daily constraints, and confirmed preferences into the same decision context.</p>
+          </li>
+          <li class="step">
+            <span class="step__index" aria-hidden="true">03</span>
+            <span class="step__label">DESIGN</span>
+            <h3>Compare real choices</h3>
+            <p>Balance safety, portions, recovery, meal mode, preparation time, and ingredient reuse before designing a reviewed next-day draft.</p>
+          </li>
+          <li class="step">
+            <span class="step__index" aria-hidden="true">04</span>
+            <span class="step__label">CALIBRATE</span>
+            <h3>Learn from outcomes</h3>
+            <p>Keep corrections and execution feedback as history. Promote recurring needs only through visible, reversible, evidence-backed learning.</p>
+          </li>
+        </ol>
+      </section>
+
+      <section class="section section--privacy" id="privacy" aria-labelledby="privacy-title">
+        <div class="page-shell privacy-layout">
+          <div class="privacy-copy">
+            <p class="eyebrow eyebrow--light">SOVEREIGNTY BY DEFAULT</p>
+            <h2 id="privacy-title">Your history stays useful without becoming someone else’s cloud.</h2>
+            <p>The local database is the source of truth. Sync and model calls are separate choices, with explicit boundaries for what leaves the device.</p>
+            <a href="https://github.com/QianQIUlp/meal-circuit/blob/main/PRIVACY.md" target="_blank" rel="noreferrer">Read the privacy notice <span aria-hidden="true">↗</span></a>
+          </div>
+          <div class="privacy-board">
+            <article class="privacy-card">
+              <span class="privacy-card__icon" aria-hidden="true">L</span>
+              <div>
+                <h3>Local by default</h3>
+                <p>Desktop and Android read and write their own local database. Core features work offline.</p>
+              </div>
+              <span class="privacy-card__status">ACTIVE</span>
+            </article>
+            <article class="privacy-card">
+              <span class="privacy-card__icon" aria-hidden="true">E</span>
+              <div>
+                <h3>Encrypted optional sync</h3>
+                <p>A self-hosted compatible relay stores encrypted revisions and photo chunks, not meal-planning logic.</p>
+              </div>
+              <span class="privacy-card__status">OPTIONAL</span>
+            </article>
+            <article class="privacy-card">
+              <span class="privacy-card__icon" aria-hidden="true">AI</span>
+              <div>
+                <h3>Model access is explicit</h3>
+                <p>You select the provider, model, and API key. Keys stay in the current process and are not persisted.</p>
+              </div>
+              <span class="privacy-card__status">OPT IN</span>
+            </article>
+          </div>
+        </div>
+      </section>
+
+      <section class="page-shell section" id="product" aria-labelledby="product-title">
+        <div class="section-heading">
+          <p class="eyebrow">THREE EVERYDAY SURFACES</p>
+          <h2 id="product-title">The machinery stays behind the decision.</h2>
+          <p>Ordinary navigation focuses on what matters now: the day, the plan, and the personal context shaping it.</p>
+        </div>
+        <div class="surface-grid">
+          <article class="surface-card">
+            <span class="surface-card__number">01 · TODAY</span>
+            <h3>Notice change.</h3>
+            <p>See today’s arrangement, record what shifted, answer only relevant questions, and negotiate tomorrow’s draft.</p>
+          </article>
+          <article class="surface-card">
+            <span class="surface-card__number">02 · PLANS</span>
+            <h3>Act with context.</h3>
+            <p>Open current and past plans, adjust one meal when reality changes, and record how the choice actually went.</p>
+          </article>
+          <article class="surface-card">
+            <span class="surface-card__number">03 · ME</span>
+            <h3>Own the rules.</h3>
+            <p>Manage goals, meal modes, safety boundaries, inventory, learned preferences, appearance, and advanced settings.</p>
+          </article>
+        </div>
+      </section>
+
+      <section class="page-shell section" id="boundaries" aria-labelledby="boundaries-title">
+        <div class="section-heading section-heading--split">
+          <div>
+            <p class="eyebrow">THE HONEST BOUNDARY</p>
+            <h2 id="boundaries-title">Useful support, without invented certainty.</h2>
+          </div>
+          <div class="section-heading__aside">
+            <p>MealCircuit is designed to make uncertainty visible. Safety and user confirmation are part of the product, not footnotes after generation.</p>
+          </div>
+        </div>
+        <div class="boundary-grid">
+          <article class="boundary-card">
+            <span aria-hidden="true">×</span>
+            <h3>No diagnosis</h3>
+            <p>It provides general logging and decision support, not medical diagnosis or treatment.</p>
+          </article>
+          <article class="boundary-card">
+            <span aria-hidden="true">×</span>
+            <h3>No invisible facts</h3>
+            <p>Oil, sauces, weights, brands, health states, and inventory stay unknown until evidence supports them.</p>
+          </article>
+          <article class="boundary-card">
+            <span aria-hidden="true">×</span>
+            <h3>No official hosted cloud</h3>
+            <p>Accounts exist only for optional compatible self-hosted synchronization.</p>
+          </article>
+          <article class="boundary-card">
+            <span aria-hidden="true">×</span>
+            <h3>No silent publishing</h3>
+            <p>A reviewed draft remains replaceable until the user explicitly accepts it as the formal plan.</p>
+          </article>
+        </div>
+      </section>
+
+      <section class="page-shell section section--source" id="source" aria-labelledby="source-title">
+        <div class="source-card">
+          <img class="source-mark" src="/favicon.svg" alt="" width="105" height="105">
+          <div class="source-copy">
+            <p class="eyebrow">SOURCE AVAILABLE NOW</p>
+            <h2 id="source-title">Inspect the loop before you put your history into it.</h2>
+            <p>MealCircuit is built in public under the MIT License. Its product boundaries, data model, sync protocol, threat model, tests, and release gates are available for review.</p>
+            <div class="source-actions">
+              <a class="button button--primary" href="https://github.com/QianQIUlp/meal-circuit" target="_blank" rel="noreferrer">View on GitHub <span aria-hidden="true">↗</span></a>
+              <a class="button button--secondary" href="https://github.com/QianQIUlp/meal-circuit/blob/main/README.md" target="_blank" rel="noreferrer">Build from source</a>
+            </div>
+          </div>
+          <dl class="source-meta">
+            <div>
+              <dt>CURRENT RELEASE</dt>
+              <dd>v0.3.0</dd>
+            </div>
+            <div>
+              <dt>CLIENTS</dt>
+              <dd>Desktop · Android</dd>
+            </div>
+            <div>
+              <dt>LICENSE</dt>
+              <dd>MIT</dd>
+            </div>
+          </dl>
+        </div>
+      </section>
+    </main>
+
+    <footer class="site-footer">
+      <div class="page-shell footer-inner">
+        <div class="footer-brand">
+          <a class="wordmark" href="/">
+            <img class="brand-mark" src="/favicon.svg" alt="" width="34" height="34">
+            <span>MealCircuit</span>
+          </a>
+          <p>Capture facts. Keep the context. Calibrate the next choice.</p>
+        </div>
+        <p class="footer-status">Local-first and built in public.</p>
+        <div class="footer-links">
+          <a href="https://github.com/QianQIUlp/meal-circuit" target="_blank" rel="noreferrer">GitHub</a>
+          <a href="https://github.com/QianQIUlp/meal-circuit/blob/main/SECURITY.md" target="_blank" rel="noreferrer">Security</a>
+          <a href="https://github.com/QianQIUlp/meal-circuit/blob/main/LICENSE" target="_blank" rel="noreferrer">MIT License</a>
+        </div>
+      </div>
+    </footer>
+  </body>
+</html>

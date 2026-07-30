@@ -213,6 +213,8 @@ Migration only copies data and never deletes source files; the database uses the
 
 ## Development & Verification
 
+The dependency-free bilingual product site lives in [`site/`](site/) and is ready for Cloudflare Pages Git deployment from `main`. See [product site deployment](docs/site-deployment.md) for the exact dashboard values, local preview command, and post-deployment checks.
+
 ```powershell
 .\test.ps1
 python tools\release_check.py
@@ -225,6 +227,7 @@ mealcircuit/   app, data, validation, service, and CLI
 android/       full native Kotlin/Compose/Room client
 protocol/      Domain v1 schema, fixtures, crypto vectors and Sync OpenAPI
 sync_server/   opaque FastAPI/PostgreSQL E2EE relay
+site/          static English and Chinese product website for Cloudflare Pages
 rules/         public core rules
 templates/     private configuration bootstrap templates
 tests/         unit and HTTP integration tests
@@ -439,6 +442,8 @@ python -m mealcircuit.agent_cli migrate-data --from-repo <旧工程路径> --app
 
 ## 开发与验证
 
+无构建依赖的中英文产品介绍站位于 [`site/`](site/)，可以由 Cloudflare Pages 从 `main` 分支直接部署。具体控制台参数、本地预览方式和部署后检查见[产品站部署说明](docs/site-deployment.md)。
+
 ```powershell
 .\test.ps1
 python tools\release_check.py
@@ -451,6 +456,7 @@ mealcircuit/   应用、数据、校验、服务与 CLI
 android/       完整 Kotlin / Compose / Room 原生客户端
 protocol/      Domain v1、夹具、密码学向量与 Sync OpenAPI
 sync_server/   不透明 FastAPI / PostgreSQL E2EE 中转服务
+site/          面向 Cloudflare Pages 的中英文静态产品介绍站
 rules/         公开核心规则
 templates/     私人配置初始化模板
 tests/         单元与 HTTP 集成测试
