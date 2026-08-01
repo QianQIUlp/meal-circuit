@@ -713,6 +713,9 @@ class MealCircuitTest(unittest.TestCase):
             ai.AIConfig("openai", "test-openai-model", "test-key"),
             transport=transport,
         )
+        context = service.task_context(task["id"])
+        self.assertEqual(task["image_path"], context["task"]["image_path"])
+        self.assertFalse(Path(context["task"]["image_path"]).is_absolute())
         completed = service.generate_task_result(task["id"], provider)
         self.assertEqual(completed["status"], "completed")
         content = payloads[0]["input"][0]["content"]
@@ -1401,7 +1404,10 @@ class MealCircuitTest(unittest.TestCase):
         output = io.StringIO()
         try:
             with redirect_stderr(output):
-                self.assertEqual(storage.db_path(), Path(legacy).resolve())
+                self.assertEqual(
+                    storage.db_path(),
+                    Path(os.path.abspath(legacy)),
+                )
             self.assertIn("已弃用", output.getvalue())
         finally:
             os.environ["MEALCIRCUIT_HOME"] = current_home

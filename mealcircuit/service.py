@@ -2356,7 +2356,9 @@ def task_context(task_id: str, days: int = 14) -> dict:
         matches = all_foods
     if task.get("image_path"):
         try:
-            task["image_path"] = str(resolve_managed_media_path(task["image_path"]))
+            task["image_path"] = store_data_path(
+                resolve_managed_media_path(task["image_path"])
+            )
         except ValidationError:
             task["image_path"] = None
             task["image_unresolved"] = True

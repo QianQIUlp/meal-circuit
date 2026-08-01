@@ -132,7 +132,7 @@ class LegacyRestoreAtomicityTest(unittest.TestCase):
         self.assertFalse(update_thread.is_alive())
         self.assertFalse(observer_thread.is_alive())
         self.assertEqual([], failures)
-        self.assertEqual([self.home.resolve()], observed)
+        self.assertEqual([Path(os.path.abspath(self.home))], observed)
 
     def test_active_background_operation_rejects_restore_without_freezing_paths(self) -> None:
         worker_entered = threading.Event()
@@ -147,7 +147,7 @@ class LegacyRestoreAtomicityTest(unittest.TestCase):
         thread.start()
         self.assertTrue(worker_entered.wait(2))
         try:
-            self.assertEqual(self.home.resolve(), app_home())
+            self.assertEqual(Path(os.path.abspath(self.home)), app_home())
             with self.assertRaisesRegex(ValidationError, "后台智能生成仍在运行"):
                 with portable_module.atomic_home_update():
                     self.fail("restore must not start while a background operation is active")

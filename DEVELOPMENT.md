@@ -504,3 +504,9 @@
 - 根因与修复：Draft PR #33 的本地、远端分支和 PR head 均已同步到 `a19ccfe`；`release-builds` 全部成功，但 `test` 的 Windows Python 3.11/3.13 同时失败。相同提交在 Windows 本机复现后确认唯一断言失败来自 SVG 换行：Git 检出为 CRLF，`Path.read_text()` 会统一换行为 LF，而 HTTP 静态响应保留原始字节。测试改为直接比较两个 SVG 的原始字节，既验证图标完全一致，也不依赖平台换行规则。
 - 验证：原失败用例 `WebAppTest.test_pages_and_material_form` 在隔离的 Python 3.11.9 与 3.13.5 上均通过；`tools/release_check.py`、`compileall` 和 `git diff --check` 通过。修复后的完整 277 项本机矩阵未再出现图标失败，唯一错误是受限执行令牌没有 Windows Credential Manager 登录会话导致 `CredWrite` 返回 WinError 1312；该测试与本次两行断言修复无关，GitHub Windows runner 将作为最终矩阵依据。
 - 临时文件与剩余风险：独立工作树位于 `C:\tmp\mc-windows-pr-fix`，测试解释器和缓存位于 `C:\tmp\mc-win-019fb725`；没有新增依赖或全局配置。推送后仍需等待 GitHub Actions 的 Python 3.11/3.13 作业均成功，才能把 PR #33 标记为全绿。
+
+## 2026-08-01：Windows 8.3 路径兼容修复
+
+- 根因与修复：GitHub Windows runner 的临时目录以 `RUNNER~1` 短路径提供，而 `Path.resolve()` 会返回 `runneradmin` 长路径。照片任务上下文先把已验证的相对受管路径转换成长路径绝对地址，AI 提交前的第二次受管目录校验再与短路径形式的数据目录做词法比较，因此误判为越界；现在验证后重新保存为受管相对路径，不放宽 UNC、重解析点或目录逃逸边界。三个路径断言改为按 `app_home()` / `db_path()` 的词法绝对路径契约比较，避免把同一目录的 8.3 与长路径别名误判为功能错误。
+- 验证：在 `C:\tmp\mc-win-019fb725` 的隔离 Python 3.11.9 与 3.13.5 上运行四个原失败用例，并补充断言确认照片生成上下文始终保留 `uploads/...` 相对路径；另运行相关受管媒体和原子恢复回归、`compileall`、`tools/release_check.py` 与 `git diff --check`。所有测试缓存通过 `PYTHONDONTWRITEBYTECODE=1` 禁止写入仓库。
+- 临时文件与剩余风险：未新增依赖或全局配置；测试日志与解释器仍集中在 `C:\tmp\mc-win-019fb725`。本轮不修改 `app_home()` 的词法路径实现，以免重新引入跟随 junction/reparse point 的安全风险；提交推送后仍需由 GitHub runner 的真实 `RUNNER~1` 环境完成最终确认。
