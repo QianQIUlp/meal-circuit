@@ -494,7 +494,7 @@
 
 ## 2026-08-01：Windows CI 安装器下载修复
 
-- 根因与修复：`release-builds / windows` 中 EXE 构建、打包与便携版冒烟测试均已通过，随后因 `files.jrsoftware.org` 上固定的 Inno Setup 6.7.3 地址返回 404 而失败。工作流改用 Inno Setup 官方下载页当前指向的 `jrsoftware/issrc` GitHub Release 固定资产；版本、SHA-256 校验值和 Authenticode 校验保持不变。
+- 根因与修复：`release-builds / windows` 中 EXE 构建、打包与便携版冒烟测试均已通过，随后因 `files.jrsoftware.org` 上固定的 Inno Setup 6.7.3 地址返回 404 而失败。工作流改用 Inno Setup 官方下载页当前指向的 `jrsoftware/issrc` GitHub Release 固定资产，并同步更新供应链策略检查中的受信地址；版本、SHA-256 校验值和 Authenticode 校验保持不变。
 - 验证：从新地址实际下载 `innosetup-6.7.3.exe` 到 `C:\tmp\innosetup-6.7.3-ci-fix.exe`，文件大小 10,592,232 字节，SHA-256 为 `9c73c3bae7ed48d44112a0f48e66742c00090bdb5bef71d9d3c056c66e97b732`，Authenticode 状态为 `Valid`、签名者为 Pyrsys B.V.；另运行工作流语法检查与 `git diff --check`。
 - 临时文件：上述下载验证文件可在本轮验收结束后直接删除；没有新增项目依赖、全局工具或项目内缓存。
 - 剩余风险：CI 仍依赖 GitHub Release 网络可用性，但固定发布资产与哈希、签名三重约束避免了静默版本漂移；Node 20 弃用提示来自已锁定的第三方 Actions，当前只是警告且不构成本次 Windows 失败原因。
