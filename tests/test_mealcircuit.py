@@ -1830,8 +1830,8 @@ class WebAppTest(unittest.TestCase):
         self.assertIn("image/svg+xml", headers["Content-Type"])
         self.assertIn(b"#173d35", favicon)
         self.assertIn(b"#ef8f5b", favicon)
-        site_favicon = (Path(__file__).resolve().parents[1] / "site" / "favicon.svg").read_text(encoding="utf-8")
-        self.assertEqual(site_favicon, favicon.decode("utf-8"))
+        site_favicon = (Path(__file__).resolve().parents[1] / "site" / "favicon.svg").read_bytes()
+        self.assertEqual(site_favicon, favicon)
         status, headers, theme_script = self.request("GET", "/assets/ui/theme-init.js")
         self.assertEqual(status, 200)
         javascript_type = headers["Content-Type"].split(";", 1)[0]

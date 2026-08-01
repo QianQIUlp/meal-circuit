@@ -498,3 +498,9 @@
 - 验证：从新地址实际下载 `innosetup-6.7.3.exe` 到 `C:\tmp\innosetup-6.7.3-ci-fix.exe`，文件大小 10,592,232 字节，SHA-256 为 `9c73c3bae7ed48d44112a0f48e66742c00090bdb5bef71d9d3c056c66e97b732`，Authenticode 状态为 `Valid`、签名者为 Pyrsys B.V.；另运行工作流语法检查与 `git diff --check`。
 - 临时文件：上述下载验证文件可在本轮验收结束后直接删除；没有新增项目依赖、全局工具或项目内缓存。
 - 剩余风险：CI 仍依赖 GitHub Release 网络可用性，但固定发布资产与哈希、签名三重约束避免了静默版本漂移；Node 20 弃用提示来自已锁定的第三方 Actions，当前只是警告且不构成本次 Windows 失败原因。
+
+## 2026-08-01：Windows CI 图标换行兼容修复
+
+- 根因与修复：Draft PR #33 的本地、远端分支和 PR head 均已同步到 `a19ccfe`；`release-builds` 全部成功，但 `test` 的 Windows Python 3.11/3.13 同时失败。相同提交在 Windows 本机复现后确认唯一断言失败来自 SVG 换行：Git 检出为 CRLF，`Path.read_text()` 会统一换行为 LF，而 HTTP 静态响应保留原始字节。测试改为直接比较两个 SVG 的原始字节，既验证图标完全一致，也不依赖平台换行规则。
+- 验证：原失败用例 `WebAppTest.test_pages_and_material_form` 在隔离的 Python 3.11.9 与 3.13.5 上均通过；`tools/release_check.py`、`compileall` 和 `git diff --check` 通过。修复后的完整 277 项本机矩阵未再出现图标失败，唯一错误是受限执行令牌没有 Windows Credential Manager 登录会话导致 `CredWrite` 返回 WinError 1312；该测试与本次两行断言修复无关，GitHub Windows runner 将作为最终矩阵依据。
+- 临时文件与剩余风险：独立工作树位于 `C:\tmp\mc-windows-pr-fix`，测试解释器和缓存位于 `C:\tmp\mc-win-019fb725`；没有新增依赖或全局配置。推送后仍需等待 GitHub Actions 的 Python 3.11/3.13 作业均成功，才能把 PR #33 标记为全绿。
