@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import re
+import unicodedata
 from typing import Any
 
 from .meal_modes import home_cooked_meal_names
@@ -137,12 +139,61 @@ def compile_constraints(context: dict) -> list[dict]:
     return compiled
 
 
-def _meal_text(meal: dict) -> str:
-    recipe = meal.get("recipe_card") or {}
-    ingredients = recipe.get("ingredients") or []
-    values = list(meal.get("foods") or [])
-    values.extend(item.get("name", "") for item in ingredients if isinstance(item, dict))
-    return " ".join(str(value).strip().lower() for value in values)
+def _nested_text_values(value: Any):
+    if isinstance(value, str):
+        yield value
+        return
+    if isinstance(value, dict):
+        for nested in value.values():
+            yield from _nested_text_values(nested)
+        return
+    if isinstance(value, (list, tuple)):
+        for nested in value:
+            yield from _nested_text_values(nested)
+
+
+def _normalized_match_text(value: object) -> str:
+    return unicodedata.normalize("NFKC", str(value or "")).casefold()
+
+
+def _text_contains_exclusion(text: object, exclusion: object) -> bool:
+    haystack = _normalized_match_text(text)
+    needle = _normalized_match_text(exclusion).strip()
+    if not needle:
+        return False
+    if needle.isascii():
+        words = re.findall(r"[a-z0-9]+", needle)
+        if not words:
+            return False
+        flexible_words = [
+            r"[\W_]*".join(re.escape(character) for character in word)
+            for word in words
+        ]
+        pattern = (
+            r"(?<![a-z0-9])"
+            + r"[\W_]*".join(flexible_words)
+            + r"(?:s|es)?(?![a-z0-9])"
+        )
+        return re.search(pattern, haystack) is not None
+    compact_haystack = "".join(character for character in haystack if character.isalnum())
+    compact_needle = "".join(character for character in needle if character.isalnum())
+    return bool(compact_needle) and compact_needle in compact_haystack
+
+
+def _contains_excluded_text(value: Any, exclusion: object) -> bool:
+    return any(
+        _text_contains_exclusion(text, exclusion)
+        for text in _nested_text_values(value)
+    )
+
+
+def _daily_actionable_payload(result: dict) -> dict:
+    menu = result.get("tomorrow_menu") or {}
+    return {
+        "core_advice": result.get("core_advice") or [],
+        "priority_food_decisions": result.get("priority_food_decisions") or [],
+        "tomorrow_menu": menu,
+    }
 
 
 def _meal_execution(meal: dict) -> dict:
@@ -163,6 +214,7 @@ def validate_and_enrich_daily_result(result: dict, context: dict) -> dict:
     compiled = compile_constraints(context)
     menu = result.get("tomorrow_menu") or {}
     meals = menu.get("meals") or []
+    actionable_payload = _daily_actionable_payload(result)
     meals_by_name = {meal.get("name"): meal for meal in meals if isinstance(meal, dict)}
     for meal in meals:
         if isinstance(meal, dict):
@@ -171,12 +223,8 @@ def validate_and_enrich_daily_result(result: dict, context: dict) -> dict:
         kind = constraint["kind"]
         if kind == "food_exclusions":
             for exclusion in constraint["value"]:
-                needle = str(exclusion).strip().lower()
-                if not needle:
-                    continue
-                for meal in meals:
-                    if needle in _meal_text(meal):
-                        raise ValidationError(f"计划包含已确认排除食品：{exclusion}")
+                if _contains_excluded_text(actionable_payload, exclusion):
+                    raise ValidationError(f"计划包含已确认排除食品：{exclusion}")
         if kind in {"max_active_minutes", "max_total_minutes", "max_cookware", "max_steps"}:
             meal_name = constraint.get("meal_name") or "晚餐"
             meal = meals_by_name.get(meal_name)
@@ -201,7 +249,7 @@ def validate_and_enrich_daily_result(result: dict, context: dict) -> dict:
                 raise ValidationError(f"计划违反确认规则：{meal_name} {kind} 实际 {actual}，上限 {limit}")
         if kind == "exclude_food":
             exclusion = str(constraint.get("value") or "").strip()
-            if exclusion and any(exclusion.lower() in _meal_text(meal) for meal in meals):
+            if _contains_excluded_text(actionable_payload, exclusion):
                 raise ValidationError(f"计划违反确认规则，包含：{exclusion}")
     result["result_schema_version"] = RESULT_SCHEMA_VERSION
     result["decision_trace"] = {
@@ -239,13 +287,14 @@ def validate_rescue_result(value: Any, plan_item: dict, constraints: list[dict])
     replacements = value.get("replacement_foods") or []
     if not isinstance(replacements, list) or any(not isinstance(item, str) or not item.strip() for item in replacements):
         raise ValidationError("replacement_foods 必须是文本数组")
-    combined = " ".join(replacements).lower()
     for constraint in constraints:
         if constraint["kind"] == "food_exclusions":
             for exclusion in constraint["value"]:
-                if str(exclusion).lower() in combined:
+                if _contains_excluded_text(value, exclusion):
                     raise ValidationError(f"救场方案包含已确认排除食品：{exclusion}")
-        if constraint["kind"] == "exclude_food" and str(constraint.get("value") or "").lower() in combined:
+        if constraint["kind"] == "exclude_food" and _contains_excluded_text(
+            value, constraint.get("value")
+        ):
             raise ValidationError(f"救场方案违反确认规则：{constraint.get('value')}")
     value["result_schema_version"] = RESULT_SCHEMA_VERSION
     value["plan_item_id"] = plan_item["plan_item_id"]

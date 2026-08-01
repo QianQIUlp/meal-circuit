@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import os
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -14,7 +15,14 @@ from .db_migrations import (
     detected_schema_version,
     migrate,
 )
-from .storage import ROOT, backups_root, db_path
+from .storage import (
+    ROOT,
+    backups_root,
+    db_path,
+    ensure_secure_directory,
+    process_data_lock,
+    process_data_locked,
+)
 
 
 MIGRATIONS = {
@@ -53,7 +61,7 @@ def _backup_before_schema_upgrade(path: Path) -> Path | None:
     if not path.is_file() or path.stat().st_size == 0 or _schema_version(path) >= CURRENT_SCHEMA_VERSION:
         return None
     target_root = backups_root()
-    target_root.mkdir(parents=True, exist_ok=True)
+    ensure_secure_directory(target_root)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     target = target_root / f"pre-schema-v{CURRENT_SCHEMA_VERSION}-{stamp}.db"
     suffix = 1
@@ -73,29 +81,31 @@ def _backup_before_schema_upgrade(path: Path) -> Path | None:
     return target
 @contextmanager
 def connect(path: Path | None = None) -> Iterator[sqlite3.Connection]:
-    target = (path or db_path()).resolve()
-    target.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(target)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    conn.execute("PRAGMA journal_mode = WAL")
-    try:
-        yield conn
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
+    with process_data_lock():
+        target = Path(os.path.abspath(os.fspath(path or db_path())))
+        ensure_secure_directory(target.parent)
+        conn = sqlite3.connect(target)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("PRAGMA journal_mode = WAL")
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
 
+@process_data_locked(wait=False)
 def init_db(path: Path | None = None) -> None:
     if path is None:
         from .portable import recover_interrupted_import
 
         recover_interrupted_import()
-    target = (path or db_path()).resolve()
-    target.parent.mkdir(parents=True, exist_ok=True)
+    target = Path(os.path.abspath(os.fspath(path or db_path())))
+    ensure_secure_directory(target.parent)
     existed_before = target.is_file() and target.stat().st_size > 0
     existing_version = _schema_version(target)
     if existing_version > CURRENT_SCHEMA_VERSION:

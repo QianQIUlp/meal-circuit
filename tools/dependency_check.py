@@ -97,6 +97,50 @@ def check_release_workflow(workflow: str) -> None:
         if name in workflow:
             raise SystemExit(f"Desktop tagged releases must not hard-fail on missing signing credentials: {name}")
 
+    windows_match = re.search(
+        r"(?ms)^  windows:\n.*?(?=^  [A-Za-z0-9_-]+:\n)",
+        workflow,
+    )
+    if not windows_match:
+        raise SystemExit("Release workflow is missing the Windows job")
+    windows_workflow = windows_match.group(0)
+    required_windows_snippets = {
+        "Windows actions use immutable pins": (
+            "actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4",
+            "actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5",
+            "astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0",
+            "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4",
+        ),
+        "Windows packaged smoke test waits for the GUI process": (
+            '$process = Start-Process -FilePath ".\\dist\\MealCircuit\\MealCircuit.exe" '
+            '-ArgumentList "--smoke-test" -Wait -PassThru\n'
+            '          if ($process.ExitCode -ne 0) { throw "Packaged smoke test failed',
+        ),
+        "Windows uv security pin": (
+            'version: "0.11.16"',
+        ),
+        "Windows Inno Setup pin": (
+            'https://files.jrsoftware.org/is/6/innosetup-6.7.3.exe',
+            'if ($innoHash -ne "9c73c3bae7ed48d44112a0f48e66742c00090bdb5bef71d9d3c056c66e97b732")',
+            "Get-AuthenticodeSignature $innoInstaller",
+            '$innoDir = Join-Path $env:RUNNER_TEMP "inno-6.7.3"',
+        ),
+        "Windows final artifacts are smoke tested": (
+            "- name: Smoke test portable ZIP",
+            "Expand-Archive",
+            "- name: Smoke test installed application and uninstaller",
+            "unins000.exe",
+            "if (Test-Path $installDir) { throw",
+        ),
+        "Windows artifact upload fails closed": (
+            "name: desktop-windows",
+            "if-no-files-found: error",
+        ),
+    }
+    for policy, snippets in required_windows_snippets.items():
+        if any(snippet not in windows_workflow for snippet in snippets):
+            raise SystemExit(f"Release workflow is missing required policy: {policy}")
+
     availability = {
         "WINDOWS_SIGNING_AVAILABLE": (
             "WINDOWS_SIGNING_AVAILABLE: ${{ secrets.WINDOWS_CERTIFICATE_BASE64 != '' "

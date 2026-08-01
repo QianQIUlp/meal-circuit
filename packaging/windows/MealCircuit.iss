@@ -23,6 +23,7 @@ Compression=lzma2
 SolidCompression=yes
 PrivilegesRequired=lowest
 WizardStyle=modern
+SetupIconFile=MealCircuit.ico
 UninstallDisplayIcon={app}\MealCircuit.exe
 
 [Files]

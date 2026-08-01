@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+from collections import deque
 import contextlib
 import hashlib
 import json
@@ -8,9 +9,9 @@ import mimetypes
 import os
 import shutil
 import sqlite3
+import stat
 import struct
 import tempfile
-import threading
 import uuid
 import zipfile
 from pathlib import Path, PurePosixPath
@@ -27,16 +28,27 @@ from .domain import (
     new_id,
     three_way_merge,
     utc_now,
+    validate_payload,
     validate_revision,
 )
 from .storage import (
+    DATA_DIRECTORY_LOCK,
+    DataDirectoryBusyError,
     app_home,
+    background_data_operations_active,
+    copy_tree_without_reparse_points,
+    create_secure_directory,
+    data_home_identity,
     db_path,
+    ensure_secure_directory,
     managed_asset_root,
     private_doctrine_path,
     profile_path,
-    resolve_data_path,
+    process_data_lock,
+    process_data_locked,
+    resolve_managed_media_path,
     settings_path,
+    validate_private_directory_security,
 )
 from .validation import ValidationError
 
@@ -52,8 +64,109 @@ MAX_METADATA_ENTRY_BYTES = 64 * 1024 * 1024
 MAX_ASSET_BYTES = 10 * 1024 * 1024
 MAX_MCX_HEADER_BYTES = 64 * 1024
 UUID_NAMESPACE = uuid.UUID("2a7c0c93-763f-4d3c-93f1-c8a5768da92a")
-_IMPORT_LOCK = threading.RLock()
+_IMPORT_LOCK = DATA_DIRECTORY_LOCK
 _IMPORT_ACTIVE = False
+_JOURNAL_OWNER_MARKER = ".mealcircuit-import-owner"
+_HOME_OWNER_MARKER = ".mealcircuit-home-owner"
+
+
+class ImportInProgressError(ValidationError):
+    """Raised when another process owns the recoverable home-import transaction."""
+
+
+class ImportRollbackError(RuntimeError):
+    """An import failed and the automatic rollback must be retried on startup."""
+
+
+def _lexical_absolute_path(value: str | Path) -> Path:
+    return Path(os.path.abspath(os.fspath(value)))
+
+
+def _same_lexical_path(left: Path, right: Path) -> bool:
+    left_value = str(_lexical_absolute_path(left))
+    right_value = str(_lexical_absolute_path(right))
+    if os.name == "nt":
+        left_value = left_value.casefold()
+        right_value = right_value.casefold()
+    return left_value == right_value
+
+
+def _entry_exists(path: Path) -> bool:
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise RuntimeError(f"无法检查导入事务路径：{path}") from exc
+    return True
+
+
+def _write_owner_marker(
+    directory: Path,
+    marker_name: str,
+    transaction_id: str,
+    *,
+    require_new: bool,
+) -> None:
+    ensure_secure_directory(directory)
+    marker = directory / marker_name
+    mode = "x" if require_new else "w"
+    try:
+        with marker.open(mode, encoding="ascii", newline="\n") as stream:
+            stream.write(transaction_id + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+    except OSError as exc:
+        raise RuntimeError(f"无法写入导入事务归属标记：{marker}") from exc
+
+
+def _require_owned_directory(
+    directory: Path,
+    marker_name: str,
+    transaction_id: str,
+) -> None:
+    validate_private_directory_security(directory)
+    marker = directory / marker_name
+    try:
+        marker_stat = marker.lstat()
+    except OSError as exc:
+        raise RuntimeError(f"导入事务目录缺少归属标记：{directory}") from exc
+    attributes = int(getattr(marker_stat, "st_file_attributes", 0))
+    if (
+        stat.S_ISLNK(marker_stat.st_mode)
+        or attributes & 0x400
+        or not stat.S_ISREG(marker_stat.st_mode)
+    ):
+        raise RuntimeError(f"导入事务归属标记不是普通文件：{marker}")
+    try:
+        marker_value = marker.read_text(encoding="ascii").strip()
+    except OSError as exc:
+        raise RuntimeError(f"无法读取导入事务归属标记：{marker}") from exc
+    if marker_value != transaction_id:
+        raise RuntimeError(f"导入事务目录归属无法证明：{directory}")
+
+
+def _remove_owned_tree(
+    directory: Path,
+    marker_name: str,
+    transaction_id: str,
+) -> None:
+    if not _entry_exists(directory):
+        return
+    _require_owned_directory(directory, marker_name, transaction_id)
+    shutil.rmtree(directory)
+
+
+@contextlib.contextmanager
+def _cross_process_import_lock(home: Path) -> Iterator[None]:
+    """Hold a non-blocking, per-home OS file lock for recovery and promotion."""
+    try:
+        with process_data_lock(home, wait=False):
+            yield
+    except DataDirectoryBusyError as exc:
+        raise ImportInProgressError(
+            "另一 MealCircuit 实例正在读取、导入或恢复数据；请等待它完成后重试"
+        ) from exc
 
 
 class _ImportTransaction:
@@ -62,10 +175,12 @@ class _ImportTransaction:
     ENVIRONMENT_KEYS = ("MEALCIRCUIT_HOME", "MEALCIRCUIT_DB", "DIETOS_DB", "MEALCIRCUIT_DOCTRINE")
 
     def __init__(self) -> None:
-        self.home = app_home().resolve()
-        self.home_existed = self.home.exists()
-        database = db_path().resolve()
-        doctrine = private_doctrine_path().resolve()
+        self.home = _lexical_absolute_path(app_home())
+        self.home_existed = _entry_exists(self.home)
+        self.transaction_id = uuid.uuid4().hex
+        self.promotion_recorded = False
+        database = _lexical_absolute_path(db_path())
+        doctrine = _lexical_absolute_path(private_doctrine_path())
         try:
             self.database_relative = database.relative_to(self.home)
             self.doctrine_relative = doctrine.relative_to(self.home)
@@ -73,28 +188,60 @@ class _ImportTransaction:
             raise ValidationError(
                 "原子导入要求数据库与私人 doctrine 位于 MEALCIRCUIT_HOME 内；请先迁回统一数据目录"
             ) from exc
-        identity = hashlib.sha256(str(self.home).encode("utf-8")).hexdigest()[:16]
+        identity = data_home_identity(self.home)
         self.journal = self.home.parent / f".mealcircuit-import-rollback-{identity}"
-        if self.journal.exists():
+        if _entry_exists(self.journal):
             raise RuntimeError(f"存在未恢复的导入事务：{self.journal}")
-        self.journal.mkdir(parents=True, mode=0o700)
-        self.staging = self.home.parent / f".mealcircuit-import-staging-{identity}-{uuid.uuid4().hex}"
+        create_secure_directory(self.journal)
+        try:
+            _write_owner_marker(
+                self.journal,
+                _JOURNAL_OWNER_MARKER,
+                self.transaction_id,
+                require_new=True,
+            )
+        except BaseException:
+            shutil.rmtree(self.journal, ignore_errors=True)
+            raise
+        self.staging = self.home.parent / (
+            f".mealcircuit-import-staging-{identity}-{self.transaction_id}"
+        )
         self.backup = self.journal / "previous-home"
         self.state = "preparing"
-        self._write_manifest()
-        if self.home_existed:
-            if any(path.is_symlink() for path in self.home.rglob("*")):
-                self.close()
-                raise ValidationError("MEALCIRCUIT_HOME 含符号链接，无法保证原子导入边界")
-            shutil.copytree(self.home, self.staging, copy_function=shutil.copy2)
-        else:
-            self.staging.mkdir(parents=True, mode=0o700)
-        self.state = "prepared"
-        self._write_manifest()
+        staging_created = False
+        try:
+            self._write_manifest()
+            if self.home_existed:
+                copy_tree_without_reparse_points(self.home, self.staging)
+            else:
+                create_secure_directory(self.staging)
+            staging_created = True
+            _write_owner_marker(
+                self.staging,
+                _HOME_OWNER_MARKER,
+                self.transaction_id,
+                require_new=not self.home_existed,
+            )
+            self.state = "prepared"
+            self._write_manifest()
+        except BaseException:
+            if staging_created:
+                try:
+                    _remove_owned_tree(
+                        self.staging,
+                        _HOME_OWNER_MARKER,
+                        self.transaction_id,
+                    )
+                except RuntimeError:
+                    # require-new plus this in-memory flag proves constructor ownership.
+                    shutil.rmtree(self.staging, ignore_errors=True)
+            self.close()
+            raise
 
     def _write_manifest(self) -> None:
         value = {
-            "version": 2,
+            "version": 3,
+            "transaction_id": self.transaction_id,
             "state": self.state,
             "home": str(self.home),
             "home_existed": self.home_existed,
@@ -108,31 +255,57 @@ class _ImportTransaction:
         os.replace(temporary, self.journal / "manifest.json")
 
     @classmethod
-    def from_manifest(cls, journal: Path, value: dict) -> "_ImportTransaction":
-        if value.get("version") != 2:
+    def from_manifest(
+        cls,
+        journal: Path,
+        value: dict,
+        *,
+        expected_home: Path,
+    ) -> "_ImportTransaction":
+        if value.get("version") != 3:
             raise RuntimeError("导入回滚日志版本不受支持")
+        transaction_id = value.get("transaction_id")
+        if (
+            not isinstance(transaction_id, str)
+            or len(transaction_id) != 32
+            or any(character not in "0123456789abcdef" for character in transaction_id)
+        ):
+            raise RuntimeError("导入事务标识无效")
         item = cls.__new__(cls)
-        item.journal = journal
+        item.journal = _lexical_absolute_path(journal)
+        item.transaction_id = transaction_id
         item.state = str(value["state"])
-        item.home = Path(value["home"]).resolve()
+        if item.state not in {"preparing", "prepared", "original_moved", "staging_promoted"}:
+            raise RuntimeError("导入事务状态无效")
+        item.promotion_recorded = item.state == "staging_promoted"
+        item.home = _lexical_absolute_path(value["home"])
+        if not _same_lexical_path(item.home, expected_home):
+            raise RuntimeError("导入事务 home 与当前私人目录不匹配")
         item.home_existed = bool(value["home_existed"])
-        item.staging = Path(value["staging"]).resolve()
-        item.backup = Path(value["backup"]).resolve()
+        item.staging = _lexical_absolute_path(value["staging"])
+        item.backup = _lexical_absolute_path(value["backup"])
         item.database_relative = Path(value["database_relative"])
         item.doctrine_relative = Path(value["doctrine_relative"])
-        identity = hashlib.sha256(str(item.home).encode("utf-8")).hexdigest()[:16]
+        identity = data_home_identity(item.home)
         expected_journal = item.home.parent / f".mealcircuit-import-rollback-{identity}"
-        if journal.resolve() != expected_journal.resolve():
+        expected_staging = item.home.parent / (
+            f".mealcircuit-import-staging-{identity}-{item.transaction_id}"
+        )
+        expected_backup = item.journal / "previous-home"
+        if not _same_lexical_path(item.journal, expected_journal):
             raise RuntimeError("导入事务日志身份不匹配")
-        if item.backup != (journal / "previous-home").resolve():
+        if not _same_lexical_path(item.backup, expected_backup):
             raise RuntimeError("导入事务备份路径逃逸")
-        if item.staging.parent != item.home.parent or not item.staging.name.startswith(
-            f".mealcircuit-import-staging-{identity}-"
-        ):
+        if not _same_lexical_path(item.staging, expected_staging):
             raise RuntimeError("导入事务 staging 路径逃逸")
         for relative in (item.database_relative, item.doctrine_relative):
             if relative.is_absolute() or ".." in relative.parts:
                 raise RuntimeError("导入事务相对路径逃逸")
+        _require_owned_directory(
+            item.journal,
+            _JOURNAL_OWNER_MARKER,
+            item.transaction_id,
+        )
         return item
 
     @contextlib.contextmanager
@@ -152,35 +325,125 @@ class _ImportTransaction:
                     os.environ[key] = value
 
     def commit(self) -> None:
-        if self.state != "prepared" or not self.staging.is_dir():
+        if self.state != "prepared":
             raise RuntimeError("导入 staging 未准备完成")
+        _require_owned_directory(
+            self.staging,
+            _HOME_OWNER_MARKER,
+            self.transaction_id,
+        )
         if self.home_existed:
+            if _entry_exists(self.backup):
+                raise RuntimeError("导入事务 backup 已被预置")
             os.replace(self.home, self.backup)
+            ensure_secure_directory(self.backup)
         self.state = "original_moved"
         self._write_manifest()
+        if not self.home_existed and _entry_exists(self.home):
+            raise RuntimeError("新的 MealCircuit 私人目录在提交前被其他进程创建")
         os.replace(self.staging, self.home)
+        # Set the in-memory state immediately after the rename. Recovery can now
+        # distinguish the promoted staging tree from an unrelated competing home.
         self.state = "staging_promoted"
         self._write_manifest()
+        self.promotion_recorded = True
         shutil.rmtree(self.backup, ignore_errors=True)
         self.close()
 
     def restore(self) -> None:
-        if self.backup.exists():
-            if self.home.exists():
-                shutil.rmtree(self.home)
+        if _entry_exists(self.backup):
+            ensure_secure_directory(self.backup)
+            if _entry_exists(self.home):
+                _remove_owned_tree(
+                    self.home,
+                    _HOME_OWNER_MARKER,
+                    self.transaction_id,
+                )
             os.replace(self.backup, self.home)
-        elif not self.home_existed and self.state != "staging_promoted":
-            shutil.rmtree(self.home, ignore_errors=True)
-        shutil.rmtree(self.staging, ignore_errors=True)
+        elif not self.home_existed:
+            if _entry_exists(self.home):
+                _remove_owned_tree(
+                    self.home,
+                    _HOME_OWNER_MARKER,
+                    self.transaction_id,
+                )
+        if _entry_exists(self.staging):
+            _remove_owned_tree(
+                self.staging,
+                _HOME_OWNER_MARKER,
+                self.transaction_id,
+            )
 
     def close(self) -> None:
-        shutil.rmtree(self.journal, ignore_errors=True)
+        _remove_owned_tree(
+            self.journal,
+            _JOURNAL_OWNER_MARKER,
+            self.transaction_id,
+        )
 
 
-def _journal_root() -> Path:
-    home = app_home()
-    identity = hashlib.sha256(str(home).encode("utf-8")).hexdigest()[:16]
+def _journal_root(home: Path | None = None) -> Path:
+    home = _lexical_absolute_path(home or app_home())
+    identity = data_home_identity(home)
     return home.parent / f".mealcircuit-import-rollback-{identity}"
+
+
+def _recover_interrupted_import_locked(home: Path) -> bool:
+    journal = _journal_root(home)
+    if not _entry_exists(journal):
+        return False
+    try:
+        validate_private_directory_security(journal)
+    except ValidationError as exc:
+        raise RuntimeError(
+            f"导入事务日志未通过当前用户与 DACL 验证；已保留现场：{journal}"
+        ) from exc
+    manifest_path = journal / "manifest.json"
+    try:
+        manifest_stat = manifest_path.lstat()
+    except OSError as exc:
+        raise RuntimeError(
+            f"导入事务日志缺少有效 manifest；已保留现场：{journal}"
+        ) from exc
+    manifest_attributes = int(getattr(manifest_stat, "st_file_attributes", 0))
+    if (
+        stat.S_ISLNK(manifest_stat.st_mode)
+        or manifest_attributes & 0x400
+        or not stat.S_ISREG(manifest_stat.st_mode)
+    ):
+        raise RuntimeError(
+            f"导入事务 manifest 不是普通文件；已保留现场：{journal}"
+        )
+    try:
+        value = json.loads(manifest_path.read_text(encoding="utf-8"))
+        transaction = _ImportTransaction.from_manifest(
+            journal,
+            value,
+            expected_home=_lexical_absolute_path(home),
+        )
+        if transaction.state == "staging_promoted":
+            _require_owned_directory(
+                transaction.home,
+                _HOME_OWNER_MARKER,
+                transaction.transaction_id,
+            )
+            if _entry_exists(transaction.backup):
+                ensure_secure_directory(transaction.backup)
+                shutil.rmtree(transaction.backup)
+            if _entry_exists(transaction.staging):
+                _remove_owned_tree(
+                    transaction.staging,
+                    _HOME_OWNER_MARKER,
+                    transaction.transaction_id,
+                )
+        else:
+            transaction.restore()
+        transaction.close()
+    except Exception as exc:
+        raise RuntimeError(
+            f"无法安全恢复中断的 Portable Data 导入；已保留事务现场：{journal}"
+        ) from exc
+    return True
 
 
 def recover_interrupted_import() -> bool:
@@ -188,25 +451,64 @@ def recover_interrupted_import() -> bool:
     if _IMPORT_ACTIVE:
         return False
     with _IMPORT_LOCK:
-        journal = _journal_root()
-        if not journal.exists():
-            return False
-        manifest_path = journal / "manifest.json"
-        if not manifest_path.is_file():
-            shutil.rmtree(journal, ignore_errors=True)
-            return False
-        try:
-            value = json.loads(manifest_path.read_text(encoding="utf-8"))
-            transaction = _ImportTransaction.from_manifest(journal, value)
-            if transaction.state == "staging_promoted":
-                shutil.rmtree(transaction.backup, ignore_errors=True)
-                shutil.rmtree(transaction.staging, ignore_errors=True)
-            else:
+        home = _lexical_absolute_path(app_home())
+        with _cross_process_import_lock(home):
+            return _recover_interrupted_import_locked(home)
+
+
+@contextlib.contextmanager
+def _exclusive_import_session() -> Iterator[None]:
+    global _IMPORT_ACTIVE
+    with _IMPORT_LOCK:
+        if background_data_operations_active():
+            raise ValidationError(
+                "后台智能生成仍在运行；为避免混合数据，请等待生成完成后再恢复备份"
+            )
+        home = _lexical_absolute_path(app_home())
+        with _cross_process_import_lock(home):
+            _recover_interrupted_import_locked(home)
+            _IMPORT_ACTIVE = True
+            try:
+                yield
+            finally:
+                _IMPORT_ACTIVE = False
+
+
+@contextlib.contextmanager
+def _home_import_transaction() -> Iterator[None]:
+    transaction: _ImportTransaction | None = None
+    try:
+        transaction = _ImportTransaction()
+        with transaction.activated():
+            yield
+        transaction.commit()
+    except BaseException as primary_error:
+        if transaction is not None:
+            if transaction.promotion_recorded:
+                raise ImportRollbackError(
+                    "数据已原子提升，但提交后的清理未完成；事务日志已保留，"
+                    f"下次启动将继续恢复：{transaction.journal}。"
+                    f"原始错误：{primary_error!r}"
+                ) from primary_error
+            try:
                 transaction.restore()
-            transaction.close()
-        except Exception as exc:
-            raise RuntimeError(f"无法恢复中断的 Portable Data 导入：{journal}") from exc
-        return True
+            except BaseException as rollback_error:
+                raise ImportRollbackError(
+                    "数据导入失败且自动回滚也失败；原数据仍保存在回滚日志中，"
+                    f"请勿删除 {transaction.journal}。"
+                    f"原始错误：{primary_error!r}；回滚错误：{rollback_error!r}"
+                ) from rollback_error
+            else:
+                transaction.close()
+        raise
+
+
+@contextlib.contextmanager
+def atomic_home_update() -> Iterator[None]:
+    """Apply a whole-home update through the existing recoverable import journal."""
+    with _exclusive_import_session():
+        with _home_import_transaction():
+            yield
 
 
 def _sha256_bytes(value: bytes) -> str:
@@ -280,8 +582,12 @@ def _collect_assets(connection: sqlite3.Connection) -> tuple[dict[str, dict], di
     mapping: dict[str, dict] = {}
     sources: dict[str, Path] = {}
     for reference in sorted(references):
-        path = resolve_data_path(reference)
-        if not path.is_file():
+        try:
+            path = resolve_managed_media_path(reference)
+        except ValidationError:
+            mapping[reference] = {"external_reference": reference, "unresolved": True}
+            continue
+        if path.stat().st_size > MAX_ASSET_BYTES:
             mapping[reference] = {"external_reference": reference, "unresolved": True}
             continue
         digest = _sha256_path(path)
@@ -313,8 +619,13 @@ def collect_revisions() -> tuple[list[DomainRevision], dict[str, Path]]:
                     raise ValidationError(
                         f"受管资产尚未下载，无法生成完整数据包：{row['entity_id']}"
                     )
-                path = resolve_data_path(asset["relative_path"])
-                if not path.is_file() or _sha256_path(path) != asset["sha256"]:
+                try:
+                    path = resolve_managed_media_path(asset["relative_path"])
+                except ValidationError as exc:
+                    raise ValidationError(
+                        f"受管资产路径无效：{row['entity_id']}"
+                    ) from exc
+                if _sha256_path(path) != asset["sha256"]:
                     raise ValidationError(f"受管资产缺失或哈希不一致：{row['entity_id']}")
                 archive_path = f"assets/{asset['sha256']}{asset['extension']}"
                 payload["archive_path"] = archive_path
@@ -420,6 +731,7 @@ def _encrypt_zip(source: Path, target: Path) -> str:
     return format_recovery_key(recovery_secret)
 
 
+@process_data_locked()
 def export_data(output: str | Path, *, encrypted: bool = True) -> dict:
     target = Path(output).expanduser().resolve()
     if target.exists():
@@ -542,6 +854,31 @@ def _read_member(archive: zipfile.ZipFile, path: str, limit: int) -> bytes:
         return value
 
 
+def _validate_revision_graph(revision_by_id: dict[str, DomainRevision]) -> None:
+    """Validate an arbitrarily deep revision DAG without recursive stack growth."""
+    child_ids: dict[str, list[str]] = {revision_id: [] for revision_id in revision_by_id}
+    remaining_parents: dict[str, int] = {}
+    for revision_id, revision in revision_by_id.items():
+        remaining_parents[revision_id] = len(revision.parent_revision_ids)
+        for parent_id in revision.parent_revision_ids:
+            child_ids[parent_id].append(revision_id)
+    ready = deque(
+        revision_id
+        for revision_id, parent_count in remaining_parents.items()
+        if parent_count == 0
+    )
+    visited = 0
+    while ready:
+        revision_id = ready.popleft()
+        visited += 1
+        for child_id in child_ids[revision_id]:
+            remaining_parents[child_id] -= 1
+            if remaining_parents[child_id] == 0:
+                ready.append(child_id)
+    if visited != len(revision_by_id):
+        raise ValidationError("revision 图包含循环")
+
+
 def _read_validated(zip_path: Path) -> tuple[dict, list[DomainRevision]]:
     try:
         archive = zipfile.ZipFile(zip_path, "r")
@@ -589,22 +926,7 @@ def _read_validated(zip_path: Path) -> tuple[dict, list[DomainRevision]]:
             missing_parents = set(revision.parent_revision_ids) - set(revision_by_id)
             if missing_parents:
                 raise ValidationError(f"revision 缺少父版本：{sorted(missing_parents)}")
-        visiting: set[str] = set()
-        visited: set[str] = set()
-
-        def visit(revision_id: str) -> None:
-            if revision_id in visited:
-                return
-            if revision_id in visiting:
-                raise ValidationError("revision 图包含循环")
-            visiting.add(revision_id)
-            for parent in revision_by_id[revision_id].parent_revision_ids:
-                visit(parent)
-            visiting.remove(revision_id)
-            visited.add(revision_id)
-
-        for revision_id in revision_by_id:
-            visit(revision_id)
+        _validate_revision_graph(revision_by_id)
         heads = manifest.get("entity_heads")
         if not isinstance(heads, dict):
             raise ValidationError("manifest 缺少 entity_heads")
@@ -768,12 +1090,19 @@ def _upsert_row(connection: sqlite3.Connection, table: str, row: dict, key: str 
 
 def _asset_paths(archive: zipfile.ZipFile, revisions: list[DomainRevision]) -> dict[str, str]:
     result: dict[str, str] = {}
+    home = app_home().resolve()
     root = managed_asset_root()
     root.mkdir(parents=True, exist_ok=True)
+    root = root.resolve()
+    try:
+        root.relative_to(home)
+    except ValueError as exc:
+        raise ValidationError("受管资产目录逃逸 MealCircuit 私人目录") from exc
     for revision in revisions:
         if revision.entity_kind != "asset":
             continue
         payload = revision.payload
+        validate_payload("asset", payload)
         archive_path = payload.get("archive_path")
         digest = payload.get("sha256")
         extension = payload.get("extension")
@@ -782,14 +1111,16 @@ def _asset_paths(archive: zipfile.ZipFile, revisions: list[DomainRevision]) -> d
         data = _read_member(archive, archive_path, MAX_ASSET_BYTES)
         if _sha256_bytes(data) != digest:
             raise ValidationError(f"资产哈希不一致：{archive_path}")
-        target = root / f"{digest}{extension}"
+        target = (root / f"{digest}{extension}").resolve()
+        if target.parent != root:
+            raise ValidationError("资产目标逃逸受管资产目录")
         if target.exists() and _sha256_path(target) != digest:
             raise ValidationError(f"本机资产冲突：{target}")
         if not target.exists():
             temporary = target.with_suffix(target.suffix + ".tmp")
             temporary.write_bytes(data)
             os.replace(temporary, target)
-        relative = target.relative_to(app_home()).as_posix()
+        relative = target.relative_to(home).as_posix()
         result[revision.entity_id] = relative
     return result
 
@@ -851,11 +1182,9 @@ def _apply_revision(connection: sqlite3.Connection, revision: DomainRevision, as
     payload = revision.payload
     if revision.entity_kind == "task":
         task = dict(payload["task"])
-        if "asset_id" in task or "external_reference" in task:
-            task["image_path"] = asset_paths.get(task.pop("asset_id", ""))
-            if not task["image_path"]:
-                task["image_path"] = task.pop("external_reference", None)
-                task.pop("unresolved", None)
+        task.pop("external_reference", None)
+        task.pop("unresolved", None)
+        task["image_path"] = asset_paths.get(task.pop("asset_id", ""), None)
         _upsert_row(connection, "tasks", task)
         for item in payload.get("input_history", []):
             _insert_row(connection, "task_input_history", item)
@@ -863,8 +1192,6 @@ def _apply_revision(connection: sqlite3.Connection, revision: DomainRevision, as
             _insert_row(connection, "task_corrections", item)
     elif revision.entity_kind == "task_input":
         image_path = asset_paths.get(payload.get("asset_id", ""))
-        if not image_path:
-            image_path = payload.get("external_reference")
         connection.execute(
             """UPDATE tasks SET original_input=?,input_version=?,image_path=? WHERE id=?""",
             (
@@ -884,9 +1211,8 @@ def _apply_revision(connection: sqlite3.Connection, revision: DomainRevision, as
         food = dict(payload["food"])
         asset_id = food.pop("package_photo_asset_id", None)
         food["package_photo_path"] = asset_paths.get(asset_id or "")
-        if not food["package_photo_path"]:
-            food["package_photo_path"] = food.pop("package_photo_external_reference", None)
-            food.pop("package_photo_unresolved", None)
+        food.pop("package_photo_external_reference", None)
+        food.pop("package_photo_unresolved", None)
         _insert_row(connection, "food_items", food)
         for item in payload.get("history", []):
             _insert_row(connection, "food_item_history", item)
@@ -1114,28 +1440,14 @@ def _record_import_conflict(
 def apply_import(
     source: str | Path, *, recovery_key: str | None = None, mode: str = "restore"
 ) -> dict:
-    global _IMPORT_ACTIVE
-    with _IMPORT_LOCK:
-        recover_interrupted_import()
-        _IMPORT_ACTIVE = True
-        transaction: _ImportTransaction | None = None
-        try:
-            archive = Path(source).expanduser().resolve()
-            preview = preview_import(archive, recovery_key=recovery_key, mode=mode)
-            if not preview["ready"]:
-                raise ValidationError(f"导入存在冲突：{preview['conflicts']}")
-            transaction = _ImportTransaction()
-            with transaction.activated():
-                result = _apply_import_unprotected(archive, recovery_key=recovery_key, mode=mode)
-            transaction.commit()
-            return result
-        except BaseException:
-            if transaction is not None:
-                transaction.restore()
-                transaction.close()
-            raise
-        finally:
-            _IMPORT_ACTIVE = False
+    with _exclusive_import_session():
+        archive = Path(source).expanduser().resolve()
+        preview = preview_import(archive, recovery_key=recovery_key, mode=mode)
+        if not preview["ready"]:
+            raise ValidationError(f"导入存在冲突：{preview['conflicts']}")
+        with _home_import_transaction():
+            result = _apply_import_unprotected(archive, recovery_key=recovery_key, mode=mode)
+        return result
 
 
 def _apply_import_unprotected(

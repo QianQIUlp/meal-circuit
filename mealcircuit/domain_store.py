@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 import json
 import mimetypes
-import shutil
 import sqlite3
 import uuid
 from typing import Any
@@ -12,10 +11,9 @@ from .domain import DomainRevision, make_revision, new_id, utc_now
 from .contracts import validate_transition
 from .storage import (
     app_home,
-    managed_asset_root,
     private_doctrine_path,
     profile_path,
-    resolve_data_path,
+    resolve_managed_media_path,
     settings_path,
 )
 from .validation import ValidationError
@@ -65,25 +63,14 @@ def _file_sha256(path) -> str:
 
 
 def _asset_reference(connection: sqlite3.Connection, reference: str) -> dict:
-    path = resolve_data_path(reference)
-    if not path.is_file():
+    try:
+        path = resolve_managed_media_path(reference)
+    except ValidationError:
         return {"external_reference": reference, "unresolved": True}
     digest = _file_sha256(path)
     extension = path.suffix.lower() or ".bin"
     asset_id = f"asset_{digest}"
-    try:
-        relative = path.resolve().relative_to(app_home().resolve()).as_posix()
-    except ValueError:
-        destination = managed_asset_root() / f"{digest}{extension}"
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        if not destination.exists():
-            temporary = destination.with_suffix(destination.suffix + ".tmp")
-            shutil.copyfile(path, temporary)
-            if _file_sha256(temporary) != digest:
-                temporary.unlink(missing_ok=True)
-                raise ValidationError("受管资产复制校验失败")
-            temporary.replace(destination)
-        relative = destination.relative_to(app_home()).as_posix()
+    relative = path.relative_to(app_home().resolve()).as_posix()
     connection.execute(
         """INSERT OR IGNORE INTO managed_assets(
                id,sha256,media_type,extension,byte_count,relative_path,created_at

@@ -470,3 +470,24 @@
 - 核心功能：`_validate_portions()` 现在同时接受当前由每日上下文和领域 Schema 使用的模块列表，以及旧版以模块名为键的字典；列表中只读取 `module_key == "hunger"` 的字典项。缺少 hunger、空模块、非字典列表元素和未知容器均按空签到处理；`answers_json`、`answers` 和直接答案字典的读取顺序保持不变，其他份量规则未改动。
 - 验证：新增列表、旧字典三种答案载荷、无 hunger、非字典元素、未知容器和空模块的定向回归测试；`python3 -m unittest tests.test_agent_workspace` 共 35 项通过；`python3 -m py_compile mealcircuit/agent_workspace.py tests/test_agent_workspace.py` 与 `git diff --check` 通过。
 - 剩余风险：未通过真实外部模型重新执行完整每日 Agent 七阶段流程；本轮验证覆盖上下文形态、`plan_design` 所调用的份量校验和现有 Agent 工作区回归，且未改变计划生成或份量业务规则。
+
+## 2026-07-31：Windows 安全加固与可双击验收
+
+- 目标与范围：只验收当前 Windows 11 x64 桌面端，使源码在用户人工测试前达到可双击运行状态；未下载、配置或调用 Android SDK、Gradle、模拟器、macOS/Linux 构建链。工作分支为 `codex/windows-acceptance`，所有本轮可控构建、依赖、测试数据和缓存均隔离在 `C:\tmp\mc-win-019fb725`。
+- 依赖：在临时目录准备官方 Python 3.11.9 embeddable、Python 3.13 虚拟环境、uv 0.11.16、PyInstaller、Inno Setup 6.7.3 和 actionlint 1.7.12；未改动全局 Python 或系统 PowerShell 执行策略。`pip-audit` 检查桌面运行依赖 20 项，已知漏洞 0 项。
+- 安全与可靠性修复：收紧 Windows 私人目录 ACL、reparse/no-follow 与路径归属验证；用私有 DACL named mutex 替代可被替换的相邻锁文件；为数据库迁移、便携恢复和同步更新增加锁、事务归属、原子替换、大小/深度限制及失败回滚；限制 AI 读取到受管文件并保持 API Key 仅存在进程内；加固 loopback Host/Origin/CSRF、CSP/HTML 转义和只读路由；强制高影响健康与排除项由用户确认并贯穿计划、替代和救场文本；Windows 打包排除 Android/macOS/Linux 后端和 `pywebview-android.jar`。
+- Windows 运行时修复：桌面健康探针改用直连 `127.0.0.1`，不再受机器 `HTTP_PROXY`/`HTTPS_PROXY` 影响；窗口化 PyInstaller 进程没有 `sys.stderr` 时安全丢弃访问日志，并把 HTTP handler 异常写入本地启动日志，修复打包 EXE 启动后被代理返回 502 或断开连接的问题。
+- Codex Security 数据边界：本轮曾完成一次基线扫描，当前可读取副本位于 `C:\tmp\mc-win-019fb725\security`，包含 48 文件范围清单、威胁模型、覆盖账本、19 条结构化发现（5 high、10 medium、4 low）和扫描清单；这些发现均已逐项本地复现、修复或按边界降级。插件在 `%TEMP%\codex-security-scans-lAod8P` 下保留两个封存目录，但当前进程无权读取其 ACL/内容，`report.md` 与 SARIF 没有可访问副本；另一次安全过滤拒绝只留下状态，没有正文可恢复。按用户要求不再调用、重试或补取 Codex Security；后续普通改动采用本地差异、测试、依赖和打包检查，仅在导入/同步/密钥/AI 文件访问等高风险边界变化时做本地专项审计。
+- 自动化验证：完整 Windows 选择器在 Python 3.13.5 上 255 项通过、15 项非 Windows/外部模块跳过，在 Python 3.11.9 上 255 项通过、17 项跳过；ACL、named mutex、原子恢复与便携回滚专项在两版本各 32/32 通过，真实 `icacls` 证据确认目标目录不继承 `Everyone` 权限；`compileall`、actionlint 与 `git diff --check` 通过。完整 255 项矩阵先于最后两项桌面探针/无 stderr 修复，修复后两版本 `tests.test_windows_desktop` 各 8/8 通过，并重新完成全部打包、安装和真实运行验收。
+- 打包与运行验收：`C:\tmp\mc-win-019fb725\security\windows-final-acceptance.ps1 -Execute` 通过 PyInstaller AMD64 GUI 构建、包内容排除检查、EXE smoke、便携 ZIP 解压 smoke、Inno 编译、静默安装/启动/卸载、无参数原生窗口和同一数据目录重复实例退出码 2；验收后没有残留 MealCircuit 进程或卸载注册表项。最终产物为 `dist\MealCircuit\MealCircuit.exe`（SHA-256 `517c6968e0f299a1d66de01d701809063f3a08f98120cad24d152d8e7ff9ed7a`）、`dist\MealCircuit-0.3.0-windows-x64-portable.zip`（`3143fca0ecb826059117b45838059d87d8710e862ae5cd5d6fb18f6c4ae6d0d4`）和 `dist\MealCircuit-0.3.0-windows-x64-setup.exe`（`ad819aafcd34a70388ef5180e21be525793349d9f127227660d4e129b0a2f95f`）。
+- 缓存与清理：本轮临时根共约 727 MiB；主要目录为 `cache`（约 314 MiB，含 pip/uv/pycache/PyInstaller）、`bootstrap`（约 111 MiB）、`dist`（约 75 MiB）、`venv`（约 47 MiB）、`downloads`（约 23 MiB）、`python`（约 21 MiB）、`build`（约 19 MiB）、`runtime-home`（约 18 MiB）、`security`（约 7 MiB）和 `logs`（约 1.3 MiB）。人工测试结束后可整体删除 `C:\tmp\mc-win-019fb725`；删除前应先复制需要保留的安装包或日志。
+- 剩余风险：最终 EXE 和安装包未做 Authenticode 签名，Windows 可能显示“未知发布者”；同账户进程可预占确定性 named mutex 造成 fail-closed 拒绝服务，但不能造成锁分裂、越界写入或误删未知数据；同账户管理员级句柄竞态不在本地应用可完全消除的边界内。上述均不阻断本机人工测试。
+- 用户用法：直接双击 `C:\tmp\mc-win-019fb725\dist\MealCircuit\MealCircuit.exe` 进行免安装测试，或双击 `C:\tmp\mc-win-019fb725\dist\MealCircuit-0.3.0-windows-x64-setup.exe` 测试安装流程；当前受限 PowerShell 策略不影响 EXE 启动。
+
+## 2026-08-01：桌面中文一致性与跨入口品牌图标统一
+
+- 目标：修复桌面应用仅翻译导航外壳、正文仍为中文而造成的中英文混杂，并让 Cloudflare Pages、桌面 Web、Windows EXE 与安装包使用同一 MealCircuit 品牌图标。
+- 改动：桌面应用固定使用内容完整的简体中文，忽略旧的英文设备偏好并移除未完成的语言切换入口；主题切换继续保留。`site/favicon.svg` 作为品牌图形来源，`mealcircuit/static/favicon.svg` 与其保持一致；由该 SVG 生成多尺寸透明 `packaging/windows/MealCircuit.ico`，分别接入 PyInstaller `EXE` 和 Inno Setup。Cloudflare Pages 的英文与 `/zh/` 双语产品站保持不变。
+- 验证：Python 3.13.5 与 3.11.9 各运行 `tests.test_windows_desktop` 加 `WebAppTest.test_pages_and_material_form`，均为 10/10 通过；真实本地页面确认 `lang=zh-CN`，导航为“今天 / 计划 / 我的”，日期、存储提示和操作文案均为中文，未发现英文外壳文案，浏览器控制台无 warning/error。重新执行 `windows-final-acceptance.ps1 -Execute`，PyInstaller AMD64 GUI、EXE smoke、便携 ZIP、Inno 编译、安装/启动/重复实例/卸载全部通过；从最终 EXE 与 Setup 实际提取的图标均为 Pages 使用的深绿回路图标。
+- 临时文件：本轮页面验收数据与日志位于 `C:\tmp\meal-circuit-ui-20260801`；SVG 渲染和图标比对文件位于 `C:\tmp\mealcircuit-brand-1024.png`、`C:\tmp\mealcircuit-exe-icon.png` 与 `C:\tmp\mealcircuit-setup-icon.png`，均可在验收结束后删除。最终构建产物仍位于 `C:\tmp\mc-win-019fb725\dist`。
+- 剩余边界：桌面英文界面暂不提供，只有在全部领域页面完成同等质量翻译后才应重新开放语言选择；最终 Windows 产物仍未做 Authenticode 签名，公开下载时可能显示“未知发布者”。

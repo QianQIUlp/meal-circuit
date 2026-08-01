@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import base64
+import hashlib
 import json
 import os
 import sqlite3
@@ -9,6 +10,7 @@ import tempfile
 import unittest
 import zipfile
 from contextlib import closing
+from dataclasses import replace
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from unittest.mock import patch
@@ -610,6 +612,54 @@ class DomainAndPortableTest(unittest.TestCase):
             archive.writestr("assets/oversized.bin", b"0" * (10 * 1024 * 1024 + 1))
         with self.assertRaisesRegex(ValidationError, "条目大小|压缩比"):
             preview_import(bomb, mode="restore")
+
+    def test_asset_metadata_rejects_windows_path_escape_and_invalid_sizes(self) -> None:
+        digest = hashlib.sha256(b"asset").hexdigest()
+        valid = make_revision(
+            "asset",
+            {
+                "sha256": digest,
+                "media_type": "image/png",
+                "extension": ".png",
+                "byte_count": 5,
+                "archive_path": f"assets/{digest}.png",
+            },
+            author_device_id="device_test",
+        )
+        self.assertEqual(".png", valid.payload["extension"])
+        for change in (
+            {"sha256": "not-a-digest"},
+            {"extension": r"\..\..\..\escaped.cmd"},
+            {"extension": ".png:stream"},
+            {"byte_count": -1},
+            {"byte_count": "5"},
+        ):
+            with self.subTest(change=change), self.assertRaises(ValidationError):
+                make_revision(
+                    "asset",
+                    {**valid.payload, **change},
+                    author_device_id="device_test",
+                )
+
+        root = Path(self.temp.name)
+        configure_home(root / "target")
+        escaped = root / "escaped.bin"
+        archive_path = f"assets/{digest}.bin"
+        unsafe = replace(
+            valid,
+            payload={
+                **valid.payload,
+                "archive_path": archive_path,
+                "extension": r"\..\..\..\escaped.bin",
+            },
+        )
+        archive_file = root / "unsafe-asset.zip"
+        with zipfile.ZipFile(archive_file, "w") as writer:
+            writer.writestr(archive_path, b"asset")
+        with zipfile.ZipFile(archive_file) as reader:
+            with self.assertRaises(ValidationError):
+                portable_module._asset_paths(reader, [unsafe])
+        self.assertFalse(escaped.exists())
 
     def test_portable_preserves_revision_graph_and_auto_merges_disjoint_fields(self) -> None:
         root = Path(self.temp.name)

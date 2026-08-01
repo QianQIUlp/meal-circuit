@@ -32,7 +32,15 @@ _DURABLE_MARKERS = ("以后", "今后", "长期", "默认", "不要再", "不再
 _TEMPORARY_MARKERS = ("今天", "这次", "临时", "今晚", "这一顿", "明天")
 _HIGH_IMPACT_MARKERS = (
     "过敏", "禁忌", "疾病", "用药", "药物", "怀孕", "孕期", "哺乳", "未成年",
-    "治疗", "医生", "热量目标", "蛋白目标", "完全不吃", "永久不吃",
+    "治疗", "医生", "热量", "卡路里", "蛋白目标", "营养目标", "减重目标", "完全不吃",
+    "永远不吃", "永久不吃", "完全排除", "清零主食", "allerg", "anaphylaxis",
+    "intoleran", "disease", "diagnos", "medical", "health condition", "medicine",
+    "medication", "drug", "prescription", "dosage", "insulin", "diabetes",
+    "hypertension", "renal", "kidney", "liver", "pregnan", "breastfeed", "lactation",
+    "minor", "clinician", "doctor", "therapeutic", "eating disorder", "calorie", "kcal",
+    "energy target", "protein target", "protein goal", "nutrition", "nutritional",
+    "macronutrient", "macro target", "weight-loss target", "weight loss target",
+    "zero carbohydrate", "zero carb", "cut carbohydrates", "eliminate carbohydrates", "fasting",
 )
 _COST_MARKERS = ("太贵", "很贵", "贵了", "高价", "买不起", "吃不起", "不划算", "性价比", "预算")
 _COMPLEXITY_MARKERS = ("太麻烦", "步骤太多", "不想做", "做不动", "费事", "复杂")
@@ -378,11 +386,16 @@ def detect_intent_signals(source: dict, review_date: str) -> list[dict]:
     text = str(source.get("text") or "").strip()
     if not text:
         return []
+    normalized_text = text.casefold()
     explicit_horizon = any(marker in text for marker in _DURABLE_MARKERS if marker != "不需要")
     temporary_horizon = any(marker in text for marker in _TEMPORARY_MARKERS)
     durable = explicit_horizon or ("不需要" in text and not temporary_horizon)
     temporary = temporary_horizon and not explicit_horizon
-    high_impact = any(marker in text for marker in _HIGH_IMPACT_MARKERS)
+    high_impact_markers = [
+        marker for marker in _HIGH_IMPACT_MARKERS
+        if marker.casefold() in normalized_text
+    ]
+    high_impact = bool(high_impact_markers)
     plan_date = (date.fromisoformat(review_date) + timedelta(days=1)).isoformat()
     valid_until = plan_date if "明天" in text else review_date if temporary else None
     categories: list[tuple[str, tuple[str, ...]]] = [
@@ -465,7 +478,7 @@ def detect_intent_signals(source: dict, review_date: str) -> list[dict]:
             "source_id": source.get("source_id"),
             "source_type": source.get("source_type"),
             "category": "high_impact",
-            "markers": [marker for marker in _HIGH_IMPACT_MARKERS if marker in text],
+            "markers": high_impact_markers,
             "entity": "",
             "lifetime": "requires_confirmation",
             "risk_level": "high",
