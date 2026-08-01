@@ -70,7 +70,7 @@ jobs:
         run: |
           $innoInstaller = Join-Path $env:RUNNER_TEMP "innosetup-6.7.3.exe"
           $innoDir = Join-Path $env:RUNNER_TEMP "inno-6.7.3"
-          Invoke-WebRequest -Uri "https://files.jrsoftware.org/is/6/innosetup-6.7.3.exe" -OutFile $innoInstaller
+          Invoke-WebRequest -Uri "https://github.com/jrsoftware/issrc/releases/download/is-6_7_3/innosetup-6.7.3.exe" -OutFile $innoInstaller
           $innoHash = (Get-FileHash $innoInstaller -Algorithm SHA256).Hash.ToLowerInvariant()
           if ($innoHash -ne "9c73c3bae7ed48d44112a0f48e66742c00090bdb5bef71d9d3c056c66e97b732") { throw "Inno Setup checksum mismatch" }
           if ((Get-AuthenticodeSignature $innoInstaller).Status -ne "Valid") { throw "Inno Setup signature invalid" }

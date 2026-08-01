@@ -491,3 +491,10 @@
 - 验证：Python 3.13.5 与 3.11.9 各运行 `tests.test_windows_desktop` 加 `WebAppTest.test_pages_and_material_form`，均为 10/10 通过；真实本地页面确认 `lang=zh-CN`，导航为“今天 / 计划 / 我的”，日期、存储提示和操作文案均为中文，未发现英文外壳文案，浏览器控制台无 warning/error。重新执行 `windows-final-acceptance.ps1 -Execute`，PyInstaller AMD64 GUI、EXE smoke、便携 ZIP、Inno 编译、安装/启动/重复实例/卸载全部通过；从最终 EXE 与 Setup 实际提取的图标均为 Pages 使用的深绿回路图标。
 - 临时文件：本轮页面验收数据与日志位于 `C:\tmp\meal-circuit-ui-20260801`；SVG 渲染和图标比对文件位于 `C:\tmp\mealcircuit-brand-1024.png`、`C:\tmp\mealcircuit-exe-icon.png` 与 `C:\tmp\mealcircuit-setup-icon.png`，均可在验收结束后删除。最终构建产物仍位于 `C:\tmp\mc-win-019fb725\dist`。
 - 剩余边界：桌面英文界面暂不提供，只有在全部领域页面完成同等质量翻译后才应重新开放语言选择；最终 Windows 产物仍未做 Authenticode 签名，公开下载时可能显示“未知发布者”。
+
+## 2026-08-01：Windows CI 安装器下载修复
+
+- 根因与修复：`release-builds / windows` 中 EXE 构建、打包与便携版冒烟测试均已通过，随后因 `files.jrsoftware.org` 上固定的 Inno Setup 6.7.3 地址返回 404 而失败。工作流改用 Inno Setup 官方下载页当前指向的 `jrsoftware/issrc` GitHub Release 固定资产；版本、SHA-256 校验值和 Authenticode 校验保持不变。
+- 验证：从新地址实际下载 `innosetup-6.7.3.exe` 到 `C:\tmp\innosetup-6.7.3-ci-fix.exe`，文件大小 10,592,232 字节，SHA-256 为 `9c73c3bae7ed48d44112a0f48e66742c00090bdb5bef71d9d3c056c66e97b732`，Authenticode 状态为 `Valid`、签名者为 Pyrsys B.V.；另运行工作流语法检查与 `git diff --check`。
+- 临时文件：上述下载验证文件可在本轮验收结束后直接删除；没有新增项目依赖、全局工具或项目内缓存。
+- 剩余风险：CI 仍依赖 GitHub Release 网络可用性，但固定发布资产与哈希、签名三重约束避免了静默版本漂移；Node 20 弃用提示来自已锁定的第三方 Actions，当前只是警告且不构成本次 Windows 失败原因。
