@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import base64
-from collections import deque
 import contextlib
 import hashlib
 import json
@@ -12,10 +11,12 @@ import sqlite3
 import stat
 import struct
 import tempfile
+import threading
+import time
 import uuid
 import zipfile
 from pathlib import Path, PurePosixPath
-from typing import Iterator
+from typing import Iterable, Iterator
 
 from . import __version__
 from .configuration import load_settings
@@ -59,6 +60,7 @@ ENCRYPTED_MAGIC = b"MCX1\n"
 CHUNK_BYTES = 4 * 1024 * 1024
 MAX_ARCHIVE_FILES = 100_000
 MAX_ARCHIVE_BYTES = 10 * 1024 * 1024 * 1024
+MAX_IMPORT_SOURCE_BYTES = MAX_ARCHIVE_BYTES + 64 * 1024 * 1024
 MAX_MANIFEST_BYTES = 8 * 1024 * 1024
 MAX_METADATA_ENTRY_BYTES = 64 * 1024 * 1024
 MAX_ASSET_BYTES = 10 * 1024 * 1024
@@ -68,6 +70,15 @@ _IMPORT_LOCK = DATA_DIRECTORY_LOCK
 _IMPORT_ACTIVE = False
 _JOURNAL_OWNER_MARKER = ".mealcircuit-import-owner"
 _HOME_OWNER_MARKER = ".mealcircuit-home-owner"
+ASSET_DESCRIPTOR_FIELDS = frozenset({"id", "sha256", "path", "bytes", "media_type"})
+LEGACY_ASSET_DESCRIPTOR_FIELDS = frozenset({"sha256", "path", "bytes"})
+ASSET_MEDIA_EXTENSIONS = {
+    "image/jpeg": frozenset({".jpg", ".jpeg"}),
+    "image/png": frozenset({".png"}),
+    "image/gif": frozenset({".gif"}),
+    "image/webp": frozenset({".webp"}),
+}
+PORTABLE_TEMP_STALE_SECONDS = 24 * 60 * 60
 
 
 class ImportInProgressError(ValidationError):
@@ -668,36 +679,212 @@ def _jsonl(items: list[DomainRevision]) -> bytes:
     ).encode("utf-8")
 
 
+def _bind_asset_descriptors(
+    revisions: list[DomainRevision],
+    heads: dict[str, str],
+    descriptors: list[dict],
+) -> list[tuple[dict, DomainRevision]]:
+    """Bind each manifest asset to exactly one authoritative ASSET head."""
+    revision_by_id = {item.revision_id: item for item in revisions}
+    if len(revision_by_id) != len(revisions):
+        raise ValidationError("Portable Data 包含重复 revision")
+
+    asset_heads: dict[str, DomainRevision] = {}
+    for entity_id, revision_id in heads.items():
+        if not isinstance(entity_id, str) or not isinstance(revision_id, str):
+            raise ValidationError("manifest entity_heads 字段类型无效")
+        revision = revision_by_id.get(revision_id)
+        if revision is None or revision.entity_id != entity_id:
+            raise ValidationError(f"manifest entity head 无效：{entity_id}")
+        if revision.entity_kind == "asset":
+            asset_heads[entity_id] = revision
+
+    asset_metadata: dict[str, dict[str, object]] = {}
+    for asset_id, revision in asset_heads.items():
+        payload = revision.payload
+        for field in ("sha256", "media_type", "extension", "archive_path"):
+            if not isinstance(payload.get(field), str):
+                raise ValidationError(f"ASSET head 的 {field} 必须是字符串：{asset_id}")
+        if type(payload.get("byte_count")) is not int:
+            raise ValidationError(f"ASSET head 的 byte_count 必须是整数：{asset_id}")
+
+        digest = payload["sha256"]
+        media_type = payload["media_type"]
+        extension = payload["extension"]
+        byte_count = payload["byte_count"]
+        if len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
+            raise ValidationError(f"ASSET head 的 sha256 必须是 64 位小写十六进制字符串：{asset_id}")
+        allowed_extensions = ASSET_MEDIA_EXTENSIONS.get(media_type)
+        if allowed_extensions is None:
+            raise ValidationError(f"ASSET head 的 media_type 不受支持：{asset_id}")
+        if extension not in allowed_extensions:
+            raise ValidationError(f"ASSET head 的 extension 与 media_type 不匹配：{asset_id}")
+        if byte_count < 0 or byte_count > MAX_ASSET_BYTES:
+            raise ValidationError(f"ASSET head 的 byte_count 超过安全边界：{asset_id}")
+        expected_path = f"assets/{digest}{extension}"
+        if payload["archive_path"] != expected_path:
+            raise ValidationError(f"ASSET head 的 archive_path 与认证元数据不一致：{asset_id}")
+        asset_metadata[asset_id] = {
+            "sha256": digest,
+            "media_type": media_type,
+            "bytes": byte_count,
+            "path": expected_path,
+        }
+
+    seen_ids: set[str] = set()
+    seen_paths: set[str] = set()
+    bindings: list[tuple[dict, DomainRevision]] = []
+    for descriptor in descriptors:
+        if not isinstance(descriptor, dict) or set(descriptor) not in {
+            ASSET_DESCRIPTOR_FIELDS,
+            LEGACY_ASSET_DESCRIPTOR_FIELDS,
+        }:
+            raise ValidationError("资产 descriptor 字段必须精确匹配协议")
+        string_fields = ("sha256", "path")
+        if set(descriptor) == ASSET_DESCRIPTOR_FIELDS:
+            string_fields += ("id", "media_type")
+        for field in string_fields:
+            if not isinstance(descriptor[field], str):
+                raise ValidationError(f"资产字段 {field} 必须是字符串")
+        if type(descriptor["bytes"]) is not int:  # bool is not a JSON integer here.
+            raise ValidationError("资产字段 bytes 必须是整数")
+
+        path = descriptor["path"]
+        if not path:
+            raise ValidationError("manifest 资产标识无效")
+        if set(descriptor) == LEGACY_ASSET_DESCRIPTOR_FIELDS:
+            candidates = [
+                asset_id
+                for asset_id, metadata in asset_metadata.items()
+                if metadata["sha256"] == descriptor["sha256"]
+                and metadata["path"] == path
+                and metadata["bytes"] == descriptor["bytes"]
+            ]
+            if len(candidates) != 1:
+                raise ValidationError("历史资产 descriptor 无法唯一绑定到 ASSET head")
+            asset_id = candidates[0]
+            descriptor = {
+                **descriptor,
+                "id": asset_id,
+                "media_type": asset_metadata[asset_id]["media_type"],
+            }
+        else:
+            asset_id = descriptor["id"]
+        if not asset_id:
+            raise ValidationError("manifest 资产标识无效")
+        if asset_id in seen_ids:
+            raise ValidationError(f"Portable Data 包含重复资产 ID：{asset_id}")
+        if path in seen_paths:
+            raise ValidationError(f"Portable Data 包含重复资产路径：{path}")
+        seen_ids.add(asset_id)
+        seen_paths.add(path)
+
+        revision = asset_heads.get(asset_id)
+        if revision is None:
+            raise ValidationError(f"资产 descriptor 没有对应的 ASSET head：{asset_id}")
+        metadata = asset_metadata[asset_id]
+        if descriptor["sha256"] != metadata["sha256"]:
+            raise ValidationError(f"资产 descriptor 的 sha256 与 ASSET head 不一致：{asset_id}")
+        if descriptor["media_type"] != metadata["media_type"]:
+            raise ValidationError(f"资产 descriptor 的 media_type 与 ASSET head 不一致：{asset_id}")
+        if descriptor["bytes"] != metadata["bytes"]:
+            raise ValidationError(f"资产 descriptor 的 bytes 与 ASSET head 不一致：{asset_id}")
+        if path != metadata["path"]:
+            raise ValidationError(
+                f"资产 descriptor 的 path/archive_path 与 ASSET head 不一致：{asset_id}"
+            )
+        bindings.append((descriptor, revision))
+
+    if seen_ids != set(asset_heads):
+        raise ValidationError("资产 descriptor 与 ASSET heads 不是一一对应关系")
+    return bindings
+
+
+def _referenced_asset_ids(revisions: Iterable[DomainRevision]) -> set[str]:
+    referenced: set[str] = set()
+    pending: list[object] = []
+    for revision in revisions:
+        if revision.entity_kind == "asset":
+            continue
+        pending.append(revision.payload)
+        while pending:
+            value = pending.pop()
+            if isinstance(value, dict):
+                for key, child in value.items():
+                    if key.endswith("asset_id") and isinstance(child, str):
+                        referenced.add(child)
+                    pending.append(child)
+            elif isinstance(value, list):
+                pending.extend(value)
+    return referenced
+
+
+def _require_asset_references(
+    revisions: Iterable[DomainRevision], available_asset_ids: set[str]
+) -> None:
+    missing = sorted(_referenced_asset_ids(revisions) - available_asset_ids)
+    if missing:
+        raise ValidationError(f"领域实体引用了缺失资产：{missing}")
+
+
 def _build_zip(target: Path) -> dict:
     revisions, assets = collect_revisions()
+    heads = _current_heads()
     grouped: dict[str, list[DomainRevision]] = {}
     for revision in revisions:
         grouped.setdefault(revision.entity_kind, []).append(revision)
     contents: dict[str, bytes] = {
         f"entities/{kind}.jsonl": _jsonl(items) for kind, items in sorted(grouped.items())
     }
+    revision_by_id = {item.revision_id: item for item in revisions}
+    asset_descriptors = []
+    for entity_id, revision_id in sorted(heads.items()):
+        revision = revision_by_id[revision_id]
+        if revision.entity_kind != "asset":
+            continue
+        payload = revision.payload
+        asset_descriptors.append(
+            {
+                "id": entity_id,
+                "sha256": payload["sha256"],
+                "path": payload["archive_path"],
+                "bytes": payload["byte_count"],
+                "media_type": payload["media_type"],
+            }
+        )
+    bindings = _bind_asset_descriptors(revisions, heads, asset_descriptors)
+    _require_asset_references(
+        revisions,
+        {descriptor["id"] for descriptor, _ in bindings},
+    )
+    archived_assets: dict[str, Path] = {}
+    for descriptor, _ in bindings:
+        path = descriptor["path"]
+        source = assets.get(path)
+        if source is None:
+            raise ValidationError(f"受管资产缺少归档源文件：{descriptor['id']}")
+        if source.stat().st_size != descriptor["bytes"] or _sha256_path(source) != descriptor["sha256"]:
+            raise ValidationError(f"受管资产文件与认证元数据不一致：{descriptor['id']}")
+        archived_assets[path] = source
     manifest = {
         "format": PORTABLE_FORMAT,
         "format_version": PORTABLE_VERSION,
         "domain_schema_version": DOMAIN_SCHEMA_VERSION,
         "application_version": __version__,
         "created_at": utc_now(),
-        "entity_heads": _current_heads(),
+        "entity_heads": heads,
         "content": {
             path: {"count": len(grouped[path.removeprefix("entities/").removesuffix(".jsonl")]), "sha256": _sha256_bytes(data)}
             for path, data in sorted(contents.items())
         },
-        "assets": [
-            {"path": path, "bytes": source.stat().st_size, "sha256": _sha256_path(source)}
-            for path, source in sorted(assets.items())
-        ],
+        "assets": asset_descriptors,
     }
     target.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(target, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
         archive.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2) + "\n")
         for path, data in contents.items():
             archive.writestr(path, data)
-        for path, source in assets.items():
+        for path, source in archived_assets.items():
             archive.write(source, path)
     return manifest
 
@@ -824,6 +1011,61 @@ def _zip_path(source: Path, recovery_key: str | None) -> Iterator[Path]:
         temporary.unlink(missing_ok=True)
 
 
+@contextlib.contextmanager
+def _snapshot_import_source(source: Path) -> Iterator[Path]:
+    root = _portable_temp_root()
+    _cleanup_stale_portable_temp(root)
+    fd, temporary_name = tempfile.mkstemp(
+        prefix="mealcircuit-source-", suffix=".portable", dir=root
+    )
+    temporary = Path(temporary_name)
+    try:
+        raw_output = os.fdopen(fd, "wb")
+        fd = -1
+        with raw_output as output_stream:
+            with source.open("rb") as input_stream:
+                total = 0
+                while True:
+                    chunk = input_stream.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > MAX_IMPORT_SOURCE_BYTES:
+                        raise ValidationError("导入数据包源文件超过大小限制")
+                    output_stream.write(chunk)
+                output_stream.flush()
+                os.fsync(output_stream.fileno())
+        yield temporary
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        temporary.unlink(missing_ok=True)
+
+
+def _portable_temp_root() -> Path:
+    home = app_home().resolve()
+    identity = hashlib.sha256(str(home).encode("utf-8")).hexdigest()[:16]
+    root = home.parent / f".mealcircuit-portable-temp-{identity}"
+    if root.exists() and (root.is_symlink() or not root.is_dir()):
+        raise ValidationError(f"Portable Data 临时根无效：{root}")
+    root.mkdir(parents=True, mode=0o700, exist_ok=True)
+    return root
+
+
+def _cleanup_stale_portable_temp(root: Path) -> None:
+    cutoff = time.time() - PORTABLE_TEMP_STALE_SECONDS
+    for child in root.iterdir():
+        try:
+            if child.stat(follow_symlinks=False).st_mtime > cutoff:
+                continue
+            if child.is_symlink() or not child.is_dir():
+                child.unlink(missing_ok=True)
+            else:
+                shutil.rmtree(child, ignore_errors=True)
+        except FileNotFoundError:
+            continue
+
+
 def _safe_member(info: zipfile.ZipInfo) -> None:
     path = PurePosixPath(info.filename)
     if path.is_absolute() or ".." in path.parts or "\\" in info.filename or not info.filename:
@@ -855,28 +1097,50 @@ def _read_member(archive: zipfile.ZipFile, path: str, limit: int) -> bytes:
 
 
 def _validate_revision_graph(revision_by_id: dict[str, DomainRevision]) -> None:
-    """Validate an arbitrarily deep revision DAG without recursive stack growth."""
-    child_ids: dict[str, list[str]] = {revision_id: [] for revision_id in revision_by_id}
-    remaining_parents: dict[str, int] = {}
-    for revision_id, revision in revision_by_id.items():
-        remaining_parents[revision_id] = len(revision.parent_revision_ids)
+    """Validate parent links and cycles iteratively so deep histories are safe."""
+    for revision in revision_by_id.values():
+        missing_parents = [
+            parent_id
+            for parent_id in revision.parent_revision_ids
+            if parent_id not in revision_by_id
+        ]
+        if missing_parents:
+            raise ValidationError(f"revision 缺少父版本：{sorted(missing_parents)}")
         for parent_id in revision.parent_revision_ids:
-            child_ids[parent_id].append(revision_id)
-    ready = deque(
-        revision_id
-        for revision_id, parent_count in remaining_parents.items()
-        if parent_count == 0
-    )
-    visited = 0
-    while ready:
-        revision_id = ready.popleft()
-        visited += 1
-        for child_id in child_ids[revision_id]:
-            remaining_parents[child_id] -= 1
-            if remaining_parents[child_id] == 0:
-                ready.append(child_id)
-    if visited != len(revision_by_id):
-        raise ValidationError("revision 图包含循环")
+            parent = revision_by_id[parent_id]
+            if (
+                parent.entity_id != revision.entity_id
+                or parent.entity_kind != revision.entity_kind
+            ):
+                raise ValidationError(
+                    f"revision 父版本必须属于同一实体和类型：{revision.revision_id}"
+                )
+
+    visiting = 1
+    visited = 2
+    states: dict[str, int] = {}
+    for start_id in revision_by_id:
+        if states.get(start_id) == visited:
+            continue
+        stack: list[tuple[str, bool]] = [(start_id, False)]
+        while stack:
+            revision_id, exiting = stack.pop()
+            if exiting:
+                states[revision_id] = visited
+                continue
+            state = states.get(revision_id)
+            if state == visited:
+                continue
+            if state == visiting:
+                raise ValidationError("revision 图包含循环")
+            states[revision_id] = visiting
+            stack.append((revision_id, True))
+            for parent_id in reversed(revision_by_id[revision_id].parent_revision_ids):
+                parent_state = states.get(parent_id)
+                if parent_state == visiting:
+                    raise ValidationError("revision 图包含循环")
+                if parent_state != visited:
+                    stack.append((parent_id, False))
 
 
 def _read_validated(zip_path: Path) -> tuple[dict, list[DomainRevision]]:
@@ -934,47 +1198,34 @@ def _read_validated(zip_path: Path) -> tuple[dict, list[DomainRevision]]:
             revision = revision_by_id.get(revision_id)
             if revision is None or revision.entity_id != entity_id:
                 raise ValidationError(f"manifest entity head 无效：{entity_id}")
-        asset_items = manifest.get("assets") or []
+        asset_items = manifest.get("assets")
         if not isinstance(asset_items, list) or any(not isinstance(item, dict) for item in asset_items):
             raise ValidationError("manifest 资产列表无效")
-        asset_paths = [item.get("path") for item in asset_items]
-        asset_ids = [item.get("id") for item in asset_items if item.get("id") is not None]
-        if any(not isinstance(value, str) or not value for value in asset_paths + asset_ids):
-            raise ValidationError("manifest 资产标识无效")
-        if len(set(asset_paths)) != len(asset_paths) or len(set(asset_ids)) != len(asset_ids):
-            raise ValidationError("manifest 包含重复资产")
-        assets = {item.get("path"): item for item in asset_items}
-        for path, descriptor in assets.items():
+        bindings = _bind_asset_descriptors(revisions, heads, asset_items)
+        archive_asset_paths = {
+            info.filename
+            for info in infos
+            if not info.is_dir() and info.filename.startswith("assets/")
+        }
+        descriptor_paths = {descriptor["path"] for descriptor, _ in bindings}
+        if archive_asset_paths != descriptor_paths:
+            raise ValidationError("归档中的资产文件必须与 manifest descriptor 精确对应")
+        for descriptor, _ in bindings:
+            path = descriptor["path"]
             if path not in names or not str(path).startswith("assets/"):
                 raise ValidationError(f"资产路径无效：{path}")
             if (
-                not isinstance(descriptor.get("bytes"), int)
-                or descriptor["bytes"] < 0
+                descriptor["bytes"] < 0
                 or descriptor["bytes"] > MAX_ASSET_BYTES
             ):
                 raise ValidationError(f"资产大小无效：{path}")
             raw = _read_member(archive, str(path), MAX_ASSET_BYTES)
             if len(raw) != descriptor.get("bytes") or _sha256_bytes(raw) != descriptor.get("sha256"):
                 raise ValidationError(f"资产校验失败：{path}")
-        available_assets = {
-            revision.entity_id
-            for revision in revisions
-            if revision.entity_kind == "asset"
-        }
-        def asset_references(value: object) -> Iterator[str]:
-            if isinstance(value, dict):
-                for key, child in value.items():
-                    if key.endswith("asset_id") and isinstance(child, str):
-                        yield child
-                    yield from asset_references(child)
-            elif isinstance(value, list):
-                for child in value:
-                    yield from asset_references(child)
-
-        for revision in revisions:
-            missing_assets = sorted(set(asset_references(revision.payload)) - available_assets)
-            if missing_assets:
-                raise ValidationError(f"领域实体引用了缺失资产：{missing_assets}")
+        _require_asset_references(
+            revisions,
+            {descriptor["id"] for descriptor, _ in bindings},
+        )
         return manifest, revisions
 
 
@@ -1012,6 +1263,23 @@ def _current_payloads() -> dict[tuple[str, str], dict]:
         return result
 
 
+def _validate_local_revision_identities(revisions: list[DomainRevision]) -> None:
+    """A revision ID is immutable and cannot be reused for different content."""
+    init_db()
+    with connect() as connection:
+        for incoming in revisions:
+            row = connection.execute(
+                "SELECT * FROM domain_revisions WHERE revision_id=?",
+                (incoming.revision_id,),
+            ).fetchone()
+            if row is None:
+                continue
+            if _row_revision(row) != _storage_revision(incoming):
+                raise ValidationError(
+                    f"revision ID 与本机已有不同内容冲突：{incoming.revision_id}"
+                )
+
+
 def preview_import(
     source: str | Path, *, recovery_key: str | None = None, mode: str = "restore"
 ) -> dict:
@@ -1022,6 +1290,7 @@ def preview_import(
         raise ValidationError(f"导入文件不存在：{path}")
     with _zip_path(path, recovery_key) as plain_zip:
         manifest, revisions = _read_validated(plain_zip)
+    _validate_local_revision_identities(revisions)
     heads = _head_revisions(manifest, revisions)
     current = _current_payloads()
     incoming = {(item.entity_kind, item.entity_id): item.payload for item in heads}
@@ -1033,8 +1302,17 @@ def preview_import(
         new = sorted(key for key in incoming if key not in comparison)
     else:
         identical = sorted(key for key, payload in incoming.items() if current.get(key) == payload)
-        conflicts = sorted(key for key, payload in incoming.items() if key in current and current[key] != payload)
-        new = sorted(key for key in incoming if key not in current)
+        current_kind_by_id = {entity_id: kind for kind, entity_id in current}
+        kind_conflicts = {
+            key
+            for key in incoming
+            if key[1] in current_kind_by_id and current_kind_by_id[key[1]] != key[0]
+        }
+        conflicts = sorted(
+            {key for key, payload in incoming.items() if key in current and current[key] != payload}
+            | kind_conflicts
+        )
+        new = sorted(key for key in incoming if key not in current and key not in kind_conflicts)
     if mode == "restore":
         existing_user = [key for key in current if key[0] in user_kinds]
         if existing_user:
@@ -1088,39 +1366,88 @@ def _upsert_row(connection: sqlite3.Connection, table: str, row: dict, key: str 
     connection.execute(sql, tuple(encoded[column] for column in columns))
 
 
-def _asset_paths(archive: zipfile.ZipFile, revisions: list[DomainRevision]) -> dict[str, str]:
+def _asset_paths(
+    archive: zipfile.ZipFile,
+    manifest: dict,
+    revisions: list[DomainRevision],
+) -> dict[str, str]:
     result: dict[str, str] = {}
+    bindings = _bind_asset_descriptors(revisions, manifest["entity_heads"], manifest["assets"])
     home = app_home().resolve()
-    root = managed_asset_root()
+    root = managed_asset_root().resolve()
     root.mkdir(parents=True, exist_ok=True)
-    root = root.resolve()
     try:
         root.relative_to(home)
     except ValueError as exc:
         raise ValidationError("受管资产目录逃逸 MealCircuit 私人目录") from exc
-    for revision in revisions:
-        if revision.entity_kind != "asset":
-            continue
+    init_db()
+    with connect() as connection:
+        for descriptor, revision in bindings:
+            payload = revision.payload
+            local_by_id = connection.execute(
+                "SELECT id,sha256,media_type,extension,byte_count FROM managed_assets WHERE id=?",
+                (revision.entity_id,),
+            ).fetchone()
+            if local_by_id is not None and (
+                local_by_id["sha256"] != payload["sha256"]
+                or local_by_id["media_type"] != payload["media_type"]
+                or local_by_id["extension"] != payload["extension"]
+                or local_by_id["byte_count"] != payload["byte_count"]
+            ):
+                raise ValidationError(f"本机资产 {revision.entity_id} 的元数据与导入包不一致")
+            local_by_digest = connection.execute(
+                "SELECT id FROM managed_assets WHERE sha256=?", (payload["sha256"],)
+            ).fetchone()
+            if local_by_digest is not None and local_by_digest["id"] != revision.entity_id:
+                raise ValidationError(f"导入资产 {revision.entity_id} 的哈希已属于另一项本机资产")
+            local_head = connection.execute(
+                """SELECT r.payload_json FROM entity_heads h
+                   JOIN domain_revisions r ON r.revision_id=h.revision_id
+                   WHERE h.entity_id=? AND r.entity_kind='asset'""",
+                (revision.entity_id,),
+            ).fetchone()
+            if local_head is not None:
+                local_payload = json.loads(local_head["payload_json"])
+                if any(
+                    local_payload.get(field) != payload[field]
+                    for field in ("sha256", "media_type", "extension", "byte_count")
+                ):
+                    raise ValidationError(
+                        f"本机资产 {revision.entity_id} 的活动修订与导入包元数据不一致"
+                    )
+
+    for descriptor, revision in bindings:
         payload = revision.payload
-        validate_payload("asset", payload)
-        archive_path = payload.get("archive_path")
-        digest = payload.get("sha256")
-        extension = payload.get("extension")
-        if not isinstance(archive_path, str) or not isinstance(digest, str) or not isinstance(extension, str):
-            raise ValidationError("资产 revision 字段无效")
+        archive_path = descriptor["path"]
+        digest = descriptor["sha256"]
+        extension = payload["extension"]
         data = _read_member(archive, archive_path, MAX_ASSET_BYTES)
-        if _sha256_bytes(data) != digest:
+        if len(data) != descriptor["bytes"] or _sha256_bytes(data) != digest:
             raise ValidationError(f"资产哈希不一致：{archive_path}")
-        target = (root / f"{digest}{extension}").resolve()
-        if target.parent != root:
-            raise ValidationError("资产目标逃逸受管资产目录")
-        if target.exists() and _sha256_path(target) != digest:
+        expected_name = f"{digest}{extension}"
+        target = (root / expected_name).resolve()
+        if target.parent != root or target.name != expected_name:
+            raise ValidationError("资产路径逃逸受管目录")
+        if target.exists() and (
+            not target.is_file()
+            or target.stat().st_size != descriptor["bytes"]
+            or _sha256_path(target) != digest
+        ):
             raise ValidationError(f"本机资产冲突：{target}")
         if not target.exists():
-            temporary = target.with_suffix(target.suffix + ".tmp")
-            temporary.write_bytes(data)
-            os.replace(temporary, target)
-        relative = target.relative_to(home).as_posix()
+            fd, temporary_name = tempfile.mkstemp(prefix=f".{digest}.", suffix=".part", dir=root)
+            temporary = Path(temporary_name)
+            try:
+                with os.fdopen(fd, "wb") as stream:
+                    stream.write(data)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                if temporary.stat().st_size != descriptor["bytes"] or _sha256_path(temporary) != digest:
+                    raise ValidationError(f"导入资产校验失败：{revision.entity_id}")
+                os.replace(temporary, target)
+            finally:
+                temporary.unlink(missing_ok=True)
+        relative = target.relative_to(app_home()).as_posix()
         result[revision.entity_id] = relative
     return result
 
@@ -1347,8 +1674,17 @@ def _write_preferences(revisions: list[DomainRevision]) -> None:
 
 def _store_revision_only(connection: sqlite3.Connection, revision: DomainRevision) -> None:
     revision = _storage_revision(revision)
+    existing = connection.execute(
+        "SELECT * FROM domain_revisions WHERE revision_id=?", (revision.revision_id,)
+    ).fetchone()
+    if existing is not None:
+        if _row_revision(existing) != revision:
+            raise ValidationError(
+                f"revision ID 与本机已有不同内容冲突：{revision.revision_id}"
+            )
+        return
     connection.execute(
-        """INSERT OR IGNORE INTO domain_revisions(
+        """INSERT INTO domain_revisions(
                revision_id,entity_id,entity_kind,parent_revision_ids_json,payload_json,
                schema_version,author_device_id,deleted,created_at
            ) VALUES(?,?,?,?,?,?,?,?,?)""",
@@ -1442,12 +1778,13 @@ def apply_import(
 ) -> dict:
     with _exclusive_import_session():
         archive = Path(source).expanduser().resolve()
-        preview = preview_import(archive, recovery_key=recovery_key, mode=mode)
-        if not preview["ready"]:
-            raise ValidationError(f"导入存在冲突：{preview['conflicts']}")
-        with _home_import_transaction():
-            result = _apply_import_unprotected(archive, recovery_key=recovery_key, mode=mode)
-        return result
+        with _snapshot_import_source(archive) as snapshot:
+            preview = preview_import(snapshot, recovery_key=recovery_key, mode=mode)
+            if not preview["ready"]:
+                raise ValidationError(f"导入存在冲突：{preview['conflicts']}")
+            with _home_import_transaction():
+                result = _apply_import_unprotected(snapshot, recovery_key=recovery_key, mode=mode)
+            return result
 
 
 def _apply_import_unprotected(
@@ -1462,7 +1799,7 @@ def _apply_import_unprotected(
         manifest, revisions = _read_validated(plain_zip)
         heads = [_storage_revision(item) for item in _head_revisions(manifest, revisions)]
         with zipfile.ZipFile(plain_zip, "r") as archive:
-            asset_paths = _asset_paths(archive, revisions)
+            asset_paths = _asset_paths(archive, manifest, revisions)
         init_db()
         applied_preferences: list[DomainRevision] = []
         merge_conflicts = 0
@@ -1492,8 +1829,16 @@ def _apply_import_unprotected(
                 for remote in ordered_heads:
                     key = (remote.entity_kind, remote.entity_id)
                     head_row = connection.execute(
-                        "SELECT revision_id FROM entity_heads WHERE entity_id=?", (remote.entity_id,)
+                        "SELECT entity_kind,revision_id FROM entity_heads WHERE entity_id=?",
+                        (remote.entity_id,),
                     ).fetchone()
+                    if head_row is not None and head_row["entity_kind"] != remote.entity_kind:
+                        local = graph[head_row["revision_id"]]
+                        _record_import_conflict(
+                            connection, None, local, remote, ["$entity_kind"]
+                        )
+                        merge_conflicts += 1
+                        continue
                     if key in incoming_keys or head_row is None:
                         apply_materialized(remote)
                         enqueue_revision(connection, remote)

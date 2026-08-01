@@ -16,8 +16,10 @@ import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.NavigationRail
 import androidx.compose.material3.NavigationRailItem
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Snackbar
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
@@ -27,6 +29,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.saveable.rememberSaveableStateHolder
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
@@ -43,10 +46,13 @@ enum class Destination(val label: String, val icon: ImageVector) {
 @Composable
 fun MealCircuitApp(viewModel: MainViewModel) {
     var destination by rememberSaveable { mutableStateOf(Destination.TODAY) }
+    val destinationState = rememberSaveableStateHolder()
     val host = remember { SnackbarHostState() }
+    var snackbarIsError by remember { mutableStateOf(false) }
     val message by viewModel.message.collectAsState()
     LaunchedEffect(message) {
         message?.let {
+            snackbarIsError = it.isError
             host.showSnackbar(it.text)
             viewModel.dismissMessage()
         }
@@ -55,7 +61,17 @@ fun MealCircuitApp(viewModel: MainViewModel) {
         val expanded = maxWidth >= 720.dp
         Scaffold(
             topBar = { TopAppBar(title = { Text(destination.label) }) },
-            snackbarHost = { SnackbarHost(host) },
+            snackbarHost = {
+                SnackbarHost(host) { data ->
+                    Snackbar(
+                        snackbarData = data,
+                        containerColor = if (snackbarIsError) MaterialTheme.colorScheme.errorContainer
+                            else MaterialTheme.colorScheme.inverseSurface,
+                        contentColor = if (snackbarIsError) MaterialTheme.colorScheme.onErrorContainer
+                            else MaterialTheme.colorScheme.inverseOnSurface,
+                    )
+                }
+            },
             bottomBar = {
                 if (!expanded) NavigationBar {
                     Destination.entries.forEach { item ->
@@ -81,10 +97,12 @@ fun MealCircuitApp(viewModel: MainViewModel) {
                     }
                 }
                 Box(Modifier.weight(1f)) {
-                    when (destination) {
-                        Destination.TODAY -> TodayScreen(viewModel)
-                        Destination.PLANS -> PlansScreen(viewModel)
-                        Destination.ME -> MoreScreen(viewModel)
+                    destinationState.SaveableStateProvider(destination.name) {
+                        when (destination) {
+                            Destination.TODAY -> TodayScreen(viewModel)
+                            Destination.PLANS -> PlansScreen(viewModel)
+                            Destination.ME -> MoreScreen(viewModel)
+                        }
                     }
                 }
             }

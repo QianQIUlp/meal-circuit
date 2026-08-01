@@ -20,7 +20,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -77,8 +77,8 @@ private fun Metric(label: String, value: Int) {
 
 @Composable
 fun TodayScreen(viewModel: MainViewModel) {
-    var record by remember { mutableStateOf("") }
-    var editingRecordId by remember { mutableStateOf<String?>(null) }
+    var record by rememberSaveable { mutableStateOf("") }
+    var editingRecordId by rememberSaveable { mutableStateOf<String?>(null) }
     val records by viewModel.repository.observe(EntityKind.DAILY_RECORD).collectAsState(emptyList())
     val reviews by viewModel.repository.observe(EntityKind.DAILY_REVIEW).collectAsState(emptyList())
     val timezone by viewModel.timezone.collectAsState()
@@ -103,10 +103,12 @@ fun TodayScreen(viewModel: MainViewModel) {
             }
             Button(
                 onClick = {
-                    editingRecordId?.let { viewModel.updateDailyRecord(it, record) }
-                        ?: viewModel.addDailyRecord(record)
-                    editingRecordId = null
-                    record = ""
+                    val clearDraft = {
+                        editingRecordId = null
+                        record = ""
+                    }
+                    editingRecordId?.let { viewModel.updateDailyRecord(it, record, clearDraft) }
+                        ?: viewModel.addDailyRecord(record, clearDraft)
                 },
                 enabled = record.isNotBlank(),
             ) { Text(if (editingRecordId == null) "记下来" else "保存修改") }

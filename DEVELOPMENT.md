@@ -510,3 +510,24 @@
 - 根因与修复：GitHub Windows runner 的临时目录以 `RUNNER~1` 短路径提供，而 `Path.resolve()` 会返回 `runneradmin` 长路径。照片任务上下文先把已验证的相对受管路径转换成长路径绝对地址，AI 提交前的第二次受管目录校验再与短路径形式的数据目录做词法比较，因此误判为越界；现在验证后重新保存为受管相对路径，不放宽 UNC、重解析点或目录逃逸边界。三个路径断言改为按 `app_home()` / `db_path()` 的词法绝对路径契约比较，避免把同一目录的 8.3 与长路径别名误判为功能错误。
 - 验证：在 `C:\tmp\mc-win-019fb725` 的隔离 Python 3.11.9 与 3.13.5 上运行四个原失败用例，并补充断言确认照片生成上下文始终保留 `uploads/...` 相对路径；另运行相关受管媒体和原子恢复回归、`compileall`、`tools/release_check.py` 与 `git diff --check`。所有测试缓存通过 `PYTHONDONTWRITEBYTECODE=1` 禁止写入仓库。
 - 临时文件与剩余风险：未新增依赖或全局配置；测试日志与解释器仍集中在 `C:\tmp\mc-win-019fb725`。本轮不修改 `app_home()` 的词法路径实现，以免重新引入跟随 junction/reparse point 的安全风险；提交推送后仍需由 GitHub runner 的真实 `RUNNER~1` 环境完成最终确认。
+
+## 2026-08-01：Windows 隔离环境中的 Android 模拟器验收与安全加固
+
+- 目标：在不污染正式仓库和用户既有 Android 配置的前提下，于 Windows 上建立可一次性删除的完整 Android SDK、AVD、Gradle、Python 同步服务与报告环境；先于人工验收修复可复现的阻断、数据损坏风险和定向安全问题，并交付可直接安装运行的调试 APK。
+- 改动范围：修正 Android 的相机权限、表单状态、营养数字校验、时区容错、主线程 I/O、同步账户切换、冲突收敛、未知记录上限、资源元数据与路径、响应体大小、重试分类、Portable Data、二维码配对和密钥轮换恢复；增加 Room/同步/协议/恶意输入回归测试。AGP 的内部 UTP 宿主配置约束 Netty `4.1.136.Final` 与 Protobuf `3.25.5`，这些依赖不进入 APK 运行时。
+- 数据安全：同步账户切换或解除绑定只清理账户作用域状态，不删除领域记录或本地资源；冲突不能被后续写入绕过；资源下载使用受管规范路径、认证元数据、大小上限和原子替换；同步、AI 与导入响应均有流式上限；二维码配对要求用户手动输入的可信服务地址与二维码规范化地址完全一致后才发送密码；密钥轮换支持服务端已提交而本地尚未激活时的进程崩溃恢复。异常提示统一为中文。
+- 安全检查：按用户要求未调用 Codex Security。使用本地代码审计、恶意输入测试、仓库 `tools/dependency_check.py` 和官方 OSV Scanner `2.3.8` 的离线 Maven 数据库。初次报告的 14 个受影响坐标仅位于 AGP/UTP 宿主工具配置，未进入 `releaseRuntimeClasspath` 或 APK DEX；约束更新后扫描 329 个包实例，0 个漏洞包、0 条漏洞记录。在线 OSV API 曾因 TLS EOF 未返回结果，因此未把该失败当作“在线零漏洞”证据。
+- 自动验证：在临时源码副本中离线执行 `testDebugUnitTest assembleDebug lintDebug compileDebugAndroidTestKotlin connectedDebugAndroidTest`，构建成功；JVM 测试 16/16、真实模拟器仪器测试 14/14 通过。Lint 为 0 error、14 warning，其中 13 条是 `UseKtx` 风格建议，1 条 `ApplySharedPref` 对应故意使用同步 `commit()` 的密钥/身份故障关闭写入。AGP 还报告其 SDK XML 解析器最高理解 v3、已安装 SDK 元数据为 v4；未影响编译、安装或测试。
+- 真实运行：API 35 Google APIs x86_64 模拟器通过 WHPX 启动；最终 APK 完成冷启动、导航、相机授权与拒绝后存活、饮食记录保存后强停重启仍存在、食品库 `NaN` 输入即时拒绝且不能保存。隔离 Python 同步服务实测 Python 写入 → Android 拉取 → Android 写入 → Python 恢复，并检查数据库、资源、日志和备份中没有账户密码、恢复密钥、API Key 或明文测试标记。
+- 隔离位置：本轮所有 JDK、SDK、系统镜像、AVD、APK、构建输出、Gradle 缓存、OSV 数据库、Python venv、同步服务状态、日志、报告和截图都位于 `C:\tmp\mc-android-019fb725`。最终 APK 为 `final-validation-src-02\android\app\build\outputs\apk\debug\app-debug.apk`，大小 20,884,784 字节，SHA-256 为 `8B2CCEC88D12916A0B5B7F7BB04A4AAB744D928D1BD6C16895D2980A17E50604`；最终 OSV 报告为 `reports\osv-android-gradle-final-offline.json`。
+- 隔离复核：任务前后 `%USERPROFILE%\.android` 按“顶层文件名、长度、UTC 修改 ticks、文件 SHA-256”生成的清单摘要均为 `05241f9bb14d8265dba4a2ea19b5801598857177820eee84a7b02a3aa9796826`；正式仓库不存在 Android `.gradle`、`.kotlin`、`app/build`、APK、AAB、DEX、CLASS、lint/test 报告或 `local.properties` 残留。
+- 剩余风险：本轮覆盖一台 Windows 主机上的 API 35 x86_64 模拟器，不能等同于所有厂商 ROM、实体相机、低内存设备、弱网和 Play 商店签名分发；真正的外部同步服务证书、账号恢复和多实体设备矩阵仍需在对应生产环境验证。`_internal-unified-test-platform-*` 属于 AGP 内部配置名，升级 AGP 时必须保留依赖检查和 connected test 回归。
+- 用户用法：当前模拟器可继续安装并启动上述调试 APK 进行人工点击。验收结束后可要求“清理这次 Windows/Android 验收环境”，届时先停止临时模拟器和同步服务，再核对并删除明确的临时根，不触碰正式仓库或用户既有 `.android`。
+
+## 2026-08-01：Android 验收中止交接检查点
+
+- 状态：应用户要求立即停止继续扩展、修复和验收，并将现有成果提交为本地检查点；这不是 Android 最终验收结论。所有子任务均已中止或结束，本轮不推送分支、不创建或更新 PR，也未调用 Codex Security。
+- 当前验证：最新工作树通过 `python -m py_compile mealcircuit\portable.py sync_server\app.py tests\test_portable.py tests\test_sync_server.py`；临时源码副本 `C:\tmp\mc-android-019fb725\handoff-validation-src-10` 使用独立项目缓存 `handoff-project-cache-10` 离线执行 `compileDebugKotlin compileDebugUnitTestKotlin` 成功。更早的副本 09 曾通过 `testDebugUnitTest`，但它早于最后一轮同步、账户、服务端和冲突处理改动，不能代替最新全量验证。
+- 未完成验证：停止前没有针对最新代码重跑 Python 全量测试、`testDebugUnitTest assembleDebug lintDebug compileDebugAndroidTestKotlin connectedDebugAndroidTest`、最终 APK 构建/哈希、真实模拟器冷启动与跨客户端同步、在线依赖扫描和 CI；因此上一节的完整验收数字与 APK 只代表此前检查点，不代表当前提交。
+- 待接手重点：完成 AI 输入及全部来源的一致快照与提交前复核；验证未知记录满额轮转不会饿死队列或阻断 outbox；验证不同实体 kind 冲突与资源冲突在同步门内原子收敛；为永久缺失 blob 设置有界重试；为 `all_wifi` 资产补传调度不计费网络约束；复核并完成密钥轮换持久标记、分阶段恢复、登录/配对/注册回滚，以及服务端请求/密码资源限制、账户配额、轮换租约和全量重同步游标语义。
+- 隔离位置：新增的交接编译副本、缓存和 Python 字节码缓存仍全部位于 `C:\tmp\mc-android-019fb725`；模拟器及 adb 可能仍在运行。后续清理前应先重新枚举进程与路径，再只删除这个明确的临时根。

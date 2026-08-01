@@ -22,6 +22,7 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.mealcircuit.app.sync.SecretVault
+import org.mealcircuit.app.sync.readBoundedText
 import java.util.Base64
 import java.util.concurrent.TimeUnit
 
@@ -43,10 +44,10 @@ class AiClient(
         imageMediaType: String? = null,
     ): JsonObject = withContext(Dispatchers.IO) {
         if (configuration.provider == AiProvider.DEEPSEEK && image != null) {
-            error("DeepSeek text API cannot process MealCircuit photo tasks")
+            error("DeepSeek 文本接口无法处理 MealCircuit 照片任务")
         }
         val key = vault.get("ai.${configuration.provider.name.lowercase()}")?.decodeToString()
-            ?: error("API key is not configured on this device")
+            ?: error("本设备尚未配置 API Key")
         val prompt = "Return only the complete MealCircuit $kind JSON result for this context:\n$context"
         val outputSchema = schemaFromExample(context.getValue("result_schema"), "result")
         val (url, headers, body) = when (configuration.provider) {
@@ -140,8 +141,8 @@ class AiClient(
             post(body.toString().toRequestBody("application/json".toMediaType()))
         }.build()
         client.newCall(request).execute().use { response ->
-            val responseBody = response.body?.string().orEmpty()
-            require(response.isSuccessful) { "AI provider returned HTTP ${response.code}" }
+            require(response.isSuccessful) { "AI 服务返回 HTTP ${response.code}" }
+            val responseBody = response.body?.readBoundedText(MAX_AI_RESPONSE_BYTES, "AI 服务响应").orEmpty()
             parseProviderResult(configuration.provider, json.parseToJsonElement(responseBody).jsonObject)
         }
     }
@@ -162,7 +163,7 @@ class AiClient(
                 .flatMap { it.jsonObject["content"]?.jsonArray.orEmpty() }
                 .first { it.jsonObject["type"]?.jsonPrimitive?.content == "output_text" }
                 .jsonObject.getValue("text").jsonPrimitive.content
-            AiProvider.ANTHROPIC -> error("handled above")
+            AiProvider.ANTHROPIC -> error("Anthropic 请求已在上方处理")
             AiProvider.DEEPSEEK -> response.getValue("choices").jsonArray.first().jsonObject
                 .getValue("message").jsonObject.getValue("content").jsonPrimitive.content
         }
@@ -203,6 +204,10 @@ class AiClient(
                 else put("minimum", 0)
             }
         }
-        else -> error("unsupported schema example")
+        else -> error("不支持的结构示例")
+    }
+
+    companion object {
+        private const val MAX_AI_RESPONSE_BYTES = 4 * 1024 * 1024
     }
 }

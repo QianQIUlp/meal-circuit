@@ -30,7 +30,7 @@ object ResultValidator {
                 nutrition(value.getValue("per_serving_nutrition").jsonObject)
                 textArray(value, "gaps"); textArray(value, "risks"); textArray(value, "minimal_adjustments")
             }
-            else -> error("Unknown task kind")
+            else -> error("未知任务类型")
         }
         return value
     }

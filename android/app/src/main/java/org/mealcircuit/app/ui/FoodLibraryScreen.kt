@@ -11,6 +11,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.OutlinedTextField
@@ -19,9 +20,10 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import org.mealcircuit.app.MainViewModel
 import org.mealcircuit.app.domain.EntityKind
@@ -34,14 +36,25 @@ import kotlinx.serialization.json.jsonArray
 
 @Composable
 fun FoodLibraryScreen(viewModel: MainViewModel) {
-    var name by remember { mutableStateOf("") }
-    var notes by remember { mutableStateOf("") }
-    var energy by remember { mutableStateOf("") }
-    var protein by remember { mutableStateOf("") }
-    var carbs by remember { mutableStateOf("") }
-    var fat by remember { mutableStateOf("") }
-    var packagePhoto by remember { mutableStateOf<Uri?>(null) }
-    var selectedId by remember { mutableStateOf<String?>(null) }
+    var name by rememberSaveable { mutableStateOf("") }
+    var notes by rememberSaveable { mutableStateOf("") }
+    var energy by rememberSaveable { mutableStateOf("") }
+    var protein by rememberSaveable { mutableStateOf("") }
+    var carbs by rememberSaveable { mutableStateOf("") }
+    var fat by rememberSaveable { mutableStateOf("") }
+    var packagePhoto by rememberSaveable { mutableStateOf<Uri?>(null) }
+    var selectedId by rememberSaveable { mutableStateOf<String?>(null) }
+    val energyError = nutritionNumberError(energy)
+    val proteinError = nutritionNumberError(protein)
+    val carbsError = nutritionNumberError(carbs)
+    val fatError = nutritionNumberError(fat)
+    val nutritionValid = listOf(energyError, proteinError, carbsError, fatError).all { it == null }
+
+    fun clearForm() {
+        name = ""; notes = ""; energy = ""; protein = ""; carbs = ""; fat = ""
+        packagePhoto = null; selectedId = null
+    }
+
     val foods by viewModel.repository.observe(EntityKind.FOOD_ITEM).collectAsState(emptyList())
     val packagePicker = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
         packagePhoto = uri
@@ -59,14 +72,38 @@ fun FoodLibraryScreen(viewModel: MainViewModel) {
         androidx.compose.foundation.layout.Row(
             Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)
         ) {
-            OutlinedTextField(energy, { energy = it }, Modifier.weight(1f), label = { Text("kcal") })
-            OutlinedTextField(protein, { protein = it }, Modifier.weight(1f), label = { Text("蛋白质 g") })
+            OutlinedTextField(
+                energy, { energy = it }, Modifier.weight(1f),
+                label = { Text("kcal") }, singleLine = true,
+                isError = energyError != null,
+                supportingText = energyError?.let { error -> { Text(error) } },
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+            )
+            OutlinedTextField(
+                protein, { protein = it }, Modifier.weight(1f),
+                label = { Text("蛋白质 g") }, singleLine = true,
+                isError = proteinError != null,
+                supportingText = proteinError?.let { error -> { Text(error) } },
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+            )
         }
         androidx.compose.foundation.layout.Row(
             Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)
         ) {
-            OutlinedTextField(carbs, { carbs = it }, Modifier.weight(1f), label = { Text("碳水 g") })
-            OutlinedTextField(fat, { fat = it }, Modifier.weight(1f), label = { Text("脂肪 g") })
+            OutlinedTextField(
+                carbs, { carbs = it }, Modifier.weight(1f),
+                label = { Text("碳水 g") }, singleLine = true,
+                isError = carbsError != null,
+                supportingText = carbsError?.let { error -> { Text(error) } },
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+            )
+            OutlinedTextField(
+                fat, { fat = it }, Modifier.weight(1f),
+                label = { Text("脂肪 g") }, singleLine = true,
+                isError = fatError != null,
+                supportingText = fatError?.let { error -> { Text(error) } },
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+            )
         }
         androidx.compose.material3.OutlinedButton(
             onClick = {
@@ -76,19 +113,17 @@ fun FoodLibraryScreen(viewModel: MainViewModel) {
         ) { Text(if (packagePhoto == null) "选择包装照片（可选）" else "已选择新包装照片") }
         Button(
             onClick = {
-                selectedId?.let { viewModel.updateFood(it, name, notes, energy, protein, carbs, fat, packagePhoto) }
-                    ?: viewModel.addFood(name, notes, energy, protein, carbs, fat, packagePhoto)
-                name = ""; notes = ""; energy = ""; protein = ""; carbs = ""; fat = ""
-                packagePhoto = null; selectedId = null
+                selectedId?.let {
+                    viewModel.updateFood(it, name, notes, energy, protein, carbs, fat, packagePhoto, onSuccess = ::clearForm)
+                } ?: viewModel.addFood(name, notes, energy, protein, carbs, fat, packagePhoto, onSuccess = ::clearForm)
             },
-            enabled = name.isNotBlank(),
+            enabled = name.isNotBlank() && nutritionValid,
         ) { Text(if (selectedId == null) "保存食品" else "保存新修订") }
         selectedId?.let { id ->
             androidx.compose.material3.OutlinedButton(
                 onClick = {
                     viewModel.deleteFood(id)
-                    selectedId = null; name = ""; notes = ""; energy = ""; protein = ""; carbs = ""; fat = ""
-                    packagePhoto = null
+                    clearForm()
                 },
             ) { Text("软删除此食品") }
         }
@@ -113,4 +148,10 @@ fun FoodLibraryScreen(viewModel: MainViewModel) {
             Text("此食品保留 $count 条历史事件；同步冲突会保留 sibling revisions。")
         }
     }
+}
+
+private fun nutritionNumberError(value: String): String? {
+    if (value.isBlank()) return null
+    val number = value.trim().toDoubleOrNull()
+    return if (number != null && number.isFinite() && number >= 0.0) null else "请输入非负数字"
 }

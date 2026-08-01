@@ -2,12 +2,12 @@ package org.mealcircuit.app.ui
 
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.widthIn
-import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
@@ -21,7 +21,8 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.saveable.rememberSaveableStateHolder
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
@@ -38,27 +39,33 @@ private enum class MoreTab(val label: String) {
     SETTINGS("设置"), SYNC("同步"), CONFLICTS("冲突")
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 fun MoreScreen(viewModel: MainViewModel) {
-    var tab by remember { mutableStateOf(MoreTab.OVERVIEW) }
+    var tab by rememberSaveable { mutableStateOf(MoreTab.OVERVIEW) }
+    val tabState = rememberSaveableStateHolder()
     Column(Modifier.fillMaxSize()) {
-        Row(
-            Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 16.dp, vertical = 8.dp),
+        FlowRow(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
             horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalArrangement = Arrangement.spacedBy(4.dp),
+            maxItemsInEachRow = 3,
         ) {
             MoreTab.entries.forEach { item ->
                 FilterChip(selected = tab == item, onClick = { tab = item }, label = { Text(item.label) })
             }
         }
-        when (tab) {
-            MoreTab.OVERVIEW -> ProfileOverview(viewModel)
-            MoreTab.TASKS -> CaptureScreen(viewModel)
-            MoreTab.FOODS -> FoodLibraryScreen(viewModel)
-            MoreTab.HISTORY -> HistoryScreen(viewModel)
-            MoreTab.MEMORY -> MemoryScreen(viewModel)
-            MoreTab.SETTINGS -> SettingsScreen(viewModel)
-            MoreTab.SYNC -> SyncSettingsScreen(viewModel)
-            MoreTab.CONFLICTS -> ConflictScreen(viewModel)
+        tabState.SaveableStateProvider(tab.name) {
+            when (tab) {
+                MoreTab.OVERVIEW -> ProfileOverview(viewModel)
+                MoreTab.TASKS -> CaptureScreen(viewModel)
+                MoreTab.FOODS -> FoodLibraryScreen(viewModel)
+                MoreTab.HISTORY -> HistoryScreen(viewModel)
+                MoreTab.MEMORY -> MemoryScreen(viewModel)
+                MoreTab.SETTINGS -> SettingsScreen(viewModel)
+                MoreTab.SYNC -> SyncSettingsScreen(viewModel)
+                MoreTab.CONFLICTS -> ConflictScreen(viewModel)
+            }
         }
     }
 }
@@ -128,10 +135,10 @@ private fun HistoryScreen(viewModel: MainViewModel) {
 
 @Composable
 private fun MemoryScreen(viewModel: MainViewModel) {
-    var value by remember { mutableStateOf("") }
-    var adjustment by remember { mutableStateOf("") }
-    var selectedMemory by remember { mutableStateOf<String?>(null) }
-    var selectedAdjustment by remember { mutableStateOf<String?>(null) }
+    var value by rememberSaveable { mutableStateOf("") }
+    var adjustment by rememberSaveable { mutableStateOf("") }
+    var selectedMemory by rememberSaveable { mutableStateOf<String?>(null) }
+    var selectedAdjustment by rememberSaveable { mutableStateOf<String?>(null) }
     val memories by viewModel.repository.observe(EntityKind.MEMORY).collectAsState(emptyList())
     val adjustments by viewModel.repository.observe(EntityKind.ADJUSTMENT).collectAsState(emptyList())
     Column(
@@ -140,7 +147,7 @@ private fun MemoryScreen(viewModel: MainViewModel) {
     ) {
         SectionTitle("长期记忆与调整", "写下稳定偏好、肠胃触发或当前约束。")
         OutlinedTextField(value, { value = it }, Modifier.fillMaxWidth(), label = { Text("新增长期记忆") }, minLines = 3)
-        Button(onClick = { viewModel.addMemory(value); value = "" }, enabled = value.isNotBlank()) { Text("保存记忆") }
+        Button(onClick = { viewModel.addMemory(value) { value = "" } }, enabled = value.isNotBlank()) { Text("保存记忆") }
         RecordList(memories, "没有长期记忆", "已验证的偏好会进入后续上下文。") { selectedMemory = it.entityId }
         selectedMemory?.let { id ->
             androidx.compose.material3.OutlinedButton(onClick = { viewModel.setActive(EntityKind.MEMORY, id, false); selectedMemory = null }) {
@@ -150,7 +157,7 @@ private fun MemoryScreen(viewModel: MainViewModel) {
         SectionTitle("当前调整")
         OutlinedTextField(adjustment, { adjustment = it }, Modifier.fillMaxWidth(), label = { Text("当前有效调整") }, minLines = 2)
         Button(
-            onClick = { viewModel.addAdjustment(adjustment); adjustment = "" },
+            onClick = { viewModel.addAdjustment(adjustment) { adjustment = "" } },
             enabled = adjustment.isNotBlank(),
         ) { Text("保存调整") }
         RecordList(adjustments, "没有当前调整", "桌面端或导入的数据会同步显示。") { selectedAdjustment = it.entityId }

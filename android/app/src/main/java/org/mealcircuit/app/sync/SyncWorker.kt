@@ -12,29 +12,39 @@ import androidx.work.WorkManager
 import androidx.work.WorkerParameters
 import java.time.Duration
 import java.security.GeneralSecurityException
+import java.io.IOException
+import kotlinx.coroutines.CancellationException
 import kotlinx.serialization.SerializationException
 
 enum class SyncFailureDisposition { RETRY, FAILURE }
 
+internal val SYNC_EXISTING_WORK_POLICY = ExistingWorkPolicy.APPEND_OR_REPLACE
+
 fun syncFailureDisposition(error: Throwable): SyncFailureDisposition = when (error) {
     is IllegalArgumentException, is IllegalStateException, is SecurityException,
     is GeneralSecurityException, is SerializationException -> SyncFailureDisposition.FAILURE
-    is SyncHttpException -> if (error.status in setOf(401, 403, 409, 426)) {
-        SyncFailureDisposition.FAILURE
-    } else {
+    is SyncHttpException -> if (error.status in setOf(408, 425, 429) || error.status >= 500) {
         SyncFailureDisposition.RETRY
-    }
-    else -> SyncFailureDisposition.RETRY
+    } else SyncFailureDisposition.FAILURE
+    is IOException -> SyncFailureDisposition.RETRY
+    else -> SyncFailureDisposition.FAILURE
 }
 
 class SyncWorker(context: Context, parameters: WorkerParameters) : CoroutineWorker(context, parameters) {
     override suspend fun doWork(): Result {
         val application = applicationContext as org.mealcircuit.app.MealCircuitApplication
-        val engine = application.syncEngineOrNull() ?: return Result.success()
-        return runCatching { engine.run() }.fold(
-            onSuccess = { Result.success() },
-            onFailure = { error -> if (syncFailureDisposition(error) == SyncFailureDisposition.RETRY) Result.retry() else Result.failure() },
-        )
+        return try {
+            val summary = application.runSync() ?: return Result.success()
+            when {
+                summary.transientAssetFailures > 0 -> Result.retry()
+                summary.permanentAssetFailures > 0 -> Result.failure()
+                else -> Result.success()
+            }
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: Throwable) {
+            if (syncFailureDisposition(error) == SyncFailureDisposition.RETRY) Result.retry() else Result.failure()
+        }
     }
 
     companion object {
@@ -47,7 +57,7 @@ class SyncWorker(context: Context, parameters: WorkerParameters) : CoroutineWork
             val request = buildRequest()
             WorkManager.getInstance(context).enqueueUniqueWork(
                 "mealcircuit-sync",
-                ExistingWorkPolicy.KEEP,
+                SYNC_EXISTING_WORK_POLICY,
                 request,
             )
         }

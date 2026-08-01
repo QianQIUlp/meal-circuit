@@ -26,6 +26,10 @@ import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import org.mealcircuit.app.data.MaterializedRecordEntity
+import java.time.Instant
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
+import java.util.Locale
 
 @Composable
 fun SectionTitle(title: String, supporting: String? = null) {
@@ -82,11 +86,33 @@ fun RecordList(
                 ) {
                     Column(Modifier.weight(1f)) {
                         Text(title, maxLines = 2, fontWeight = FontWeight.Medium)
-                        Text(record.updatedAt, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Text(formatLocalTimestamp(record.updatedAt), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
-                    Text(record.entityKind.replace('_', ' '), style = MaterialTheme.typography.labelMedium)
+                    Text(entityKindLabel(record.entityKind), style = MaterialTheme.typography.labelMedium)
                 }
             }
         }
     }
+}
+
+private fun formatLocalTimestamp(timestamp: String): String = runCatching {
+    Instant.parse(timestamp).atZone(ZoneId.systemDefault())
+        .format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm", Locale.getDefault()))
+}.getOrDefault(timestamp)
+
+private fun entityKindLabel(kind: String): String = when (kind) {
+    "task" -> "任务"
+    "task_input" -> "任务输入"
+    "analysis_result" -> "分析结果"
+    "correction" -> "校正"
+    "food_item" -> "食品"
+    "daily_record" -> "饮食记录"
+    "checkin_day" -> "每日状态"
+    "checkin_draft" -> "状态草稿"
+    "daily_review" -> "每日复盘"
+    "memory" -> "长期记忆"
+    "adjustment" -> "当前调整"
+    "preferences" -> "偏好设置"
+    "asset" -> "资源"
+    else -> "其他记录"
 }

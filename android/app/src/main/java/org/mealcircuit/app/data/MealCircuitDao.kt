@@ -59,11 +59,14 @@ interface MealCircuitDao {
     @Query("SELECT * FROM sync_outbox WHERE opId=:opId")
     suspend fun outbox(opId: String): SyncOutboxEntity?
 
-    @Query("SELECT * FROM sync_outbox WHERE entityId=:entityId AND state IN ('pending','sending') ORDER BY localSequence DESC LIMIT 1")
+    @Query("SELECT * FROM sync_outbox WHERE entityId=:entityId AND state IN ('pending','sending','conflict') ORDER BY localSequence DESC LIMIT 1")
     suspend fun pendingForEntity(entityId: String): SyncOutboxEntity?
 
     @Query("DELETE FROM sync_outbox WHERE opId=:opId")
     suspend fun deleteOutbox(opId: String)
+
+    @Query("DELETE FROM sync_outbox WHERE entityId=:entityId AND state='conflict'")
+    suspend fun deleteConflictOutbox(entityId: String)
 
     @Query("UPDATE sync_outbox SET remoteId=:remoteId,encryptedEnvelope=:envelope,updatedAt=:updatedAt WHERE opId=:opId")
     suspend fun prepareOutbox(opId: String, remoteId: String, envelope: String, updatedAt: String)
@@ -98,6 +101,9 @@ interface MealCircuitDao {
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun putUnknown(value: UnknownEntity)
 
+    @Query("SELECT * FROM sync_unknown_entities WHERE remoteId=:remoteId")
+    suspend fun unknown(remoteId: String): UnknownEntity?
+
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun putAsset(value: ManagedAssetEntity)
 
@@ -131,9 +137,36 @@ interface MealCircuitDao {
     @Query("SELECT COUNT(*) FROM sync_unknown_entities")
     suspend fun unknownCount(): Int
 
+    @Query("SELECT COUNT(*) FROM sync_unknown_entities")
+    fun observeUnknownCount(): Flow<Int>
+
+    @Query("SELECT * FROM sync_unknown_entities ORDER BY updatedAt,remoteId")
+    suspend fun unknownEntities(): List<UnknownEntity>
+
+    @Query("SELECT * FROM sync_unknown_entities ORDER BY updatedAt,remoteId LIMIT :limit")
+    suspend fun unknownEntities(limit: Int): List<UnknownEntity>
+
+    @Query("SELECT COALESCE(SUM(length(CAST(encryptedEnvelope AS BLOB))),0) FROM sync_unknown_entities")
+    suspend fun unknownByteCount(): Long
+
+    @Query("SELECT COALESCE(MAX(length(CAST(encryptedEnvelope AS BLOB))),0) FROM sync_unknown_entities")
+    suspend fun unknownMaxByteCount(): Long
+
+    @Query("DELETE FROM sync_unknown_entities WHERE remoteId=:remoteId")
+    suspend fun deleteUnknown(remoteId: String)
+
     @Query("DELETE FROM sync_outbox")
     suspend fun clearOutbox()
 
     @Query("DELETE FROM sync_shadow")
     suspend fun clearShadows()
+
+    @Query("DELETE FROM sync_conflicts")
+    suspend fun clearConflicts()
+
+    @Query("DELETE FROM sync_unknown_entities")
+    suspend fun clearUnknownEntities()
+
+    @Query("UPDATE entity_heads SET conflicted=0 WHERE conflicted=1")
+    suspend fun clearHeadConflicts()
 }
