@@ -35,6 +35,7 @@ import org.mealcircuit.app.ai.AiClient
 import org.mealcircuit.app.ai.AiProvider
 import org.mealcircuit.app.data.ManagedAssetEntity
 import org.mealcircuit.app.data.MaterializedRecordEntity
+import org.mealcircuit.app.data.EntityHeadEntity
 import org.mealcircuit.app.data.DomainRepository
 import org.mealcircuit.app.domain.DomainRevision
 import org.mealcircuit.app.domain.EntityKind
@@ -85,6 +86,13 @@ private data class TaskGenerationSnapshot(
     val task: MaterializedRecordEntity,
     val inputHeadRevisionId: String,
     val taskHeadRevisionId: String,
+    val recentRecords: List<MaterializedRecordEntity>,
+    val recentCheckins: List<MaterializedRecordEntity>,
+    val foodLibrary: List<MaterializedRecordEntity>,
+    val memories: List<MaterializedRecordEntity>,
+    val adjustments: List<MaterializedRecordEntity>,
+    val domainPreferences: List<MaterializedRecordEntity>,
+    val sourceHeads: List<EntityHeadEntity>,
 )
 
 internal fun canReuseManagedAsset(
@@ -870,16 +878,44 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun generateLatestTask() = launchAction("任务分析已保存到本机", actionKey = "ai") {
+        val today = LocalDate.now(currentZoneId())
+        val start = today.minusDays(13)
         val snapshot = repository.mutateTransaction {
             val capturedInput = records(EntityKind.TASK_INPUT).firstOrNull() ?: error("没有任务输入")
             val capturedInputPayload = Json.parseToJsonElement(capturedInput.payloadJson).jsonObject
             val capturedTaskId = capturedInputPayload.getValue("task_id").jsonPrimitive.content
             val capturedTask = record(capturedTaskId) ?: error("任务主体缺失")
+            val capturedRecentRecords = records(EntityKind.DAILY_RECORD).filter { record ->
+                runCatching { LocalDate.parse(Json.parseToJsonElement(record.payloadJson).jsonObject
+                    .getValue("record_date").jsonPrimitive.content) in start..today }.getOrDefault(false)
+            }
+            val capturedRecentCheckins = records(EntityKind.CHECKIN_DAY).filter { record ->
+                runCatching { LocalDate.parse(Json.parseToJsonElement(record.payloadJson).jsonObject
+                    .getValue("checkin").jsonObject.getValue("checkin_date").jsonPrimitive.content) in start..today }
+                    .getOrDefault(false) && record.publishedCheckinPayload() != null
+            }
+            val capturedFoodLibrary = records(EntityKind.FOOD_ITEM).filterNot { it.deleted }
+            val capturedMemories = records(EntityKind.MEMORY).filter { it.activePayload() }
+            val capturedAdjustments = records(EntityKind.ADJUSTMENT).filter { it.activePayload() }
+            val capturedPreferences = records(EntityKind.PREFERENCES)
+            val sourceIds = setOf(capturedTaskId, capturedInput.entityId) +
+                capturedRecentRecords.map { it.entityId } + capturedRecentCheckins.map { it.entityId } +
+                capturedFoodLibrary.map { it.entityId } + capturedMemories.map { it.entityId } +
+                capturedAdjustments.map { it.entityId } + capturedPreferences.map { it.entityId }
+            val capturedHeads = heads().filter { it.entityId in sourceIds }
+            require(capturedHeads.map { it.entityId }.toSet() == sourceIds) { "任务来源版本信息不完整" }
             TaskGenerationSnapshot(
                 input = capturedInput,
                 task = capturedTask,
                 inputHeadRevisionId = requireNotNull(head(capturedInput.entityId)) { "任务输入版本缺失" }.revisionId,
                 taskHeadRevisionId = requireNotNull(head(capturedTaskId)) { "任务版本缺失" }.revisionId,
+                recentRecords = capturedRecentRecords,
+                recentCheckins = capturedRecentCheckins,
+                foodLibrary = capturedFoodLibrary,
+                memories = capturedMemories,
+                adjustments = capturedAdjustments,
+                domainPreferences = capturedPreferences,
+                sourceHeads = capturedHeads,
             )
         }
         val input = snapshot.input
@@ -890,31 +926,17 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val taskRow = taskPayload.getValue("task").jsonObject
         if (taskRow["status"]?.jsonPrimitive?.content == "completed") error("最新任务已完成")
         val taskType = taskRow.getValue("type").jsonPrimitive.content
-        val today = LocalDate.now(currentZoneId())
-        val start = today.minusDays(13)
-        val recentRecords = repository.records(EntityKind.DAILY_RECORD).filter { record ->
-            runCatching { LocalDate.parse(Json.parseToJsonElement(record.payloadJson).jsonObject
-                .getValue("record_date").jsonPrimitive.content) in start..today }.getOrDefault(false)
-        }
-        val recentCheckins = repository.records(EntityKind.CHECKIN_DAY).filter { record ->
-            runCatching { LocalDate.parse(Json.parseToJsonElement(record.payloadJson).jsonObject
-                .getValue("checkin").jsonObject.getValue("checkin_date").jsonPrimitive.content) in start..today }
-                .getOrDefault(false) && record.publishedCheckinPayload() != null
-        }
-        val foodLibrary = repository.records(EntityKind.FOOD_ITEM).filterNot { it.deleted }
-        val memories = repository.records(EntityKind.MEMORY).filter { it.activePayload() }
-        val adjustments = repository.records(EntityKind.ADJUSTMENT).filter { it.activePayload() }
-        val domainPreferences = repository.records(EntityKind.PREFERENCES)
+        val recentRecords = snapshot.recentRecords
+        val recentCheckins = snapshot.recentCheckins
+        val foodLibrary = snapshot.foodLibrary
+        val memories = snapshot.memories
+        val adjustments = snapshot.adjustments
+        val domainPreferences = snapshot.domainPreferences
         val settings = domainPreferences.preferenceContent("settings")?.let {
             runCatching { Json.parseToJsonElement(it).jsonObject }.getOrNull()
         }
         val doctrine = domainPreferences.preferenceContent("doctrine").orEmpty()
-        val source = sourceSnapshot(
-            setOf(taskId, input.entityId) + recentRecords.map { it.entityId } +
-                recentCheckins.map { it.entityId } + foodLibrary.map { it.entityId } +
-                memories.map { it.entityId } + adjustments.map { it.entityId } +
-                domainPreferences.map { it.entityId }
-        )
+        val source = sourceSnapshot(snapshot.sourceHeads)
         val context = buildJsonObject {
             put("task", taskRow)
             put("task_input", inputPayload)
@@ -955,6 +977,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             }
             require(head(taskId)?.revisionId == snapshot.taskHeadRevisionId) {
                 "任务在分析期间已变化，请重新生成"
+            }
+            for (headRow in snapshot.sourceHeads) {
+                if (headRow.entityId == input.entityId || headRow.entityId == taskId) continue
+                require(head(headRow.entityId)?.revisionId == headRow.revisionId) {
+                    "分析期间相关数据已变化，请重新生成"
+                }
             }
             val currentInput = requireNotNull(record(input.entityId)) { "任务输入已不存在" }
             val currentTask = requireNotNull(record(taskId)) { "任务主体已不存在" }
@@ -1090,11 +1118,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 })
             }
         }
-        val source = sourceSnapshot(
-            records.map { it.entityId }.toSet() + checkins.map { it.entityId } + foods.map { it.entityId } +
-                memories.map { it.entityId } + adjustments.map { it.entityId } + preferences.map { it.entityId } +
-                previousReviews.map { it.entityId }
-        )
+        val sourceIds = records.map { it.entityId }.toSet() + checkins.map { it.entityId } + foods.map { it.entityId } +
+            memories.map { it.entityId } + adjustments.map { it.entityId } + preferences.map { it.entityId } +
+            previousReviews.map { it.entityId }
+        val source = sourceSnapshot(repository.heads().filter { it.entityId in sourceIds })
         val context = buildJsonObject {
             put("recent_days", 14)
             put("daily_review", targetReview.getValue("review"))
@@ -1245,8 +1272,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         SyncWorker.enqueue(getApplication())
     }
 
-    private suspend fun sourceSnapshot(entityIds: Set<String>) = buildJsonArray {
-        repository.heads().filter { it.entityId in entityIds }.forEach { head ->
+    private fun sourceSnapshot(heads: List<EntityHeadEntity>) = buildJsonArray {
+        heads.forEach { head ->
             add(buildJsonObject {
                 put("entity_id", head.entityId); put("entity_kind", head.entityKind); put("revision_id", head.revisionId)
             })

@@ -38,10 +38,13 @@ import org.mealcircuit.app.portable.requirePortableAssetReferences
 import org.mealcircuit.app.portable.validatePortableRevisionGraph
 import org.mealcircuit.app.sync.AccountCipher
 import org.mealcircuit.app.sync.SyncBudget
+import org.mealcircuit.app.sync.PermanentAssetException
 import org.mealcircuit.app.sync.classifyManagedAssetsByReachability
 import org.mealcircuit.app.sync.referencedAssetIds
 import org.mealcircuit.app.sync.shouldPauseSyncForUnknownCount
+import org.mealcircuit.app.sync.shouldEvictUnknown
 import org.mealcircuit.app.sync.allowsAssetDownload
+import org.mealcircuit.app.sync.shouldDeferAssetTransfer
 import org.mealcircuit.app.ui.visibleCheckinInput
 import org.mealcircuit.app.sync.formatRecoveryKey
 import org.mealcircuit.app.sync.isRevisionDescendant
@@ -323,7 +326,7 @@ class DomainContractTest {
 
     @Test
     fun backgroundSyncRetriesOnlyTransientFailures() {
-        listOf(401, 403, 409, 413, 422, 426).forEach { status ->
+        listOf(401, 403, 404, 409, 413, 422, 426).forEach { status ->
             assertEquals(
                 "HTTP $status must not be retried",
                 SyncFailureDisposition.FAILURE,
@@ -340,6 +343,14 @@ class DomainContractTest {
         assertEquals(SyncFailureDisposition.RETRY, syncFailureDisposition(java.io.IOException("network")))
         assertEquals(SyncFailureDisposition.FAILURE, syncFailureDisposition(IllegalStateException("schema mismatch")))
         assertEquals(SyncFailureDisposition.FAILURE, syncFailureDisposition(javax.crypto.AEADBadTagException("tampered")))
+        assertEquals(
+            SyncFailureDisposition.FAILURE,
+            syncFailureDisposition(PermanentAssetException("资源 asset_x 缺少分块 2")),
+        )
+        assertEquals(
+            SyncFailureDisposition.FAILURE,
+            syncFailureDisposition(PermanentAssetException("资源 asset_x 与认证元数据不一致")),
+        )
     }
 
     @Test
@@ -666,16 +677,36 @@ class DomainContractTest {
         assertEquals(0, full.addedThisRun)
         runCatching { full.reserve(isNew = true) }
             .onSuccess { error("new unknown row was accepted above the storage cap") }
+        assertTrue(!full.tryReserve(isNew = true))
 
         val perRun = SyncBudget(storedAtStart = 0, addedThisRun = 500)
         perRun.reserve(isNew = false)
         runCatching { perRun.reserve(isNew = true) }
             .onSuccess { error("new unknown row was accepted above the per-run cap") }
+        assertTrue(!perRun.tryReserve(isNew = true))
+
+        val available = SyncBudget(storedAtStart = 1_999)
+        assertTrue(available.tryReserve(isNew = true))
+        assertEquals(1, available.addedThisRun)
+        assertTrue(!available.tryReserve(isNew = true))
 
         assertTrue(allowsAssetDownload("on_demand", unmetered = false, includeOnDemandMedia = true))
         assertTrue(allowsAssetDownload("all_wifi", unmetered = false, includeOnDemandMedia = true))
         assertTrue(!allowsAssetDownload("all_wifi", unmetered = false, includeOnDemandMedia = false))
         assertTrue(allowsAssetDownload("all_wifi", unmetered = true, includeOnDemandMedia = false))
+
+        assertTrue(shouldDeferAssetTransfer("all_wifi", unmetered = false, hasPendingAssets = true))
+        assertTrue(!shouldDeferAssetTransfer("all_wifi", unmetered = true, hasPendingAssets = true))
+        assertTrue(!shouldDeferAssetTransfer("all_wifi", unmetered = false, hasPendingAssets = false))
+        assertTrue(!shouldDeferAssetTransfer("all", unmetered = false, hasPendingAssets = true))
+        assertTrue(!shouldDeferAssetTransfer("on_demand", unmetered = false, hasPendingAssets = true))
+    }
+
+    @Test
+    fun unknownReprocessAttemptsAreBoundedBeforeEviction() {
+        assertTrue(!shouldEvictUnknown(9))
+        assertTrue(shouldEvictUnknown(10))
+        assertTrue(shouldEvictUnknown(99))
     }
 
     @Test
@@ -709,6 +740,12 @@ class DomainContractTest {
         assertEquals(1, transient.transientFailures)
         assertEquals(0, transient.permanentFailures)
 
+        val missing = safelyProcessAssets(listOf(asset("asset_missing")), mutableListOf()) {
+            throw PermanentAssetException("资源 asset_missing 缺少分块 0")
+        }
+        assertEquals(0, missing.transientFailures)
+        assertEquals(1, missing.permanentFailures)
+
         val cancelledVisits = mutableListOf<String>()
         val cancellation = runCatching {
             safelyProcessAssets(assets, mutableListOf()) { value ->
@@ -733,11 +770,13 @@ class DomainContractTest {
         assertTrue(runCatching {
             perRun.reserve(isNew = true, previousBytes = 0, newBytes = 1)
         }.isFailure)
+        assertTrue(!perRun.tryReserve(isNew = true, previousBytes = 0, newBytes = 1))
 
         val persistent = SyncBudget(storedAtStart = 1, storedBytes = 63L * 1024L * 1024L)
         assertTrue(runCatching {
             persistent.reserve(isNew = true, previousBytes = 0, newBytes = 2 * 1024 * 1024)
         }.isFailure)
+        assertTrue(!persistent.tryReserve(isNew = true, previousBytes = 0, newBytes = 2 * 1024 * 1024))
     }
 
     @Test

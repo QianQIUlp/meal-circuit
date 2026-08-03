@@ -1220,6 +1220,64 @@ class SyncServerTest(unittest.TestCase):
             self.assertEqual(response.status_code, 413)
         app.state.engine.dispose()
 
+    def test_account_blob_byte_quota_is_enforced(self) -> None:
+        root = Path(self.temp.name) / "byte-quota"
+        root.mkdir()
+        with patch.dict(
+            os.environ,
+            {"MEALCIRCUIT_SYNC_QUOTA_BYTES": "256"},
+        ):
+            app = create_app(
+                f"sqlite:///{(root / 'quota.db').as_posix()}",
+                root / "blobs",
+                registration_mode="open",
+                create_schema=True,
+            )
+        try:
+            with TestClient(app) as client:
+                account = client.post(
+                    "/v1/accounts",
+                    json={
+                        "login_name": "byte-quota-user",
+                        "password": "correct horse battery staple",
+                        "device_name": "desktop",
+                    },
+                ).json()
+                headers = {"Authorization": f"Bearer {account['access_token']}"}
+                recovery = client.put(
+                    "/v1/key-envelopes/recovery",
+                    headers=headers,
+                    json={
+                        "envelope": {
+                            "version": 1,
+                            "key_version": 1,
+                            "nonce": "quota",
+                            "ciphertext": "quota",
+                        }
+                    },
+                )
+                self.assertEqual(recovery.status_code, 200, recovery.text)
+
+                def create_blob(blob_id: str, byte_count: int) -> int:
+                    return client.post(
+                        "/v1/blobs",
+                        headers=headers,
+                        json={
+                            "blob_id": blob_id,
+                            "byte_count": byte_count,
+                            "chunk_count": 1,
+                            "key_version": 1,
+                        },
+                    ).status_code
+
+                within_quota = hashlib.sha256(b"within-quota").hexdigest()
+                self.assertEqual(create_blob(within_quota, 100), 201)
+                over_quota = hashlib.sha256(b"over-quota").hexdigest()
+                self.assertEqual(create_blob(over_quota, 200), 413)
+                self.assertEqual(create_blob(over_quota, 200), 413)
+        finally:
+            app.state.engine.dispose()
+
     def test_pull_pages_are_bounded_by_advertised_response_bytes(self) -> None:
         root = Path(self.temp.name) / "bounded-pull"
         root.mkdir()

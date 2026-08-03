@@ -42,14 +42,19 @@ data class SyncSummary(
     var merged: Int = 0,
     var conflicts: Int = 0,
     var unknown: Int = 0,
+    var unknownSkipped: Int = 0,
+    var unknownEvicted: Int = 0,
     var cursor: Long = 0,
     var fullResync: Boolean = false,
     var assetsUploaded: Int = 0,
     var assetsDownloaded: Int = 0,
+    var deferredAssetTransfer: Boolean = false,
     val assetErrors: MutableList<String> = mutableListOf(),
     var transientAssetFailures: Int = 0,
     var permanentAssetFailures: Int = 0,
 )
+
+class PermanentAssetException(message: String) : Exception(message)
 
 class SyncEngine(
     private val repository: DomainRepository,
@@ -212,21 +217,26 @@ class SyncEngine(
         }
     }
 
-    private suspend fun putUnknown(value: UnknownEntity, summary: SyncSummary, budget: SyncBudget) {
+    private suspend fun putUnknown(value: UnknownEntity, summary: SyncSummary, budget: SyncBudget): Boolean {
         val existing = repository.unknown(value.remoteId)
         val encodedBytes = value.encryptedEnvelope.utf8ByteCount()
         require(encodedBytes <= MAX_UNKNOWN_ENVELOPE_BYTES) { "未知同步记录超过单项安全上限" }
         if (existing != null && existing.serverVersion >= value.serverVersion) {
             summary.unknown += 1
-            return
+            return true
         }
-        budget.reserve(
-            isNew = existing == null,
-            previousBytes = existing?.encryptedEnvelope?.utf8ByteCount() ?: 0,
-            newBytes = encodedBytes,
-        )
+        if (!budget.tryReserve(
+                isNew = existing == null,
+                previousBytes = existing?.encryptedEnvelope?.utf8ByteCount() ?: 0,
+                newBytes = encodedBytes,
+            )
+        ) {
+            summary.unknownSkipped += 1
+            return false
+        }
         repository.putUnknown(value)
         summary.unknown += 1
+        return true
     }
 
     private suspend fun reprocessUnknowns(summary: SyncSummary, budget: SyncBudget, limit: Int) {
@@ -238,7 +248,16 @@ class SyncEngine(
             if (envelopeElement == null || envelope == null ||
                 runCatching { cipher.open(unknown.remoteId, envelope) }.isFailure
             ) {
-                repository.putUnknown(unknown.copy(updatedAt = Instant.now().toString()))
+                val attempts = unknown.reprocessAttempts + 1
+                if (shouldEvictUnknown(attempts)) {
+                    repository.deleteUnknown(unknown.remoteId)
+                    budget.release(unknown.encryptedEnvelope.utf8ByteCount())
+                    summary.unknownEvicted += 1
+                } else {
+                    repository.putUnknown(
+                        unknown.copy(reprocessAttempts = attempts, updatedAt = Instant.now().toString())
+                    )
+                }
                 return@forEach
             }
             processPull(
@@ -593,8 +612,15 @@ class SyncEngine(
                 unresolved
             }
         }
+        val uploadCandidates = reachableAssets.filter { !it.unresolved && it.relativePath != null }
+        val downloadCandidates = reachableAssets.filter { it.unresolved }
+        summary.deferredAssetTransfer = shouldDeferAssetTransfer(
+            policy,
+            unmetered,
+            uploadCandidates.isNotEmpty() || downloadCandidates.isNotEmpty(),
+        )
         if (uploadAllowed) summary.recordAssetFailures(safelyProcessAssets(
-            reachableAssets.filter { !it.unresolved && it.relativePath != null },
+            uploadCandidates,
             summary.assetErrors,
         ) { asset ->
             val file = localAssetFile(asset)
@@ -619,7 +645,7 @@ class SyncEngine(
             summary.assetsUploaded += 1
         })
         if (downloadAllowed) summary.recordAssetFailures(safelyProcessAssets(
-            reachableAssets.filter { it.unresolved },
+            downloadCandidates,
             summary.assetErrors,
         ) { asset ->
             var temporary: File? = null
@@ -635,11 +661,11 @@ class SyncEngine(
                 FileOutputStream(partFile).use { output ->
                     repeat(count) { index ->
                         val encrypted = api.downloadChunk(blobId, index)
-                            ?: throw IOException("资源 ${asset.id} 缺少分块 $index")
+                            ?: throw PermanentAssetException("资源 ${asset.id} 缺少分块 $index")
                         val plain = cipher.openBlobChunk(blobId, index, count, encrypted)
                         written += plain.size
                         if (written > asset.byteCount) {
-                            throw IOException("资源 ${asset.id} 超过声明的字节数")
+                            throw PermanentAssetException("资源 ${asset.id} 超过声明的字节数")
                         }
                         output.write(plain)
                         digest.update(plain)
@@ -647,7 +673,7 @@ class SyncEngine(
                     output.fd.sync()
                 }
                 if (written != asset.byteCount || digest.digest().hex() != asset.sha256) {
-                    throw IOException("资源 ${asset.id} 与认证元数据不一致")
+                    throw PermanentAssetException("资源 ${asset.id} 与认证元数据不一致")
                 }
                 Files.move(
                     partFile.toPath(),
@@ -849,6 +875,9 @@ internal suspend fun isRevisionDescendant(
 internal fun allowsAssetDownload(policy: String, unmetered: Boolean, includeOnDemandMedia: Boolean): Boolean =
     includeOnDemandMedia || policy == "all" || (policy == "all_wifi" && unmetered)
 
+internal fun shouldDeferAssetTransfer(policy: String, unmetered: Boolean, hasPendingAssets: Boolean): Boolean =
+    policy == "all_wifi" && !unmetered && hasPendingAssets
+
 internal data class AssetProcessingResult(
     val transientFailures: Int = 0,
     val permanentFailures: Int = 0,
@@ -892,26 +921,30 @@ internal data class SyncBudget(
     var addedBytesThisRun: Long = 0,
 ) {
     fun reserve(isNew: Boolean) {
-        if (!isNew) return
-        require(addedThisRun < MAX_UNKNOWN_PER_RUN) { "单次同步中无法识别的记录过多" }
-        require(storedAtStart + addedThisRun < MAX_STORED_UNKNOWN) {
-            "未知同步记录的存储数量已达上限"
-        }
+        check(tryReserve(isNew)) { "未知同步记录的存储数量已达上限" }
+    }
+
+    fun tryReserve(isNew: Boolean): Boolean {
+        if (!isNew) return true
+        if (addedThisRun >= MAX_UNKNOWN_PER_RUN) return false
+        if (storedAtStart + addedThisRun >= MAX_STORED_UNKNOWN) return false
         addedThisRun += 1
+        return true
     }
 
     fun reserve(isNew: Boolean, previousBytes: Int, newBytes: Int) {
+        check(tryReserve(isNew, previousBytes, newBytes)) { "未知同步记录的存储空间已达上限" }
+    }
+
+    fun tryReserve(isNew: Boolean, previousBytes: Int, newBytes: Int): Boolean {
         require(previousBytes >= 0 && newBytes in 0..MAX_UNKNOWN_ENVELOPE_BYTES)
-        require(addedBytesThisRun + newBytes <= MAX_UNKNOWN_BYTES_PER_RUN) {
-            "单次同步中未知记录的总字节数超过安全上限"
-        }
+        if (addedBytesThisRun + newBytes > MAX_UNKNOWN_BYTES_PER_RUN) return false
         val updatedStoredBytes = storedBytes - previousBytes + newBytes
-        require(updatedStoredBytes in 0L..MAX_STORED_UNKNOWN_BYTES) {
-            "未知同步记录的存储空间已达上限"
-        }
-        reserve(isNew)
+        if (updatedStoredBytes !in 0L..MAX_STORED_UNKNOWN_BYTES) return false
+        if (!tryReserve(isNew)) return false
         addedBytesThisRun += newBytes
         storedBytes = updatedStoredBytes
+        return true
     }
 
     fun release(bytes: Int) {
@@ -922,6 +955,9 @@ internal data class SyncBudget(
 }
 
 internal fun shouldPauseSyncForUnknownCount(count: Int): Boolean = count >= MAX_STORED_UNKNOWN
+
+internal fun shouldEvictUnknown(reprocessAttempts: Int): Boolean =
+    reprocessAttempts >= MAX_UNKNOWN_REPROCESS_ATTEMPTS
 
 private const val BLOB_CHUNK = 4 * 1024 * 1024
 private const val MAX_OUTBOX_BATCHES = 1_000
@@ -934,6 +970,7 @@ private const val PULL_RESPONSE_FIXED_OVERHEAD_BYTES = 4L * 1024L
 private const val PULL_CHANGE_OVERHEAD_BYTES = 1024L
 private const val MAX_UNKNOWN_PER_RUN = 500
 private const val MAX_UNKNOWN_REPROCESS_PER_RUN = 500
+private const val MAX_UNKNOWN_REPROCESS_ATTEMPTS = 10
 private const val MAX_STORED_UNKNOWN = 2_000
 private const val MAX_UNKNOWN_ENVELOPE_BYTES = 16 * 1024 * 1024
 private const val MAX_UNKNOWN_BYTES_PER_RUN = 32L * 1024L * 1024L

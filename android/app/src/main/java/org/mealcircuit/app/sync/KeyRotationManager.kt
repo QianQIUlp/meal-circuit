@@ -243,12 +243,12 @@ class KeyRotationManager(
 
     private suspend fun abortLocked() {
         val initial = readStaging()
+        if (initial === RotationStagingState.Absent) {
+            clearStaging()
+            return
+        }
         val config = repository.syncConfiguration()
         if (config == null || !config.enabled || config.serverUrl == null) {
-            if (initial === RotationStagingState.Absent) {
-                clearStaging()
-                return
-            }
             error("同步凭据不可用；已保留本地轮换暂存")
         }
         val binding = config.rotationBinding()

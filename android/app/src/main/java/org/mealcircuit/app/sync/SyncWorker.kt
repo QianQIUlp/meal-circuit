@@ -22,7 +22,8 @@ internal val SYNC_EXISTING_WORK_POLICY = ExistingWorkPolicy.APPEND_OR_REPLACE
 
 fun syncFailureDisposition(error: Throwable): SyncFailureDisposition = when (error) {
     is IllegalArgumentException, is IllegalStateException, is SecurityException,
-    is GeneralSecurityException, is SerializationException -> SyncFailureDisposition.FAILURE
+    is GeneralSecurityException, is SerializationException, is PermanentAssetException ->
+        SyncFailureDisposition.FAILURE
     is SyncHttpException -> if (error.status in setOf(408, 425, 429) || error.status >= 500) {
         SyncFailureDisposition.RETRY
     } else SyncFailureDisposition.FAILURE
@@ -35,6 +36,7 @@ class SyncWorker(context: Context, parameters: WorkerParameters) : CoroutineWork
         val application = applicationContext as org.mealcircuit.app.MealCircuitApplication
         return try {
             val summary = application.runSync() ?: return Result.success()
+            if (summary.deferredAssetTransfer) enqueueUnmeteredFollowUp(application)
             when {
                 summary.transientAssetFailures > 0 -> Result.retry()
                 summary.permanentAssetFailures > 0 -> Result.failure()
@@ -48,8 +50,9 @@ class SyncWorker(context: Context, parameters: WorkerParameters) : CoroutineWork
     }
 
     companion object {
-        fun buildRequest(): OneTimeWorkRequest = OneTimeWorkRequestBuilder<SyncWorker>()
-                .setConstraints(Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build())
+        fun buildRequest(networkType: NetworkType = NetworkType.CONNECTED): OneTimeWorkRequest =
+            OneTimeWorkRequestBuilder<SyncWorker>()
+                .setConstraints(Constraints.Builder().setRequiredNetworkType(networkType).build())
                 .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, Duration.ofSeconds(30))
                 .build()
 
@@ -58,6 +61,15 @@ class SyncWorker(context: Context, parameters: WorkerParameters) : CoroutineWork
             WorkManager.getInstance(context).enqueueUniqueWork(
                 "mealcircuit-sync",
                 SYNC_EXISTING_WORK_POLICY,
+                request,
+            )
+        }
+
+        fun enqueueUnmeteredFollowUp(context: Context) {
+            val request = buildRequest(NetworkType.UNMETERED)
+            WorkManager.getInstance(context).enqueueUniqueWork(
+                "mealcircuit-sync-unmetered",
+                ExistingWorkPolicy.REPLACE,
                 request,
             )
         }

@@ -90,27 +90,42 @@ class SyncAccountManager(
         repository.withMutationGate {
             require(typedRecoveryKey.trim().uppercase() == pending.material.recoveryKey)
             val api = SyncApi(pending.serverUrl, vault)
-            api.authorized(
-                "/v1/key-envelopes/recovery",
-                "PUT",
-                buildJsonObject {
-                    put("envelope", buildJsonObject {
-                        put("version", 1)
-                        put("key_version", pending.material.keyVersion)
-                        put("nonce", pending.material.envelopeNonce)
-                        put("ciphertext", pending.material.envelopeCiphertext)
-                    })
-                },
-            )
-            vault.put("sync.account_data_key", pending.material.accountDataKey)
-            enable(
-                pending.serverUrl,
-                pending.accountId,
-                pending.deviceId,
-                pending.deviceName,
-                pending.material.keyVersion,
-            )
-            vault.delete(PENDING_REGISTRATION)
+            try {
+                api.authorized(
+                    "/v1/key-envelopes/recovery",
+                    "PUT",
+                    buildJsonObject {
+                        put("envelope", buildJsonObject {
+                            put("version", 1)
+                            put("key_version", pending.material.keyVersion)
+                            put("nonce", pending.material.envelopeNonce)
+                            put("ciphertext", pending.material.envelopeCiphertext)
+                        })
+                    },
+                )
+                vault.put("sync.account_data_key", pending.material.accountDataKey)
+                enable(
+                    pending.serverUrl,
+                    pending.accountId,
+                    pending.deviceId,
+                    pending.deviceName,
+                    pending.material.keyVersion,
+                )
+                vault.delete(PENDING_REGISTRATION)
+            } catch (error: Throwable) {
+                throwAfterSessionCleanup(
+                    original = error,
+                    revokeRemote = {
+                        vault.get("sync.access_token")?.decodeToString()?.let { token ->
+                            api.revokeCreatedSession(token)
+                        }
+                    },
+                    clearLocal = {
+                        clearLoginSecrets()
+                        vault.delete(PENDING_REGISTRATION)
+                    },
+                )
+            }
         }
 
     suspend fun login(

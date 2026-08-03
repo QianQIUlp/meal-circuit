@@ -104,6 +104,8 @@ class DomainRepository(
 
         suspend fun head(id: String): EntityHeadEntity? = dao.head(id)
 
+        suspend fun heads(): List<EntityHeadEntity> = dao.heads()
+
         suspend fun putAsset(value: ManagedAssetEntity) = dao.putAsset(value)
     }
 
