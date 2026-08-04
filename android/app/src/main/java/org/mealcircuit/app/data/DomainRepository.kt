@@ -1,10 +1,14 @@
 package org.mealcircuit.app.data
 
 import androidx.room.withTransaction
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Deferred
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.encodeToString
@@ -24,11 +28,14 @@ class DomainRepository(
         encodeDefaults = true
         explicitNulls = false
     },
+    initializationGate: Deferred<Unit> = CompletableDeferred(Unit),
 ) {
     private val dao = database.dao()
     private val mutationGate = Mutex()
+    private val initialization = initializationGate
 
     suspend fun <T> withMutationGate(block: suspend () -> T): T {
+        initialization.await()
         val owner = requireNotNull(currentCoroutineContext()[Job]) { "数据写入门禁需要协程任务上下文" }
         if (mutationGate.holdsLock(owner)) return block()
         mutationGate.lock(owner)
@@ -69,14 +76,14 @@ class DomainRepository(
     }
 
     fun observe(kind: EntityKind): Flow<List<MaterializedRecordEntity>> =
-        dao.observeRecords(kind.serialized())
+        dao.observeRecords(kind.serialized()).flowOn(Dispatchers.IO)
     suspend fun records(kind: EntityKind): List<MaterializedRecordEntity> = dao.records(kind.serialized())
 
-    fun observeConflicts(): Flow<List<SyncConflictEntity>> = dao.observeConflicts()
-    fun observeSyncConfiguration(): Flow<SyncConfigurationEntity?> = dao.observeSyncConfiguration()
-    fun observePendingCount(): Flow<Int> = dao.observePendingCount()
-    fun observeUnknownCount(): Flow<Int> = dao.observeUnknownCount()
-    fun observeHeads(): Flow<List<EntityHeadEntity>> = dao.observeHeads()
+    fun observeConflicts(): Flow<List<SyncConflictEntity>> = dao.observeConflicts().flowOn(Dispatchers.IO)
+    fun observeSyncConfiguration(): Flow<SyncConfigurationEntity?> = dao.observeSyncConfiguration().flowOn(Dispatchers.IO)
+    fun observePendingCount(): Flow<Int> = dao.observePendingCount().flowOn(Dispatchers.IO)
+    fun observeUnknownCount(): Flow<Int> = dao.observeUnknownCount().flowOn(Dispatchers.IO)
+    fun observeHeads(): Flow<List<EntityHeadEntity>> = dao.observeHeads().flowOn(Dispatchers.IO)
 
     suspend fun save(
         kind: EntityKind,

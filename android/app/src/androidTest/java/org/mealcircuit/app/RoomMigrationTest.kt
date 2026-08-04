@@ -467,6 +467,39 @@ class RoomMigrationTest {
     }
 
     @Test
+    fun mutationsWaitForApplicationInitialization() = runBlocking {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val database = Room.inMemoryDatabaseBuilder(context, MealCircuitDatabase::class.java).build()
+        val initialization = CompletableDeferred<Unit>()
+        try {
+            val repository = DomainRepository(
+                database,
+                "device_ready_test",
+                initializationGate = initialization,
+            )
+            val entityId = DomainRevision.id("record")
+            val save = async {
+                repository.save(
+                    EntityKind.DAILY_RECORD,
+                    buildJsonObject {
+                        put("id", entityId)
+                        put("record_date", "2026-08-04")
+                        put("raw_input", "等待初始化")
+                        put("created_at", Instant.now().toString())
+                    },
+                    entityId,
+                )
+            }
+            yield()
+            assertTrue(!save.isCompleted)
+            initialization.complete(Unit)
+            assertEquals(entityId, save.await().entityId)
+        } finally {
+            database.close()
+        }
+    }
+
+    @Test
     fun abortWithoutLocalRotationStagingDoesNotRequireNetwork() = runBlocking {
         val context = ApplicationProvider.getApplicationContext<Context>()
         val database = Room.inMemoryDatabaseBuilder(context, MealCircuitDatabase::class.java).build()

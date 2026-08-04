@@ -145,7 +145,7 @@ fun FoodLibraryScreen(viewModel: MainViewModel) {
         selectedId?.let { id ->
             val record = foods.firstOrNull { it.entityId == id }
             val count = record?.let { Json.parseToJsonElement(it.payloadJson).jsonObject["history"]?.jsonArray?.size } ?: 0
-            Text("此食品保留 $count 条历史事件；同步冲突会保留 sibling revisions。")
+            Text("此食品保留 $count 条历史事件；同步冲突会保留并列历史版本。")
         }
     }
 }

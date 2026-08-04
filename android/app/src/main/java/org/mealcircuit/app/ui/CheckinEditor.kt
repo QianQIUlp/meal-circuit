@@ -1,13 +1,13 @@
 package org.mealcircuit.app.ui
 
-import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.rememberScrollState
 import androidx.compose.material3.Card
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.OutlinedButton
@@ -23,6 +23,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.Saver
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
@@ -103,6 +104,8 @@ fun CheckinEditor(viewModel: MainViewModel) {
     val context = androidx.compose.ui.platform.LocalContext.current
     val contract = remember { CheckinContract.load(context) }
     val enabledModules by viewModel.checkinModules.collectAsState()
+    val visibleModules = contract.modules.filter { it.key in enabledModules }
+    var renderedModuleCount by remember { mutableStateOf(0) }
     val checkins by viewModel.repository.observe(EntityKind.CHECKIN_DAY).collectAsState(emptyList())
     val timezone by viewModel.timezone.collectAsState()
     var today by remember(timezone) { mutableStateOf(LocalDate.now(ZoneId.of(timezone)).toString()) }
@@ -113,6 +116,13 @@ fun CheckinEditor(viewModel: MainViewModel) {
             today = now.toLocalDate().toString()
             val nextMidnight = now.toLocalDate().plusDays(1).atStartOfDay(zone)
             delay(Duration.between(now, nextMidnight).toMillis().coerceAtLeast(1_000L))
+        }
+    }
+    LaunchedEffect(enabledModules) {
+        renderedModuleCount = 0
+        while (renderedModuleCount < visibleModules.size) {
+            withFrameNanos { }
+            renderedModuleCount += 1
         }
     }
     var answers by rememberSaveable(stateSaver = answersSaver) {
@@ -157,7 +167,7 @@ fun CheckinEditor(viewModel: MainViewModel) {
         }
     }
 
-    contract.modules.filter { it.key in enabledModules }.forEach { module ->
+    visibleModules.take(renderedModuleCount).forEach { module ->
         CheckinModuleEditor(
             module = module,
             values = answers[module.key].orEmpty(),
@@ -281,6 +291,7 @@ private fun QuestionEditor(
 }
 
 @Composable
+@OptIn(ExperimentalLayoutApi::class)
 private fun OptionRow(
     question: CheckinQuestion,
     value: JsonElement?,
@@ -288,9 +299,10 @@ private fun OptionRow(
     onValue: (CheckinQuestion, JsonElement) -> Unit,
 ) {
     val selected = selectedValues(value)
-    Row(
-        Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+    FlowRow(
+        Modifier.fillMaxWidth(),
         horizontalArrangement = Arrangement.spacedBy(8.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
     ) {
         question.options.forEach { option ->
             FilterChip(

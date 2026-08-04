@@ -1,6 +1,8 @@
 package org.mealcircuit.app
 
 import android.app.Application
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
 import org.mealcircuit.app.data.DomainRepository
 import org.mealcircuit.app.data.MealCircuitDatabase
 import org.mealcircuit.app.domain.DomainRevision
@@ -10,9 +12,11 @@ import org.mealcircuit.app.sync.SyncApi
 import org.mealcircuit.app.sync.SyncEngine
 import org.mealcircuit.app.sync.SyncSummary
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 
 class MealCircuitApplication : Application() {
+    private val applicationScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     lateinit var repository: DomainRepository
         private set
     lateinit var vault: SecretVault
@@ -33,10 +37,21 @@ class MealCircuitApplication : Application() {
                     "无法保存安装设备 ID"
                 }
             }
-        repository = DomainRepository(MealCircuitDatabase.open(this), deviceId)
-        runBlocking(Dispatchers.IO) {
-            repository.ensureMetadata(installationId("instance_id", "instance"))
-            repository.cleanupOrphanedAssetFiles(filesDir)
+        val initialization = CompletableDeferred<Unit>()
+        repository = DomainRepository(
+            MealCircuitDatabase.open(this),
+            deviceId,
+            initializationGate = initialization,
+        )
+        applicationScope.launch {
+            runCatching {
+                repository.ensureMetadata(installationId("instance_id", "instance"))
+                repository.cleanupOrphanedAssetFiles(filesDir)
+            }.onSuccess {
+                initialization.complete(Unit)
+            }.onFailure { error ->
+                initialization.completeExceptionally(error)
+            }
         }
         vault = SecretVault(this)
     }

@@ -17,9 +17,11 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -33,6 +35,7 @@ import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.coroutines.delay
 import java.time.LocalDate
 import java.time.ZoneId
 
@@ -79,6 +82,7 @@ private fun Metric(label: String, value: Int) {
 fun TodayScreen(viewModel: MainViewModel) {
     var record by rememberSaveable { mutableStateOf("") }
     var editingRecordId by rememberSaveable { mutableStateOf<String?>(null) }
+    var checkinReady by remember { mutableStateOf(false) }
     val records by viewModel.repository.observe(EntityKind.DAILY_RECORD).collectAsState(emptyList())
     val reviews by viewModel.repository.observe(EntityKind.DAILY_REVIEW).collectAsState(emptyList())
     val timezone by viewModel.timezone.collectAsState()
@@ -87,6 +91,10 @@ fun TodayScreen(viewModel: MainViewModel) {
     val plans = publishedPlans(reviews)
     val planForToday = plans.firstOrNull { it.planDate == today }
     val reviewToday = plans.firstOrNull { it.reviewDate == today }
+    LaunchedEffect(Unit) {
+        delay(100)
+        checkinReady = true
+    }
     Column(
         Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp).widthIn(max = 880.dp),
         verticalArrangement = Arrangement.spacedBy(20.dp),
@@ -95,7 +103,10 @@ fun TodayScreen(viewModel: MainViewModel) {
         SectionTitle("记一笔", "写下吃了什么、执行阻力或真实变化。保存后仍可直接修改这条记录。")
         OutlinedTextField(
             record, { record = it }, Modifier.fillMaxWidth(),
-            label = { Text(if (editingRecordId == null) "自然语言饮食记录" else "修改这条记录") }, minLines = 4,
+            label = { Text(if (editingRecordId == null) "饮食记录" else "修改这条记录") },
+            placeholder = { if (editingRecordId == null) Text("写下吃了什么、执行阻力或真实变化") },
+            supportingText = { if (editingRecordId == null) Text("写下吃了什么、执行阻力或真实变化") },
+            minLines = 4,
         )
         Row(Modifier.align(Alignment.End), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             editingRecordId?.let {
@@ -122,7 +133,13 @@ fun TodayScreen(viewModel: MainViewModel) {
             record = dailyRecordText(selected)
         }
         SectionTitle("今日状态", "发布的信息进入复盘上下文；缺失仍保持未知。")
-        CheckinEditor(viewModel)
+        if (checkinReady) {
+            CheckinEditor(viewModel)
+        } else {
+            Card(Modifier.fillMaxWidth()) {
+                Text("正在准备今日状态", Modifier.padding(16.dp))
+            }
+        }
         reviewToday?.let { plan ->
             SectionTitle("今天最重要的方向", "来自今天的真实记录和已发布复盘。")
             PublishedPlanCard(plan, showReviewDate = false)

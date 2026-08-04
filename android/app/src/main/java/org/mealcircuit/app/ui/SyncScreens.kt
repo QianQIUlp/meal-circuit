@@ -41,6 +41,10 @@ import com.journeyapps.barcodescanner.ScanOptions
 import androidx.core.content.ContextCompat
 import kotlinx.serialization.json.Json
 import org.mealcircuit.app.MainViewModel
+import org.mealcircuit.app.data.SyncConflictEntity
+import org.mealcircuit.app.data.serialized
+import org.mealcircuit.app.domain.DomainRevision
+import kotlinx.serialization.decodeFromString
 
 @Composable
 fun SyncSettingsScreen(viewModel: MainViewModel) {
@@ -337,22 +341,31 @@ fun ConflictScreen(viewModel: MainViewModel) {
         Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp).widthIn(max = 880.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
-        SectionTitle("冲突中心", "不会按时间覆盖同字段并发值；两个 sibling revision 都会保留。")
+        SectionTitle("冲突中心", "不会按时间覆盖并发修改；冲突版本会保留，确认后才会继续同步。")
         if (conflicts.isEmpty()) {
             EmptyState("没有待解决冲突", "离线编辑不同实体或不同字段会自动合并。")
         }
         conflicts.forEach { conflict ->
+            val remoteKind = conflict.remoteEntityKind(viewModel)
+            val crossKind = remoteKind != null && remoteKind != conflict.entityKind
             Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer)) {
                 Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
                     Text("${conflict.entityKind} · ${conflict.entityId}")
-                    Text("冲突路径：${conflict.conflictingPathsJson}")
-                    Text("本机 sibling")
+                    if (crossKind) {
+                        Text("数据类型冲突：本机为 ${conflict.entityKind}，远端为 $remoteKind。为避免把一种数据改名成另一种，只能保留本机类型。")
+                    } else {
+                        Text("冲突位置：${conflict.conflictingPathsJson}")
+                    }
+                    Text("本机版本")
                     Text(pretty(conflict.localRevisionJson), maxLines = 8, fontFamily = FontFamily.Monospace)
-                    Text("远端 sibling")
+                    Text("远端版本")
                     Text(pretty(conflict.remoteRevisionJson), maxLines = 8, fontFamily = FontFamily.Monospace)
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         Button(onClick = { viewModel.resolveConflict(conflict.id, true) }) { Text("保留本机") }
-                        OutlinedButton(onClick = { viewModel.resolveConflict(conflict.id, false) }) { Text("保留远端") }
+                        OutlinedButton(
+                            onClick = { viewModel.resolveConflict(conflict.id, false) },
+                            enabled = !crossKind,
+                        ) { Text("保留远端") }
                     }
                 }
             }
@@ -368,3 +381,7 @@ private fun pretty(value: String) = runCatching {
         Json.parseToJsonElement(value),
     )
 }.getOrDefault(value)
+
+private fun SyncConflictEntity.remoteEntityKind(viewModel: MainViewModel): String? = runCatching {
+    viewModel.repository.json.decodeFromString<DomainRevision>(remoteRevisionJson).entityKind.serialized()
+}.getOrNull()

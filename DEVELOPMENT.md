@@ -4,6 +4,13 @@
 
 > 本文件只记录开发历史，不是 Agent 的需求输入。当前行为以代码、测试、`AGENTS.md`、`README.md` 和 `docs/agent-workbench.md` 为准。
 
+## 2026-08-04：Android 首帧初始化与视觉验收修复
+
+- 目标：执行 Android 模拟器验收计划，消除首帧前同步初始化、首屏输入提示、签到选项横向裁切和冲突页技术化操作文案等已确认阻断项；不改变领域数据格式、同步合并规则或 API Key 边界。
+- 改动：`MealCircuitApplication` 将 metadata 初始化和孤儿照片清理移到应用级 IO 协程；`DomainRepository` 增加初始化门禁，写入/同步等待门禁完成，并将 Room 只读 Flow 的上游查询放到 IO；`MainViewModel` 延后 Keystore 状态读取和惰性创建 AI、Portable、问卷及同步对象。Today 页补充未聚焦时可见的“写下吃了什么、执行阻力或真实变化”提示，并在首屏后逐步组合状态模块；签到选项改为 `FlowRow`。冲突页改用“本机版本/远端版本”文案，跨实体类型冲突禁用错误的“保留远端”入口；食品库移除 sibling 技术术语。新增 repository 初始化门禁 instrumentation 回归测试。
+- 验证：`git diff --check` 通过。使用隔离 SDK `C:\tmp\mc-android-019fb725\sdk`、`-Dkotlin.compiler.execution.strategy=in-process`，并临时排除本机缺失的 debug-only `ui-test-manifest` 后，最终源码的 `:app:assembleDebug` 成功；临时构建条件已恢复且不在工作树差异中。新 APK 为 `org.mealcircuit.app` `0.3.0`，SHA-256 为 `EDAAFE2084C119074B71540E187077A4169B6CDFAABAD8FEA517942E1B158B8A`。隔离 API 35 AVD 使用 ADB 端口 `5038` 连续冷启动 5 次为 `2552ms、2519ms、2602ms、2693ms、2589ms`，均低于 3 秒；首屏提示截图为 `C:\tmp\mc-android-019fb725\visual-acceptance\61-today-final.png`，签到换行截图为 `62-checkin-flow.png`，无 `FATAL EXCEPTION` 或应用 ANR。
+- 未完成与风险：当前 Gradle 缓存缺少 `ui-test-manifest`、AndroidX test/Room testing 等依赖，Google Maven Java TLS 握手失败；`testDebugUnitTest` 在 `collection-ktx` 下载处停止，`compileDebugAndroidTestKotlin` 在 AndroidTest manifest 依赖解析处停止，因此本轮没有声称 JVM 测试或 instrumentation 通过。模拟器仍报告首次 Compose 绘制约 77--93 个 skipped frames，虽不影响 3 秒首屏门槛，仍需在完整依赖和硬件加速环境复查。真实同步登录和跨客户端状态文件也未执行。
+
 ## 2026-07-29：Cloudflare Pages 双语产品介绍站
 
 - 目标：让 `main` 分支可以直接连接 Cloudflare Pages，托管一份不暴露本地应用或私人数据的中英文 MealCircuit 对外介绍站；参考 `verisilo.qiu.works` 的信息组织和其公开仓库部署方式，但不把 Astro/pnpm 引入当前 Python/Android 工程。

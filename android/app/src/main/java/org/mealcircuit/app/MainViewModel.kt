@@ -165,19 +165,17 @@ internal fun requireCheckinDate(value: String): String = LocalDate.parse(value).
 class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val app = application as MealCircuitApplication
     val repository = app.repository
-    private val accounts = SyncAccountManager(repository, app.vault)
-    private val keyRotation = KeyRotationManager(application, repository, app.vault)
-    private val ai = AiClient(app.vault)
-    private val portable = PortableData(application, repository)
-    private val checkinContract = CheckinContract.load(application)
+    private val accounts = lazy { SyncAccountManager(repository, app.vault) }
+    private val keyRotation = lazy { KeyRotationManager(application, repository, app.vault) }
+    private val ai = lazy { AiClient(app.vault) }
+    private val portable = lazy { PortableData(application, repository) }
+    private val checkinContract = lazy { CheckinContract.load(application) }
     val settingsEditor = SettingsEditorState()
     private val _message = MutableStateFlow<UiMessage?>(null)
     val message: StateFlow<UiMessage?> = _message.asStateFlow()
-    private val _pendingRegistration = MutableStateFlow(accounts.pendingRegistration())
+    private val _pendingRegistration = MutableStateFlow<PendingRegistration?>(null)
     val pendingRegistration: StateFlow<PendingRegistration?> = _pendingRegistration.asStateFlow()
-    private val _exportRecoveryKey = MutableStateFlow(
-        app.vault.get(EXPORT_RECOVERY_KEY)?.decodeToString()
-    )
+    private val _exportRecoveryKey = MutableStateFlow<String?>(null)
     val exportRecoveryKey: StateFlow<String?> = _exportRecoveryKey.asStateFlow()
     private val _portableImport = MutableStateFlow<PortableImportUi?>(null)
     val portableImport: StateFlow<PortableImportUi?> = _portableImport.asStateFlow()
@@ -188,7 +186,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     val pairingServerUrl: StateFlow<String?> = _pairingServerUrl.asStateFlow()
     private val _devices = MutableStateFlow<List<DeviceUi>>(emptyList())
     val devices: StateFlow<List<DeviceUi>> = _devices.asStateFlow()
-    private val _pendingRotationRecovery = MutableStateFlow(keyRotation.pendingRecovery())
+    private val _pendingRotationRecovery = MutableStateFlow<String?>(null)
     val pendingRotationRecovery: StateFlow<String?> = _pendingRotationRecovery.asStateFlow()
     private val preferences = application.getSharedPreferences("user_settings", android.content.Context.MODE_PRIVATE)
     private val _timezone = MutableStateFlow(normalizedTimezone(preferences.getString("timezone", null)))
@@ -203,6 +201,16 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     init {
         if (preferences.getString("timezone", null) != _timezone.value) {
             preferences.edit().putString("timezone", _timezone.value).apply()
+        }
+        viewModelScope.launch(Dispatchers.IO) {
+            val pendingRegistration = accounts.value.pendingRegistration()
+            val exportRecoveryKey = app.vault.get(EXPORT_RECOVERY_KEY)?.decodeToString()
+            val pendingRotationRecovery = keyRotation.value.pendingRecovery()
+            withContext(Dispatchers.Main.immediate) {
+                _pendingRegistration.value = pendingRegistration
+                _exportRecoveryKey.value = exportRecoveryKey
+                _pendingRotationRecovery.value = pendingRotationRecovery
+            }
         }
         viewModelScope.launch {
             repository.observe(EntityKind.PREFERENCES).collect { records ->
@@ -302,7 +310,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             actionKey = "checkin:$day",
             onSuccess = onSuccess,
         ) {
-            val answers = checkinContract.modules.associate { module ->
+            val answers = checkinContract.value.modules.associate { module ->
                 val values = raw[module.key].orEmpty()
                 module.key to module.normalize(
                     values,
@@ -872,7 +880,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     ) {
         require(model.isNotBlank())
         withContext(Dispatchers.IO) {
-            ai.saveKey(provider, key)
+            ai.value.saveKey(provider, key)
             check(preferences.edit().putString("ai_provider", provider.name).putString("ai_model", model.trim()).commit())
         }
     }
@@ -965,7 +973,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 }
             }
         }
-        val result = ai.generate(aiConfiguration(), taskType, context, image, imageAsset?.mediaType)
+        val result = ai.value.generate(aiConfiguration(), taskType, context, image, imageAsset?.mediaType)
         org.mealcircuit.app.domain.ResultValidator.task(
             taskType,
             result,
@@ -1200,7 +1208,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 carryovers,
             ))
         }
-        val result = ai.generate(aiConfiguration(), "daily", context)
+        val result = ai.value.generate(aiConfiguration(), "daily", context)
         org.mealcircuit.app.domain.ResultValidator.daily(
             result,
             reviewDay.plusDays(1),
@@ -1408,13 +1416,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         require(_exportRecoveryKey.value == null && app.vault.get(EXPORT_RECOVERY_KEY) == null) {
             "请先保存并确认上一份导出的恢复密钥"
         }
-        val recoveryKey = portable.createRecoveryKey()
+        val recoveryKey = portable.value.createRecoveryKey()
         app.vault.put(EXPORT_RECOVERY_KEY, recoveryKey.toByteArray())
         try {
             withContext(Dispatchers.IO) {
                 val output = getApplication<Application>().contentResolver.openOutputStream(uri)
                     ?: error("无法打开导出目标")
-                output.use { portable.export(it, encrypted = true, recoveryKey = recoveryKey) }
+                output.use { portable.value.export(it, encrypted = true, recoveryKey = recoveryKey) }
             }
         } catch (error: Throwable) {
             app.vault.delete(EXPORT_RECOVERY_KEY)
@@ -1431,28 +1439,28 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val staging = withContext(Dispatchers.IO) {
             val input = getApplication<Application>().contentResolver.openInputStream(uri)
                 ?: error("无法读取数据包")
-            input.use { portable.previewAndStage(it, recoveryKey.ifBlank { null }, mode) }
+            input.use { portable.value.previewAndStage(it, recoveryKey.ifBlank { null }, mode) }
         }
         val previous = stagedPortableImport
         stagedPortableImport = staging
         _portableImport.value = PortableImportUi(recoveryKey, mode, staging.preview)
-        previous?.let { runCatching { portable.discardStaged(it) } }
+        previous?.let { runCatching { portable.value.discardStaged(it) } }
     }
 
     fun applyPortable() = launchAction("Portable Data 已导入", actionKey = "portable") {
         val request = _portableImport.value ?: error("请先预检数据包")
         val staging = stagedPortableImport ?: error("临时导入数据包已失效，请重新预检")
-        portable.importStaged(staging, request.recoveryKey.ifBlank { null }, request.mode)
+        portable.value.importStaged(staging, request.recoveryKey.ifBlank { null }, request.mode)
         stagedPortableImport = null
         _portableImport.value = null
-        runCatching { portable.discardStaged(staging) }
+        runCatching { portable.value.discardStaged(staging) }
     }
 
     fun cancelPortableImport() {
         val staging = stagedPortableImport
         stagedPortableImport = null
         _portableImport.value = null
-        staging?.let { runCatching { portable.discardStaged(it) } }
+        staging?.let { runCatching { portable.value.discardStaged(it) } }
     }
 
     fun clearExportRecoveryKey() = launchAction(null, actionKey = "portable-recovery") {
@@ -1462,19 +1470,19 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun beginRegistration(url: String, login: String, password: String, device: String) =
         launchAction(null, actionKey = "sync-registration") {
-            _pendingRegistration.value = accounts.beginRegistration(url, login, password, device)
+            _pendingRegistration.value = accounts.value.beginRegistration(url, login, password, device)
         }
 
     fun confirmRegistration(value: String) = launchAction("端到端加密同步已启用") {
         val pending = _pendingRegistration.value ?: error("注册确认已失效")
-        accounts.confirmRegistration(pending, value)
+        accounts.value.confirmRegistration(pending, value)
         _pendingRegistration.value = null
         SyncWorker.enqueue(getApplication())
     }
 
     fun login(url: String, login: String, password: String, device: String, recovery: String) =
         launchAction(null, actionKey = "sync-login") {
-            val pending = accounts.login(url, login, password, device, recovery)
+            val pending = accounts.value.login(url, login, password, device, recovery)
             _pendingRegistration.value = pending
             if (pending == null) {
                 SyncWorker.enqueue(getApplication())
@@ -1498,15 +1506,15 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
     fun unlink() = launchAction("已取消同步；本地数据完整保留") {
         require(repository.rotationReadiness().second == 0) { "请先解决所有同步冲突，再取消同步" }
-        require(keyRotation.pendingRecovery() == null) { "请先完成或取消正在进行的密钥轮换" }
-        keyRotation.abort()
-        accounts.unlink()
+        require(keyRotation.value.pendingRecovery() == null) { "请先完成或取消正在进行的密钥轮换" }
+        keyRotation.value.abort()
+        accounts.value.unlink()
         _pendingRotationRecovery.value = null
         _pairingQr.value = null
         _devices.value = emptyList()
     }
     fun createPairingQr() = launchAction("10 分钟配对二维码已生成") {
-        _pairingQr.value = accounts.createPairingQr()
+        _pairingQr.value = accounts.value.createPairingQr()
     }
     fun clearPairingQr() { _pairingQr.value = null }
     fun previewPairing(payload: String) {
@@ -1526,7 +1534,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         device: String,
     ) =
         launchAction("新设备已通过二维码加入") {
-            accounts.claimPairing(payload, expectedServerUrl, login, password, device)
+            accounts.value.claimPairing(payload, expectedServerUrl, login, password, device)
             _pairingServerUrl.value = null
             SyncWorker.enqueue(getApplication())
         }
@@ -1534,7 +1542,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         loadDevices()
     }
     private suspend fun loadDevices() {
-        _devices.value = accounts.devices().getValue("devices").jsonArray.map { value ->
+        _devices.value = accounts.value.devices().getValue("devices").jsonArray.map { value ->
             val item = value.jsonObject
             DeviceUi(
                 item.getValue("id").jsonPrimitive.content,
@@ -1545,7 +1553,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
     fun revokeDevice(id: String) = launchAction("设备已撤销") {
-        accounts.revokeDevice(id)
+        accounts.value.revokeDevice(id)
         loadDevices()
     }
     fun deleteSyncAccount(password: String, onSuccess: () -> Unit = {}) = launchAction(
@@ -1553,22 +1561,22 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         onSuccess = onSuccess,
     ) {
         require(repository.rotationReadiness().second == 0) { "请先解决所有同步冲突，再删除同步账户" }
-        keyRotation.abort()
-        accounts.deleteAccount(password)
+        keyRotation.value.abort()
+        accounts.value.deleteAccount(password)
         _pendingRotationRecovery.value = null
         _pairingQr.value = null
         _devices.value = emptyList()
     }
     fun prepareKeyRotation() = launchAction(null, actionKey = "key-rotation") {
-        _pendingRotationRecovery.value = keyRotation.prepare()
+        _pendingRotationRecovery.value = keyRotation.value.prepare()
     }
     fun confirmKeyRotation(value: String) = launchAction("安全轮换完成；其他设备已撤销") {
-        keyRotation.confirm(value)
+        keyRotation.value.confirm(value)
         _pendingRotationRecovery.value = null
         loadDevices()
     }
     fun abortKeyRotation() = launchAction("密钥轮换已中止") {
-        keyRotation.abort()
+        keyRotation.value.abort()
         _pendingRotationRecovery.value = null
     }
 
@@ -1691,7 +1699,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private fun ByteArray.hex() = joinToString("") { "%02x".format(it) }
 
     override fun onCleared() {
-        stagedPortableImport?.let { runCatching { portable.discardStaged(it) } }
+        if (portable.isInitialized()) {
+            stagedPortableImport?.let { runCatching { portable.value.discardStaged(it) } }
+        }
         stagedPortableImport = null
         super.onCleared()
     }
