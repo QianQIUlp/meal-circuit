@@ -1,6 +1,8 @@
 package org.mealcircuit.app.ui
 
+import android.Manifest
 import android.net.Uri
+import android.content.pm.PackageManager
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
@@ -25,11 +27,12 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
+import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
 import org.mealcircuit.app.MainViewModel
 import org.mealcircuit.app.domain.EntityKind
@@ -40,6 +43,7 @@ import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 
 internal const val CAMERA_FAILURE_MESSAGE = "拍照未完成，未创建任务。"
+internal const val CAMERA_PERMISSION_MESSAGE = "没有相机权限。请在系统设置中允许相机权限，或改用“选择照片”。"
 
 internal fun finalizeCameraResult(success: Boolean, hasUri: Boolean, temporary: File?): String? {
     if (success && hasUri) return null
@@ -50,37 +54,61 @@ internal fun finalizeCameraResult(success: Boolean, hasUri: Boolean, temporary: 
 @Composable
 fun CaptureScreen(viewModel: MainViewModel) {
     val context = LocalContext.current
-    var note by remember { mutableStateOf("") }
-    var materials by remember { mutableStateOf("") }
-    var cameraUri by remember { mutableStateOf<Uri?>(null) }
-    var cameraFile by remember { mutableStateOf<File?>(null) }
-    var cameraError by remember { mutableStateOf<String?>(null) }
-    var selectedInputId by remember { mutableStateOf<String?>(null) }
-    var selectedTaskId by remember { mutableStateOf<String?>(null) }
-    var correction by remember { mutableStateOf("") }
+    var note by rememberSaveable { mutableStateOf("") }
+    var materials by rememberSaveable { mutableStateOf("") }
+    var cameraUri by rememberSaveable { mutableStateOf<String?>(null) }
+    var cameraPath by rememberSaveable { mutableStateOf<String?>(null) }
+    var cameraError by rememberSaveable { mutableStateOf<String?>(null) }
+    var selectedInputId by rememberSaveable { mutableStateOf<String?>(null) }
+    var selectedTaskId by rememberSaveable { mutableStateOf<String?>(null) }
+    var correction by rememberSaveable { mutableStateOf("") }
     val inputs by viewModel.repository.observe(EntityKind.TASK_INPUT).collectAsState(emptyList())
     val tasks by viewModel.repository.observe(EntityKind.TASK).collectAsState(emptyList())
     val camera = rememberLauncherForActivityResult(ActivityResultContracts.TakePicture()) { success ->
-        val uri = cameraUri
-        val temporary = cameraFile
+        val uri = cameraUri?.let(Uri::parse)
+        val temporary = cameraPath?.let(::File)
         cameraUri = null
-        cameraFile = null
+        cameraPath = null
         val error = finalizeCameraResult(success, uri != null, temporary)
         if (error == null && uri != null) {
             cameraError = null
-            viewModel.addPhotoTask(uri, note) { temporary?.delete() }
+            viewModel.addPhotoTask(
+                uri,
+                note,
+                afterRead = { temporary?.delete() },
+                onSuccess = { note = "" },
+            )
         } else {
             cameraError = error
         }
     }
+    val launchCamera = {
+        val file = context.cacheDir.resolve("camera/${UUID.randomUUID()}.jpg")
+        try {
+            file.parentFile?.mkdirs()
+            val target = FileProvider.getUriForFile(context, "${context.packageName}.files", file)
+            cameraError = null
+            cameraPath = file.absolutePath
+            cameraUri = target.toString()
+            camera.launch(target)
+        } catch (_: Exception) {
+            file.delete()
+            cameraPath = null
+            cameraUri = null
+            cameraError = CAMERA_FAILURE_MESSAGE
+        }
+    }
+    val cameraPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        if (granted) launchCamera() else cameraError = CAMERA_PERMISSION_MESSAGE
+    }
     val picker = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
-        uri?.let { viewModel.addPhotoTask(it, note) }
+        uri?.let { viewModel.addPhotoTask(it, note, onSuccess = { note = "" }) }
     }
     Column(
         Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp).widthIn(max = 880.dp),
         verticalArrangement = Arrangement.spacedBy(20.dp),
     ) {
-        SectionTitle("照片任务", "使用系统相机或 Photo Picker；原图进入应用私有目录。")
+        SectionTitle("照片任务", "使用系统相机或系统照片选择器；原图进入应用私有目录。")
         OutlinedTextField(
             note, { note = it }, Modifier.fillMaxWidth(),
             label = { Text("补充说明（可选）") }, minLines = 2,
@@ -88,13 +116,11 @@ fun CaptureScreen(viewModel: MainViewModel) {
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
             Button(
                 onClick = {
-                    val file = context.cacheDir.resolve("camera/${UUID.randomUUID()}.jpg")
-                    file.parentFile?.mkdirs()
-                    val target = FileProvider.getUriForFile(context, "${context.packageName}.files", file)
-                    cameraError = null
-                    cameraFile = file
-                    cameraUri = target
-                    camera.launch(target)
+                    if (ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
+                        launchCamera()
+                    } else {
+                        cameraPermission.launch(Manifest.permission.CAMERA)
+                    }
                 },
                 modifier = Modifier.weight(1f),
             ) { Icon(Icons.Outlined.CameraAlt, null); Text("拍照") }
@@ -113,9 +139,9 @@ fun CaptureScreen(viewModel: MainViewModel) {
         )
         Button(
             onClick = {
-                selectedInputId?.let { viewModel.updateTaskInput(it, materials) }
-                    ?: viewModel.addMaterialTask(materials)
-                materials = ""; selectedInputId = null
+                val clear: () -> Unit = { materials = ""; selectedInputId = null }
+                selectedInputId?.let { viewModel.updateTaskInput(it, materials, clear) }
+                    ?: viewModel.addMaterialTask(materials, clear)
             },
             enabled = materials.isNotBlank(),
         ) { Text(if (selectedInputId == null) "创建任务" else "保存输入修订") }
@@ -139,7 +165,11 @@ fun CaptureScreen(viewModel: MainViewModel) {
             label = { Text("对选中已完成任务的校正") }, minLines = 2,
         )
         Button(
-            onClick = { selectedTaskId?.let { viewModel.addTaskCorrection(it, correction) }; correction = "" },
+            onClick = {
+                selectedTaskId?.let { taskId ->
+                    viewModel.addTaskCorrection(taskId, correction) { correction = "" }
+                }
+            },
             enabled = selectedTaskId != null && correction.isNotBlank(),
         ) { Text("追加校正") }
     }

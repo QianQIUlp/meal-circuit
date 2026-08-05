@@ -32,13 +32,23 @@ class SecretVault(context: Context) {
     }
 
     fun put(name: String, value: ByteArray) {
+        putAll(mapOf(name to value))
+    }
+
+    fun putAll(values: Map<String, ByteArray>) {
+        require(values.isNotEmpty())
+        val editor = preferences.edit()
+        values.forEach { (name, value) ->
+            editor.putString(name, Base64.getEncoder().encodeToString(wrap(name, value)))
+        }
+        check(editor.commit()) { "无法保存加密凭据" }
+    }
+
+    private fun wrap(name: String, value: ByteArray): ByteArray {
         val cipher = Cipher.getInstance("AES/GCM/NoPadding")
         cipher.init(Cipher.ENCRYPT_MODE, wrappingKey())
         cipher.updateAAD(aad(name))
-        val wrapped = cipher.iv + cipher.doFinal(value)
-        check(preferences.edit().putString(name, Base64.getEncoder().encodeToString(wrapped)).commit()) {
-            "Unable to persist wrapped secret"
-        }
+        return cipher.iv + cipher.doFinal(value)
     }
 
     fun get(name: String): ByteArray? {
@@ -54,7 +64,14 @@ class SecretVault(context: Context) {
     }
 
     fun delete(name: String) {
-        check(preferences.edit().remove(name).commit()) { "Unable to delete wrapped secret" }
+        deleteAll(listOf(name))
+    }
+
+    fun deleteAll(names: Collection<String>) {
+        if (names.isEmpty()) return
+        val editor = preferences.edit()
+        names.forEach(editor::remove)
+        check(editor.commit()) { "无法删除加密凭据" }
     }
 
     private fun aad(name: String) = "MealCircuit Secret v1\u0000$name".toByteArray()

@@ -4,6 +4,13 @@
 
 > 本文件只记录开发历史，不是 Agent 的需求输入。当前行为以代码、测试、`AGENTS.md`、`README.md` 和 `docs/agent-workbench.md` 为准。
 
+## 2026-08-04：Android 首帧初始化与视觉验收修复
+
+- 目标：执行 Android 模拟器验收计划，消除首帧前同步初始化、首屏输入提示、签到选项横向裁切和冲突页技术化操作文案等已确认阻断项；不改变领域数据格式、同步合并规则或 API Key 边界。
+- 改动：`MealCircuitApplication` 将 metadata 初始化和孤儿照片清理移到应用级 IO 协程；`DomainRepository` 增加初始化门禁，写入/同步等待门禁完成，并将 Room 只读 Flow 的上游查询放到 IO；`MainViewModel` 延后 Keystore 状态读取和惰性创建 AI、Portable、问卷及同步对象。Today 页补充未聚焦时可见的“写下吃了什么、执行阻力或真实变化”提示，并在首屏后逐步组合状态模块；签到选项改为 `FlowRow`。冲突页改用“本机版本/远端版本”文案，跨实体类型冲突禁用错误的“保留远端”入口；食品库移除 sibling 技术术语。新增 repository 初始化门禁 instrumentation 回归测试。
+- 验证：`git diff --check` 通过。使用隔离 SDK `C:\tmp\mc-android-019fb725\sdk`、`-Dkotlin.compiler.execution.strategy=in-process`，并临时排除本机缺失的 debug-only `ui-test-manifest` 后，最终源码的 `:app:assembleDebug` 成功；临时构建条件已恢复且不在工作树差异中。新 APK 为 `org.mealcircuit.app` `0.3.0`，SHA-256 为 `EDAAFE2084C119074B71540E187077A4169B6CDFAABAD8FEA517942E1B158B8A`。隔离 API 35 AVD 使用 ADB 端口 `5038` 连续冷启动 5 次为 `2552ms、2519ms、2602ms、2693ms、2589ms`，均低于 3 秒；首屏提示截图为 `C:\tmp\mc-android-019fb725\visual-acceptance\61-today-final.png`，签到换行截图为 `62-checkin-flow.png`，无 `FATAL EXCEPTION` 或应用 ANR。
+- 后续复验：Google Maven 使用临时环境变量 `MEALCIRCUIT_LOCAL_MAVEN=https://maven.aliyun.com/repository/google`，Central 使用同样不入库的临时镜像入口；未修改仓库依赖配置。`testDebugUnitTest`、真实配置 `assembleDebug`、`lintDebug` 和 `compileDebugAndroidTestKotlin` 均通过。普通 connected instrumentation 为 27 项完成、1 项按设计跳过；补齐真实 `syncServerUrl/login/password/recovery` 后跨客户端 connected instrumentation 的 26 项全部通过，Python `cross_client_sync_test verify` 也通过并完成服务端数据库、blob、日志明文审计。模拟器仍报告首次 Compose 绘制约 77--93 个 skipped frames，虽不影响 3 秒首屏门槛，仍需在硬件加速设备上复查。跨端测试结束后临时 server、state 和镜像配置均已清理；本轮误用保留变量名造成的用户目录 synthetic 数据已从迁移前备份恢复，数据库再次确认无 synthetic 标记。
+
 ## 2026-07-29：Cloudflare Pages 双语产品介绍站
 
 - 目标：让 `main` 分支可以直接连接 Cloudflare Pages，托管一份不暴露本地应用或私人数据的中英文 MealCircuit 对外介绍站；参考 `verisilo.qiu.works` 的信息组织和其公开仓库部署方式，但不把 Astro/pnpm 引入当前 Python/Android 工程。
@@ -510,3 +517,39 @@
 - 根因与修复：GitHub Windows runner 的临时目录以 `RUNNER~1` 短路径提供，而 `Path.resolve()` 会返回 `runneradmin` 长路径。照片任务上下文先把已验证的相对受管路径转换成长路径绝对地址，AI 提交前的第二次受管目录校验再与短路径形式的数据目录做词法比较，因此误判为越界；现在验证后重新保存为受管相对路径，不放宽 UNC、重解析点或目录逃逸边界。三个路径断言改为按 `app_home()` / `db_path()` 的词法绝对路径契约比较，避免把同一目录的 8.3 与长路径别名误判为功能错误。
 - 验证：在 `C:\tmp\mc-win-019fb725` 的隔离 Python 3.11.9 与 3.13.5 上运行四个原失败用例，并补充断言确认照片生成上下文始终保留 `uploads/...` 相对路径；另运行相关受管媒体和原子恢复回归、`compileall`、`tools/release_check.py` 与 `git diff --check`。所有测试缓存通过 `PYTHONDONTWRITEBYTECODE=1` 禁止写入仓库。
 - 临时文件与剩余风险：未新增依赖或全局配置；测试日志与解释器仍集中在 `C:\tmp\mc-win-019fb725`。本轮不修改 `app_home()` 的词法路径实现，以免重新引入跟随 junction/reparse point 的安全风险；提交推送后仍需由 GitHub runner 的真实 `RUNNER~1` 环境完成最终确认。
+
+## 2026-08-01：Windows 隔离环境中的 Android 模拟器验收与安全加固
+
+- 目标：在不污染正式仓库和用户既有 Android 配置的前提下，于 Windows 上建立可一次性删除的完整 Android SDK、AVD、Gradle、Python 同步服务与报告环境；先于人工验收修复可复现的阻断、数据损坏风险和定向安全问题，并交付可直接安装运行的调试 APK。
+- 改动范围：修正 Android 的相机权限、表单状态、营养数字校验、时区容错、主线程 I/O、同步账户切换、冲突收敛、未知记录上限、资源元数据与路径、响应体大小、重试分类、Portable Data、二维码配对和密钥轮换恢复；增加 Room/同步/协议/恶意输入回归测试。AGP 的内部 UTP 宿主配置约束 Netty `4.1.136.Final` 与 Protobuf `3.25.5`，这些依赖不进入 APK 运行时。
+- 数据安全：同步账户切换或解除绑定只清理账户作用域状态，不删除领域记录或本地资源；冲突不能被后续写入绕过；资源下载使用受管规范路径、认证元数据、大小上限和原子替换；同步、AI 与导入响应均有流式上限；二维码配对要求用户手动输入的可信服务地址与二维码规范化地址完全一致后才发送密码；密钥轮换支持服务端已提交而本地尚未激活时的进程崩溃恢复。异常提示统一为中文。
+- 安全检查：按用户要求未调用 Codex Security。使用本地代码审计、恶意输入测试、仓库 `tools/dependency_check.py` 和官方 OSV Scanner `2.3.8` 的离线 Maven 数据库。初次报告的 14 个受影响坐标仅位于 AGP/UTP 宿主工具配置，未进入 `releaseRuntimeClasspath` 或 APK DEX；约束更新后扫描 329 个包实例，0 个漏洞包、0 条漏洞记录。在线 OSV API 曾因 TLS EOF 未返回结果，因此未把该失败当作“在线零漏洞”证据。
+- 自动验证：在临时源码副本中离线执行 `testDebugUnitTest assembleDebug lintDebug compileDebugAndroidTestKotlin connectedDebugAndroidTest`，构建成功；JVM 测试 16/16、真实模拟器仪器测试 14/14 通过。Lint 为 0 error、14 warning，其中 13 条是 `UseKtx` 风格建议，1 条 `ApplySharedPref` 对应故意使用同步 `commit()` 的密钥/身份故障关闭写入。AGP 还报告其 SDK XML 解析器最高理解 v3、已安装 SDK 元数据为 v4；未影响编译、安装或测试。
+- 真实运行：API 35 Google APIs x86_64 模拟器通过 WHPX 启动；最终 APK 完成冷启动、导航、相机授权与拒绝后存活、饮食记录保存后强停重启仍存在、食品库 `NaN` 输入即时拒绝且不能保存。隔离 Python 同步服务实测 Python 写入 → Android 拉取 → Android 写入 → Python 恢复，并检查数据库、资源、日志和备份中没有账户密码、恢复密钥、API Key 或明文测试标记。
+- 隔离位置：本轮所有 JDK、SDK、系统镜像、AVD、APK、构建输出、Gradle 缓存、OSV 数据库、Python venv、同步服务状态、日志、报告和截图都位于 `C:\tmp\mc-android-019fb725`。最终 APK 为 `final-validation-src-02\android\app\build\outputs\apk\debug\app-debug.apk`，大小 20,884,784 字节，SHA-256 为 `8B2CCEC88D12916A0B5B7F7BB04A4AAB744D928D1BD6C16895D2980A17E50604`；最终 OSV 报告为 `reports\osv-android-gradle-final-offline.json`。
+- 隔离复核：任务前后 `%USERPROFILE%\.android` 按“顶层文件名、长度、UTC 修改 ticks、文件 SHA-256”生成的清单摘要均为 `05241f9bb14d8265dba4a2ea19b5801598857177820eee84a7b02a3aa9796826`；正式仓库不存在 Android `.gradle`、`.kotlin`、`app/build`、APK、AAB、DEX、CLASS、lint/test 报告或 `local.properties` 残留。
+- 剩余风险：本轮覆盖一台 Windows 主机上的 API 35 x86_64 模拟器，不能等同于所有厂商 ROM、实体相机、低内存设备、弱网和 Play 商店签名分发；真正的外部同步服务证书、账号恢复和多实体设备矩阵仍需在对应生产环境验证。`_internal-unified-test-platform-*` 属于 AGP 内部配置名，升级 AGP 时必须保留依赖检查和 connected test 回归。
+- 用户用法：当前模拟器可继续安装并启动上述调试 APK 进行人工点击。验收结束后可要求“清理这次 Windows/Android 验收环境”，届时先停止临时模拟器和同步服务，再核对并删除明确的临时根，不触碰正式仓库或用户既有 `.android`。
+
+## 2026-08-01：Android 验收中止交接检查点
+
+- 状态：应用户要求立即停止继续扩展、修复和验收，并将现有成果提交为本地检查点；这不是 Android 最终验收结论。所有子任务均已中止或结束，本轮不推送分支、不创建或更新 PR，也未调用 Codex Security。
+- 当前验证：最新工作树通过 `python -m py_compile mealcircuit\portable.py sync_server\app.py tests\test_portable.py tests\test_sync_server.py`；临时源码副本 `C:\tmp\mc-android-019fb725\handoff-validation-src-10` 使用独立项目缓存 `handoff-project-cache-10` 离线执行 `compileDebugKotlin compileDebugUnitTestKotlin` 成功。更早的副本 09 曾通过 `testDebugUnitTest`，但它早于最后一轮同步、账户、服务端和冲突处理改动，不能代替最新全量验证。
+- 未完成验证：停止前没有针对最新代码重跑 Python 全量测试、`testDebugUnitTest assembleDebug lintDebug compileDebugAndroidTestKotlin connectedDebugAndroidTest`、最终 APK 构建/哈希、真实模拟器冷启动与跨客户端同步、在线依赖扫描和 CI；因此上一节的完整验收数字与 APK 只代表此前检查点，不代表当前提交。
+- 待接手重点：完成 AI 输入及全部来源的一致快照与提交前复核；验证未知记录满额轮转不会饿死队列或阻断 outbox；验证不同实体 kind 冲突与资源冲突在同步门内原子收敛；为永久缺失 blob 设置有界重试；为 `all_wifi` 资产补传调度不计费网络约束；复核并完成密钥轮换持久标记、分阶段恢复、登录/配对/注册回滚，以及服务端请求/密码资源限制、账户配额、轮换租约和全量重同步游标语义。
+- 隔离位置：新增的交接编译副本、缓存和 Python 字节码缓存仍全部位于 `C:\tmp\mc-android-019fb725`；模拟器及 adb 可能仍在运行。后续清理前应先重新枚举进程与路径，再只删除这个明确的临时根。
+
+## 2026-08-03：Android 验收收尾（快照一致性、unknown 轮换、冲突原子性、资产重试、网络约束、回滚与服务端复核）
+
+- 状态：接手 08-01 中止的交接检查点，按“待接手重点”完成全部七项后在本轮提交。未推送分支、未创建 PR、未调用 Codex Security；所有构建、测试、模拟器与同步服务均在 `C:\tmp\mc-android-019fb725` 的新副本中运行，正式仓库无任何构建残留。
+- AI 输入一致快照：`generateLatestTask` 现在把任务输入、任务主体、近 14 天记录、已发布签到、食品库、记忆、调整、偏好及其全部 head 修订 ID 放在同一个 `mutateTransaction`（同步门 + 单事务）内捕获；提交前在同一事务内重新校验全部来源的 head 修订 ID，任一来源在分析期间变化即拒绝保存。`MutationTransaction` 新增 `heads()`；`sourceSnapshot`/`provenance` 使用事务内捕获的版本。新增 instrumented 测试验证“快照后修改食品 → 提交被拒；重新捕获后提交成功”。
+- unknown 满额轮换：`sync_unknown_entities` 增加 `reprocessAttempts` 列（Room 迁移 v2→v3，新增 schema 3.json 与 2→3 迁移测试）；重处理失败计数，达到 10 次后驱逐该行并释放容量（`summary.unknownEvicted`）。`SyncBudget` 新增 `tryReserve` 语义，`putUnknown` 在容量满时跳过并计数（`unknownSkipped`）而不再中止整个同步运行，outbox 推送与资产同步不再被未知记录容量阻断；单信封 16MiB 协议违规仍保留硬性拒绝。
+- 冲突路径：复核确认按实体 kind 的 keep-local 解析、ASSET 冲突在同步门内的单事务提交与“文件缺失保持 unresolved 稍后重下”自愈路径；新增 instrumented 测试覆盖跨 kind 冲突 keep-local（head 保持本地 kind/revision、冲突关闭、本地 revision 重新入队）与 ASSET 冲突解析的文件+行原子提交、缺失文件保持 unresolved。
+- 永久缺失 blob：下载循环对 404 缺失分块、超声明字节数、摘要不一致改为抛 `PermanentAssetException`，归类为永久失败（有界，零无限退避），资源保持 unresolved 由下次用户触发同步重试；`syncFailureDisposition` 新增该类型的 FAILURE 分类，单测把 404 加入永久状态清单。
+- `all_wifi` 计费网络：引擎在计费网络跳过资产传输时置 `deferredAssetTransfer`，工作器随后用独立唯一名 + `NetworkType.UNMETERED` 约束排队后续任务（纯等待、无退避循环）；主同步任务保持 CONNECTED 约束不变。新增 `shouldDeferAssetTransfer` 纯函数单测与 UNMETERED workSpec instrumented 断言。
+- 账户回滚：`confirmRegistration` 任一步失败（含恢复包 PUT 成功但本地激活失败）后尽力撤销已建 session、清除登录令牌与待注册状态，与 login/claimPairing 的 `throwAfterSessionCleanup` 回滚一致；新增 instrumented 测试验证失败后令牌、账户数据密钥与待注册状态全部清空且同步未启用。密钥轮换 `abort` 在本机无任何暂存时改为纯离线 no-op（不再需要 remoteDeviceId 或网络），与既有测试意图一致。
+- 服务端复核与测试修复：复核确认请求体路由级限制（16KiB 认证/32MiB 推送/4MiB 分块/64KiB 小 JSON）、Argon2 固定成本 + 并发信号量 + 限流、六类账户配额、轮换租约心跳/过期接管、全量重同步负游标与并发写入回放、refresh 重用检测/设备撤销等均已实现并有测试；新增 blob 字节配额直测（`MEALCIRCUIT_SYNC_QUOTA_BYTES` 超限 413）。修复交接检查点遗留的 Python 集成测试：测试夹具补恢复包配置（服务端要求加密写入前必须先配置恢复密钥）与 capabilities 协商（拉取 limit 不得超过服务端有效上限）。
+- 验证：Python 全量 `unittest discover -s tests` 205 项通过、1 项按设计跳过（PostgreSQL 地址）；Android JVM 单测 30/30、`assembleDebug`、`lintDebug` 0 error 14 warning（13 条 UseKtx + 1 条 ApplySharedPref，与既有基线一致）、`compileDebugAndroidTestKotlin`、真实 API 35 模拟器 `connectedDebugAndroidTest` 25/25 通过（0 跳过），其中真实同步服务的 Python→Android→新 Python 双向离线 revision 交换、合成 API Key/密码/恢复密钥服务端零明文扫描全部通过（`tools/cross_client_sync_test.py prepare/verify`，退出码 0）。模拟器人工流程：APK 安装、冷启动、今天/计划/我的三页导航、饮食记录保存后强停重启仍在、照片任务相机权限拒绝后应用存活且页面完整；截图存于 `artifacts\acceptance-*.png`。
+- 最终产物：`handoff-validation-src-11\android\app\build\outputs\apk\debug\app-debug.apk`，大小 21,151,162 字节，SHA-256 `380F1F0A36C285F39A98A5FD3449657DEE0DA2DE90827292E3DA82A8058BFD4F`；androidTest APK 1,181,837 字节，SHA-256 `A2ACE60D9050D9D9CA85E7D920364AF046A1563A91B33BDC882A25B21DCC5598`。构建在 `handoff-validation-src-11` + 项目缓存 `handoff-project-cache-11`（GRADLE_USER_HOME 复用 `gradle-home`），同步服务运行于 `runtime-sync-acceptance`，全部位于 `C:\tmp\mc-android-019fb725`。
+- 隔离复核：`%USERPROFILE%\.android` 顶层文件“文件名、长度、UTC ticks、SHA-256”清单摘要仍为 `05241f9bb14d8265dba4a2ea19b5801598857177820eee84a7b02a3aa9796826`，与验收前一致；正式仓库无 `.gradle`/`.kotlin`/`app/build`/APK/AAB/DEX/CLASS/lint 报告/`local.properties` 残留。
+- 剩余风险：轮换中断恢复、永久缺失资产、计费网络、unknown 满额场景在代码层由单元/instrumented 测试覆盖，未在真实 UI 上逐一重演；`lintDebug` 14 条 warning 未清零（均为风格性，既有基线）；Android 仍只覆盖 API 35 x86_64 模拟器，实体相机、弱网、Play 分发与真实外部证书服务需生产环境验证。模拟器与同步服务进程已停止；需要视觉验收时按 `tools\enter-environment.ps1` 环境重启 AVD `MealCircuit_API35` 并安装上述 APK。

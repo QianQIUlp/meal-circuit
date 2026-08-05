@@ -27,8 +27,24 @@ The Compose volume is mounted at `/var/lib/postgresql`, the version-aware volume
 | `MEALCIRCUIT_SYNC_MAX_BATCH` | 100 operations |
 | `MEALCIRCUIT_SYNC_MAX_PULL` | 500 changes |
 | `MEALCIRCUIT_SYNC_MAX_ENTITY_BYTES` | 1 MiB ciphertext |
+| `MEALCIRCUIT_SYNC_MAX_PULL_RESPONSE_BYTES` | 32 MiB JSON response budget |
+| `MEALCIRCUIT_SYNC_MAX_REQUEST_BYTES` | 32 MiB sync-push request budget |
 | `MEALCIRCUIT_SYNC_MAX_BLOB_BYTES` | 10 MiB plaintext metadata limit |
 | `MEALCIRCUIT_SYNC_QUOTA_BYTES` | 10 GiB per account |
+| `MEALCIRCUIT_SYNC_MAX_ENTITIES` | 100,000 opaque entities and 100,000 blobs per account/key epoch |
+| `MEALCIRCUIT_SYNC_MAX_OPERATIONS` | 500,000 retained idempotency records per account |
+| `MEALCIRCUIT_SYNC_MAX_DEVICES` | 32 per account |
+| `MEALCIRCUIT_SYNC_MAX_PAIRINGS` | 32 active pairings per account |
+| `MEALCIRCUIT_SYNC_MAX_INCOMPLETE_BLOBS` | 128 per account |
+| `MEALCIRCUIT_SYNC_INCOMPLETE_BLOB_HOURS` | 24 hours before incomplete-blob cleanup |
+| `MEALCIRCUIT_SYNC_AUTH_RATE_LIMIT` | 20 login/registration attempts per source and window |
+| `MEALCIRCUIT_SYNC_AUTH_RATE_WINDOW_SECONDS` | 60 seconds |
+| `MEALCIRCUIT_SYNC_ARGON2_CONCURRENCY` | 2 concurrent password hash/verify jobs per process |
+| `MEALCIRCUIT_SYNC_ROTATION_LEASE_MINUTES` | 60-minute renewable key-rotation lease |
+
+The request and pull-response byte budgets can lower the effective batch or page count; `/v1/capabilities` reports those effective limits. Authentication rate limiting is per service process and source address, so multi-worker or multi-instance deployments should also enforce a shared limit at the trusted reverse proxy.
+
+Key rotation ownership is a renewable lease rather than a permanent account lock. Target-key pushes and blob uploads, plus owner status checks, renew it. After the configured idle period, the next rotation-sensitive request removes the abandoned target epoch and allows another authenticated device to start a fresh rotation; an unexpired non-owner still receives `409`.
 
 Run `alembic -c sync_server/alembic.ini upgrade head` before the service; the container does this automatically. The API contract is `protocol/sync-v1.openapi.json` and `/v1/capabilities` reports effective limits.
 

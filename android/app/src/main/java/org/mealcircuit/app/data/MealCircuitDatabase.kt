@@ -20,7 +20,7 @@ import androidx.sqlite.db.SupportSQLiteDatabase
         ManagedAssetEntity::class,
         SyncConfigurationEntity::class,
     ],
-    version = 2,
+    version = 3,
     exportSchema = true,
 )
 abstract class MealCircuitDatabase : RoomDatabase() {
@@ -34,13 +34,19 @@ abstract class MealCircuitDatabase : RoomDatabase() {
                 context.applicationContext,
                 MealCircuitDatabase::class.java,
                 "mealcircuit.db",
-            ).addMigrations(MIGRATION_1_2).build().also { instance = it }
+            ).addMigrations(MIGRATION_1_2, MIGRATION_2_3).build().also { instance = it }
         }
 
         val MIGRATION_1_2 = object : Migration(1, 2) {
             override fun migrate(db: SupportSQLiteDatabase) {
                 db.execSQL("CREATE TABLE IF NOT EXISTS `app_metadata` (`key` TEXT NOT NULL, `value` TEXT NOT NULL, PRIMARY KEY(`key`))")
                 db.execSQL("INSERT OR REPLACE INTO `app_metadata` (`key`,`value`) VALUES ('schema_version','2')")
+            }
+        }
+
+        val MIGRATION_2_3 = object : Migration(2, 3) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE `sync_unknown_entities` ADD COLUMN `reprocessAttempts` INTEGER NOT NULL DEFAULT 0")
             }
         }
     }

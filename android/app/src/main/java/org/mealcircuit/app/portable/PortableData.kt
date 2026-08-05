@@ -1,20 +1,27 @@
 package org.mealcircuit.app.portable
 
 import android.content.Context
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.decodeFromJsonElement
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.longOrNull
 import kotlinx.serialization.json.put
 import org.mealcircuit.app.data.DomainRepository
 import org.mealcircuit.app.data.ManagedAssetEntity
 import org.mealcircuit.app.data.SyncConflictEntity
 import org.mealcircuit.app.domain.DomainRevision
+import org.mealcircuit.app.domain.EntityKind
 import org.mealcircuit.app.domain.threeWayMerge
 import org.mealcircuit.app.io.readUpTo
 import org.mealcircuit.app.io.readBounded
@@ -23,11 +30,15 @@ import org.mealcircuit.app.io.MAX_MANAGED_ASSET_BYTES
 import org.mealcircuit.app.sync.formatRecoveryKey
 import org.mealcircuit.app.sync.hkdf
 import org.mealcircuit.app.sync.parseRecoveryKey
+import org.mealcircuit.app.sync.referencedAssetIds
 import java.io.DataInputStream
 import java.io.DataOutputStream
 import java.io.File
+import java.io.FileOutputStream
 import java.io.InputStream
 import java.io.OutputStream
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
 import java.security.MessageDigest
 import java.security.SecureRandom
 import java.time.Instant
@@ -41,104 +52,332 @@ import javax.crypto.spec.SecretKeySpec
 
 enum class ImportMode { RESTORE, MERGE }
 data class ImportPreview(val entities: Int, val revisions: Int, val assets: Int, val conflicts: Int)
+internal data class PortableImportStaging(val source: File, val preview: ImportPreview)
+
+internal data class PortableAssetBinding(
+    val id: String,
+    val sha256: String,
+    val path: String,
+    val byteCount: Long,
+    val mediaType: String,
+    val extension: String,
+    val revision: DomainRevision,
+)
+
+private enum class RevisionVisitState { VISITING, VISITED }
+
+private data class RevisionGraphFrame(
+    val revisionId: String,
+    val exiting: Boolean,
+)
+
+/** Validates the complete portable revision graph without consuming the thread stack. */
+internal fun validatePortableRevisionGraph(revisions: List<DomainRevision>) {
+    val byRevision = revisions.associateBy(DomainRevision::revisionId)
+    require(byRevision.size == revisions.size) { "Portable Data 包含重复 revision" }
+    val revisionIds = byRevision.keys
+    revisions.forEach { revision ->
+        require(revision.parentRevisionIds.all { parentId ->
+            byRevision[parentId]?.let { parent ->
+                parent.entityId == revision.entityId && parent.entityKind == revision.entityKind
+            } == true
+        }) {
+            "revision 父版本缺失或属于其他实体"
+        }
+    }
+
+    val states = HashMap<String, RevisionVisitState>(byRevision.size)
+    for (startId in revisionIds) {
+        if (states[startId] == RevisionVisitState.VISITED) continue
+        val stack = ArrayDeque<RevisionGraphFrame>()
+        stack.addLast(RevisionGraphFrame(startId, exiting = false))
+        while (stack.isNotEmpty()) {
+            val frame = stack.removeLast()
+            if (frame.exiting) {
+                states[frame.revisionId] = RevisionVisitState.VISITED
+                continue
+            }
+            when (states[frame.revisionId]) {
+                RevisionVisitState.VISITED -> continue
+                RevisionVisitState.VISITING -> throw IllegalArgumentException("修订关系图包含循环")
+                null -> Unit
+            }
+            states[frame.revisionId] = RevisionVisitState.VISITING
+            stack.addLast(RevisionGraphFrame(frame.revisionId, exiting = true))
+            val parents = byRevision.getValue(frame.revisionId).parentRevisionIds
+            for (index in parents.indices.reversed()) {
+                val parentId = parents[index]
+                when (states[parentId]) {
+                    RevisionVisitState.VISITING -> throw IllegalArgumentException("修订关系图包含循环")
+                    RevisionVisitState.VISITED -> Unit
+                    null -> stack.addLast(RevisionGraphFrame(parentId, exiting = false))
+                }
+            }
+        }
+    }
+}
+
+internal fun portableStorageRevision(revision: DomainRevision): DomainRevision {
+    if (revision.entityKind != EntityKind.ASSET || "archive_path" !in revision.payload) return revision
+    return revision.copy(payload = JsonObject(revision.payload - "archive_path")).validate()
+}
+
+/**
+ * Binds every manifest asset descriptor to the authoritative ASSET head it represents.
+ * Keeping this validation pure makes the archive boundary independently testable.
+ */
+internal fun bindPortableAssetDescriptors(
+    revisions: List<DomainRevision>,
+    heads: Map<String, String>,
+    descriptors: List<JsonObject>,
+): List<PortableAssetBinding> {
+    val revisionsById = revisions.associateBy(DomainRevision::revisionId)
+    require(revisionsById.size == revisions.size) { "Portable Data 包含重复 revision" }
+    val assetHeads = heads.mapNotNull { (entityId, revisionId) ->
+        val revision = revisionsById[revisionId]
+            ?: throw IllegalArgumentException("Portable Data 的 head revision 不存在：$revisionId")
+        require(revision.entityId == entityId) { "Portable Data 的 head 与实体不匹配：$entityId" }
+        revision.takeIf { it.entityKind == EntityKind.ASSET }
+    }.associateBy(DomainRevision::entityId)
+
+    fun JsonElement.requiredString(field: String): String {
+        val primitive = this as? JsonPrimitive
+            ?: throw IllegalArgumentException("资产字段 $field 必须是字符串")
+        require(primitive.isString) { "资产字段 $field 必须是字符串" }
+        return primitive.content
+    }
+
+    val seenIds = mutableSetOf<String>()
+    val seenPaths = mutableSetOf<String>()
+    val bindings = descriptors.map { descriptor ->
+        val legacy = descriptor.keys == LEGACY_PORTABLE_ASSET_DESCRIPTOR_FIELDS
+        require(legacy || descriptor.keys == PORTABLE_ASSET_DESCRIPTOR_FIELDS) {
+            "资产 descriptor 字段必须精确匹配受支持的协议"
+        }
+        val sha256 = descriptor.getValue("sha256").requiredString("sha256")
+        val path = descriptor.getValue("path").requiredString("path")
+        val bytesPrimitive = descriptor.getValue("bytes") as? JsonPrimitive
+            ?: throw IllegalArgumentException("资产字段 bytes 必须是整数")
+        require(!bytesPrimitive.isString) { "资产字段 bytes 必须是整数" }
+        val byteCount = bytesPrimitive.longOrNull
+            ?: throw IllegalArgumentException("资产字段 bytes 必须是整数")
+        val revision = if (legacy) {
+            val candidates = assetHeads.values.filter { candidate ->
+                val payload = candidate.payload
+                payload["sha256"]?.jsonPrimitive?.content == sha256 &&
+                    payload["byte_count"]?.jsonPrimitive?.longOrNull == byteCount &&
+                    payload["archive_path"]?.jsonPrimitive?.content == path
+            }
+            require(candidates.size == 1) {
+                "旧版资产 descriptor 无法唯一绑定到 ASSET head：$path"
+            }
+            candidates.single()
+        } else {
+            val id = descriptor.getValue("id").requiredString("id")
+            assetHeads[id] ?: throw IllegalArgumentException("资产 descriptor 没有对应的 ASSET head：$id")
+        }
+        val id = revision.entityId
+        val mediaType = if (legacy) {
+            revision.payload.getValue("media_type").requiredString("media_type")
+        } else {
+            descriptor.getValue("media_type").requiredString("media_type")
+        }
+        require(seenIds.add(id)) { "Portable Data 包含重复资产 ID：$id" }
+        require(seenPaths.add(path)) { "Portable Data 包含重复资产路径：$path" }
+
+        val payload = revision.payload
+        val payloadSha256 = payload.getValue("sha256").requiredString("sha256")
+        val payloadMediaType = payload.getValue("media_type").requiredString("media_type")
+        val extension = payload.getValue("extension").requiredString("extension")
+        val payloadByteCount = (payload.getValue("byte_count") as? JsonPrimitive)
+            ?.takeUnless { it.isString }
+            ?.longOrNull
+            ?: throw IllegalArgumentException("ASSET head 的 byte_count 必须是整数")
+        val archivePath = payload["archive_path"]?.requiredString("archive_path")
+            ?: throw IllegalArgumentException("ASSET head 缺少 archive_path：$id")
+        val expectedPath = "assets/$payloadSha256$extension"
+
+        require(sha256 == payloadSha256) { "资产 descriptor 的 sha256 与 ASSET head 不一致：$id" }
+        require(mediaType == payloadMediaType) { "资产 descriptor 的 media_type 与 ASSET head 不一致：$id" }
+        require(byteCount == payloadByteCount) { "资产 descriptor 的 bytes 与 ASSET head 不一致：$id" }
+        require(path == expectedPath && archivePath == expectedPath) {
+            "资产 descriptor 的 path/archive_path 与 ASSET head 不一致：$id"
+        }
+        PortableAssetBinding(id, sha256, path, byteCount, mediaType, extension, revision)
+    }
+    require(seenIds == assetHeads.keys) { "资产 descriptor 与 ASSET heads 不是一一对应关系" }
+    return bindings
+}
+
+internal fun requirePortableAssetReferences(
+    revisions: Iterable<DomainRevision>,
+    availableAssetIds: Set<String>,
+) {
+    val missing = referencedAssetIds(revisions) - availableAssetIds
+    require(missing.isEmpty()) { "领域实体引用了缺失资产：${missing.sorted()}" }
+}
+
+private val PORTABLE_ASSET_DESCRIPTOR_FIELDS = setOf("id", "sha256", "path", "bytes", "media_type")
+private val LEGACY_PORTABLE_ASSET_DESCRIPTOR_FIELDS = setOf("sha256", "path", "bytes")
 
 class PortableData(
     private val context: Context,
     private val repository: DomainRepository,
     private val json: Json = repository.json,
 ) {
-    suspend fun export(output: OutputStream, encrypted: Boolean = true): String? {
-        val plain = File.createTempFile("mealcircuit-", ".zip", context.cacheDir)
-        try {
-            buildZip(plain)
-            if (!encrypted) {
-                plain.inputStream().use { it.copyTo(output) }
-                return null
-            }
-            val secret = ByteArray(32).also(SecureRandom()::nextBytes)
-            encryptMcx(plain, output, secret)
-            return formatRecoveryKey(secret)
-        } finally {
-            plain.delete()
-        }
+    init {
+        context.cacheDir.listFiles()?.filter { file ->
+            file.name.startsWith("mealcircuit-source-") || file.name.startsWith("mealcircuit-plain-")
+        }?.forEach(File::delete)
     }
 
-    suspend fun preview(input: InputStream, recoveryKey: String?, mode: ImportMode): ImportPreview {
-        val archive = materializeArchive(input, recoveryKey)
-        try {
-            val parsed = readValidated(archive)
-            return calculatePreview(parsed, mode)
-        } finally {
-            archive.delete()
-        }
-    }
+    fun createRecoveryKey(): String = formatRecoveryKey(ByteArray(32).also(SecureRandom()::nextBytes))
 
-    suspend fun import(input: InputStream, recoveryKey: String?, mode: ImportMode): ImportPreview {
-        val archive = materializeArchive(input, recoveryKey)
-        val createdFiles = mutableListOf<File>()
+    internal suspend fun previewAndStage(
+        input: InputStream,
+        recoveryKey: String?,
+        mode: ImportMode,
+    ): PortableImportStaging = withContext(Dispatchers.IO) {
+        val source = File.createTempFile("mealcircuit-source-", ".portable", context.cacheDir)
         try {
-            val parsed = readValidated(archive)
-            val preview = calculatePreview(parsed, mode)
-            repository.importTransaction {
-                createdFiles += extractAssets(archive, parsed)
-                parsed.revisions.forEach { repository.storeRevision(it, materialize = false) }
-                val byId = parsed.revisions.associateBy { it.revisionId }
-                for ((entityId, revisionId) in parsed.heads) {
-                    val remote = byId.getValue(revisionId)
-                    val localHead = repository.heads().firstOrNull { it.entityId == entityId }
-                    if (localHead == null) {
-                        repository.commitRevision(remote, queue = false)
-                        continue
-                    }
-                    val local = repository.revision(localHead.revisionId) ?: continue
-                    if (local.payload == remote.payload && local.deleted == remote.deleted) continue
-                    val base = commonAncestor(local, remote, byId)
-                    if (base == null) {
-                        recordConflict(local, remote, null, listOf("$"))
-                        continue
-                    }
-                    val merged = threeWayMerge(base.payload, local.payload, remote.payload)
-                    val deleteEdit = local.deleted != remote.deleted &&
-                        ((local.deleted != base.deleted && remote.payload != base.payload) ||
-                            (remote.deleted != base.deleted && local.payload != base.payload))
-                    val paths = merged.conflicts + if (deleteEdit) listOf("\$deleted") else emptyList()
-                    if (paths.isNotEmpty()) {
-                        recordConflict(local, remote, base, paths)
-                        continue
-                    }
-                    repository.commitRevision(
-                        DomainRevision.create(
-                            local.entityKind,
-                            entityId,
-                            listOf(local.revisionId, remote.revisionId),
-                            repository.deviceId,
-                            merged.value,
-                            if (local.deleted == base.deleted) remote.deleted else local.deleted,
-                        )
-                    )
-                }
-                val storedIds = repository.revisions().map { it.revisionId }.toSet()
-                require(storedIds.containsAll(parsed.revisions.map { it.revisionId }))
-                if (mode == ImportMode.RESTORE) {
-                    val roundTrip = File.createTempFile("mealcircuit-roundtrip-", ".zip", context.cacheDir)
-                    try {
-                        buildZip(roundTrip)
-                        val restored = readValidated(roundTrip)
-                        require(restored.heads == parsed.heads)
-                        require(restored.revisions.map { it.revisionId }.toSet() == parsed.revisions.map { it.revisionId }.toSet())
-                        require(restored.assets.map { it.getValue("sha256").jsonPrimitive.content }.toSet() ==
-                            parsed.assets.map { it.getValue("sha256").jsonPrimitive.content }.toSet())
-                    } finally {
-                        roundTrip.delete()
-                    }
-                }
+            FileOutputStream(source).use { output ->
+                input.copyToBounded(output, MAX_ARCHIVE_BYTES + MAX_ENCRYPTED_OVERHEAD_BYTES)
+                output.fd.sync()
             }
-            return preview
+            val preview = source.inputStream().use { staged ->
+                preview(staged, recoveryKey, mode)
+            }
+            PortableImportStaging(source, preview)
         } catch (error: Throwable) {
-            createdFiles.forEach(File::delete)
+            source.delete()
             throw error
-        } finally {
-            archive.delete()
+        }
+    }
+
+    internal suspend fun importStaged(
+        staging: PortableImportStaging,
+        recoveryKey: String?,
+        mode: ImportMode,
+    ): ImportPreview = withContext(Dispatchers.IO) {
+        val source = requireStagedSource(staging.source)
+        source.inputStream().use { input -> import(input, recoveryKey, mode) }
+    }
+
+    internal fun discardStaged(staging: PortableImportStaging) {
+        val source = requireStagedSource(staging.source, requireExists = false)
+        check(!source.exists() || source.delete()) { "临时导入数据包清理失败" }
+    }
+
+    suspend fun export(
+        output: OutputStream,
+        encrypted: Boolean = true,
+        recoveryKey: String? = null,
+    ): String? = withContext(Dispatchers.IO) {
+        repository.withMutationGate {
+            val plain = File.createTempFile("mealcircuit-", ".zip", context.cacheDir)
+            try {
+                buildZip(plain)
+                if (!encrypted) {
+                    plain.inputStream().use { it.copyTo(output) }
+                    null
+                } else {
+                    val key = recoveryKey ?: createRecoveryKey()
+                    val secret = parseRecoveryKey(key)
+                    encryptMcx(plain, output, secret)
+                    key
+                }
+            } finally {
+                plain.delete()
+            }
+        }
+    }
+
+    suspend fun preview(input: InputStream, recoveryKey: String?, mode: ImportMode): ImportPreview = withContext(Dispatchers.IO) {
+        repository.withMutationGate {
+            val archive = materializeArchive(input, recoveryKey)
+            try {
+                val parsed = readValidated(archive)
+                calculatePreview(parsed, mode)
+            } finally {
+                archive.delete()
+            }
+        }
+    }
+
+    suspend fun import(input: InputStream, recoveryKey: String?, mode: ImportMode): ImportPreview = withContext(Dispatchers.IO) {
+        repository.withMutationGate {
+            val archive = materializeArchive(input, recoveryKey)
+            val createdFiles = mutableListOf<File>()
+            try {
+                val parsed = readValidated(archive)
+                val preview = calculatePreview(parsed, mode)
+                val storageRevisions = parsed.revisions.map(::portableStorageRevision)
+                repository.importTransaction {
+                    createdFiles += extractAssets(archive, parsed)
+                    storageRevisions.forEach { repository.storeRevision(it, materialize = false) }
+                    val byId = storageRevisions.associateBy { it.revisionId }
+                    for ((entityId, revisionId) in parsed.heads) {
+                        val remote = byId.getValue(revisionId)
+                        val localHead = repository.heads().firstOrNull { it.entityId == entityId }
+                        if (localHead == null) {
+                            repository.commitRevision(remote, queue = true)
+                            continue
+                        }
+                        val local = repository.revision(localHead.revisionId) ?: continue
+                        if (local.payload == remote.payload && local.deleted == remote.deleted) continue
+                        val base = commonAncestor(local, remote, byId)
+                        if (base == null) {
+                            recordConflict(local, remote, null, listOf("$"))
+                            continue
+                        }
+                        val merged = threeWayMerge(base.payload, local.payload, remote.payload)
+                        val deleteEdit = local.deleted != remote.deleted &&
+                            ((local.deleted != base.deleted && remote.payload != base.payload) ||
+                                (remote.deleted != base.deleted && local.payload != base.payload))
+                        val paths = merged.conflicts + if (deleteEdit) listOf("\$deleted") else emptyList()
+                        if (paths.isNotEmpty()) {
+                            recordConflict(local, remote, base, paths)
+                            continue
+                        }
+                        repository.commitRevision(
+                            DomainRevision.create(
+                                local.entityKind,
+                                entityId,
+                                listOf(local.revisionId, remote.revisionId),
+                                repository.deviceId,
+                                merged.value,
+                                if (local.deleted == base.deleted) remote.deleted else local.deleted,
+                            )
+                        )
+                    }
+                    val storedIds = repository.revisions().map { it.revisionId }.toSet()
+                    require(storedIds.containsAll(storageRevisions.map { it.revisionId }))
+                    if (mode == ImportMode.RESTORE) {
+                        val roundTrip = File.createTempFile("mealcircuit-roundtrip-", ".zip", context.cacheDir)
+                        try {
+                            buildZip(roundTrip)
+                            val restored = readValidated(roundTrip)
+                            require(restored.heads == parsed.heads)
+                            require(restored.revisions.map { it.revisionId }.toSet() == parsed.revisions.map { it.revisionId }.toSet())
+                            require(restored.assets.map { it.sha256 }.toSet() == parsed.assets.map { it.sha256 }.toSet())
+                        } finally {
+                            roundTrip.delete()
+                        }
+                    }
+                }
+                preview
+            } catch (error: Throwable) {
+                try {
+                    withContext(NonCancellable) {
+                        repository.cleanupUnreferencedAssetFiles(context.filesDir, createdFiles)
+                    }
+                } catch (cleanupError: Throwable) {
+                    if (cleanupError !== error) error.addSuppressed(cleanupError)
+                }
+                throw error
+            } finally {
+                archive.delete()
+            }
         }
     }
 
@@ -148,14 +387,31 @@ class PortableData(
             val current = local[entityId] ?: return@count false
             current.revisionId != revisionId
         }
-        require(mode == ImportMode.MERGE || local.isEmpty()) { "Restore target is not empty" }
+        require(mode == ImportMode.MERGE || local.isEmpty()) { "恢复目标并非空目录" }
         return ImportPreview(parsed.heads.size, parsed.revisions.size, parsed.assets.size, conflicts)
+    }
+
+    private fun requireStagedSource(source: File, requireExists: Boolean = true): File {
+        val cacheRoot = context.cacheDir.canonicalFile
+        val canonical = source.canonicalFile
+        require(
+            canonical.parentFile == cacheRoot && canonical.name.startsWith("mealcircuit-source-")
+        ) { "临时导入数据包路径无效" }
+        if (requireExists) require(canonical.isFile) { "临时导入数据包已失效，请重新预检" }
+        return canonical
     }
 
     private suspend fun buildZip(target: File) {
         val rawRevisions = repository.revisions()
         val heads = repository.heads().associate { it.entityId to it.revisionId }
-        val assets = repository.assets()
+        val rawByRevisionId = rawRevisions.associateBy(DomainRevision::revisionId)
+        val storedAssetsById = repository.assets().associateBy(ManagedAssetEntity::id)
+        val assetHeadIds = heads.entries.mapNotNull { (entityId, revisionId) ->
+            rawByRevisionId[revisionId]?.takeIf { it.entityKind == EntityKind.ASSET }?.let { entityId }
+        }.sorted()
+        val assets = assetHeadIds.map { id ->
+            storedAssetsById[id] ?: error("资产 $id 缺少受管文件记录")
+        }
         val assetsById = assets.associateBy { it.id }
         val revisions = rawRevisions.map { revision ->
             val asset = assetsById[revision.entityId]
@@ -167,6 +423,19 @@ class PortableData(
                 )
             )
         }
+        val assetDescriptors = assets.map { asset ->
+            buildJsonObject {
+                put("id", asset.id)
+                put("sha256", asset.sha256)
+                put("path", "assets/${asset.sha256}${asset.extension}")
+                put("bytes", asset.byteCount)
+                put("media_type", asset.mediaType)
+            }
+        }
+        bindPortableAssetDescriptors(revisions, heads, assetDescriptors)
+        requirePortableAssetReferences(revisions, assetDescriptors.mapTo(mutableSetOf()) {
+            it.getValue("id").jsonPrimitive.content
+        })
         val grouped = revisions.groupBy { it.entityKind.name.lowercase() }
         val content = grouped.mapValues { (_, values) ->
             (values.joinToString("\n") { json.encodeToString(it) } + "\n").toByteArray()
@@ -186,17 +455,7 @@ class PortableData(
                     })
                 }
             })
-            put("assets", buildJsonArray {
-                assets.forEach { asset ->
-                    add(buildJsonObject {
-                        put("id", asset.id)
-                        put("sha256", asset.sha256)
-                        put("path", "assets/${asset.sha256}${asset.extension}")
-                        put("bytes", asset.byteCount)
-                        put("media_type", asset.mediaType)
-                    })
-                }
-            })
+            put("assets", buildJsonArray { assetDescriptors.forEach(::add) })
         }
         ZipOutputStream(target.outputStream().buffered()).use { zip ->
             zip.putNextEntry(ZipEntry("manifest.json"))
@@ -208,9 +467,16 @@ class PortableData(
                 zip.closeEntry()
             }
             assets.forEach { asset ->
-                val relative = asset.relativePath ?: error("Asset ${asset.id} is not downloaded")
-                val file = context.filesDir.resolve(relative)
-                require(file.isFile && file.readBytes().sha256() == asset.sha256)
+                val relative = asset.relativePath ?: error("资源 ${asset.id} 尚未下载")
+                val filesRoot = context.filesDir.canonicalFile
+                val managedRoot = File(filesRoot, "assets").canonicalFile
+                require(managedRoot.parentFile == filesRoot) { "受管资产目录不可用" }
+                val expected = File(managedRoot, "${asset.sha256}${asset.extension}").canonicalFile
+                val file = File(filesRoot, relative).canonicalFile
+                require(file == expected && file.parentFile == managedRoot) { "资产路径逃逸受管目录" }
+                require(
+                    file.isFile && file.length() == asset.byteCount && file.sha256() == asset.sha256
+                ) { "资源 ${asset.id} 的文件与认证元数据不一致" }
                 zip.putNextEntry(ZipEntry("assets/${asset.sha256}${asset.extension}"))
                 file.inputStream().use { it.copyTo(zip) }
                 zip.closeEntry()
@@ -221,12 +487,12 @@ class PortableData(
     private data class Parsed(
         val revisions: List<DomainRevision>,
         val heads: Map<String, String>,
-        val assets: List<JsonObject>,
+        val assets: List<PortableAssetBinding>,
     )
 
     private fun readValidated(file: File): Parsed = ZipFile(file).use { zip ->
         val entries = zip.entries().toList()
-        require(entries.size <= 100_000)
+        require(entries.size <= MAX_ARCHIVE_ENTRIES)
         require(entries.map { it.name }.distinct().size == entries.size)
         require(entries.sumOf { it.size.coerceAtLeast(0) } <= MAX_ARCHIVE_BYTES)
         entries.forEach { entry ->
@@ -237,9 +503,9 @@ class PortableData(
                 MAX_METADATA_ENTRY_BYTES.toLong()
             }
             require(entry.size in 0..entryLimit)
-            require(entry.compressedSize <= 0 || entry.size <= entry.compressedSize * 1000)
+            require(entry.compressedSize <= 0 || entry.size <= entry.compressedSize * MAX_COMPRESSION_RATIO)
         }
-        val manifest = zip.getInputStream(zip.getEntry("manifest.json") ?: error("Missing manifest")).use {
+        val manifest = zip.getInputStream(zip.getEntry("manifest.json") ?: error("导入包缺少清单")).use {
             json.parseToJsonElement(it.readBounded(MAX_MANIFEST_BYTES).decodeToString()).jsonObject
         }
         require(manifest["format"]?.jsonPrimitive?.content == "mealcircuit.portable")
@@ -247,98 +513,134 @@ class PortableData(
         val content = manifest.getValue("content").jsonObject
         val revisions = mutableListOf<DomainRevision>()
         content.forEach { (path, descriptorValue) ->
-            val bytes = zip.getInputStream(zip.getEntry(path) ?: error("Missing $path")).use {
+            val bytes = zip.getInputStream(zip.getEntry(path) ?: error("导入包缺少 $path")).use {
                 it.readBounded(MAX_METADATA_ENTRY_BYTES)
             }
             require(bytes.sha256() == descriptorValue.jsonObject.getValue("sha256").jsonPrimitive.content)
             val lines = bytes.decodeToString().lineSequence().filter(String::isNotBlank).toList()
             require(lines.size == descriptorValue.jsonObject.getValue("count").jsonPrimitive.content.toInt())
+            require(revisions.size + lines.size <= MAX_REVISIONS)
             lines.forEach {
                 revisions += json.decodeFromString<DomainRevision>(it).validate()
             }
         }
-        require(revisions.map { it.revisionId }.distinct().size == revisions.size)
-        val revisionIds = revisions.map { it.revisionId }.toSet()
-        require(revisions.all { revisionIds.containsAll(it.parentRevisionIds) })
-        val byRevision = revisions.associateBy { it.revisionId }
-        val visiting = mutableSetOf<String>()
-        val visited = mutableSetOf<String>()
-        fun visit(id: String) {
-            if (id in visited) return
-            require(visiting.add(id)) { "Revision graph contains a cycle" }
-            byRevision.getValue(id).parentRevisionIds.forEach(::visit)
-            visiting.remove(id)
-            visited.add(id)
-        }
-        revisionIds.forEach(::visit)
+        validatePortableRevisionGraph(revisions)
         val heads = json.decodeFromJsonElement<Map<String, String>>(manifest.getValue("entity_heads"))
-        require(heads.all { (entity, revision) -> revisions.any { it.entityId == entity && it.revisionId == revision } })
+        require(heads.size <= MAX_ENTITIES)
+        val revisionsById = revisions.associateBy(DomainRevision::revisionId)
+        require(heads.all { (entity, revisionId) -> revisionsById[revisionId]?.entityId == entity })
         val assets = manifest.getValue("assets") as kotlinx.serialization.json.JsonArray
         val assetDescriptors = assets.map { it.jsonObject }
-        require(assetDescriptors.map { it.getValue("id").jsonPrimitive.content }.distinct().size == assetDescriptors.size)
-        require(assetDescriptors.map { it.getValue("path").jsonPrimitive.content }.distinct().size == assetDescriptors.size)
-        assetDescriptors.forEach { descriptor ->
-            val path = descriptor.getValue("path").jsonPrimitive.content
-            require(path.startsWith("assets/") && zip.getEntry(path) != null)
+        require(assetDescriptors.size <= MAX_ASSETS)
+        val assetBindings = bindPortableAssetDescriptors(revisions, heads, assetDescriptors)
+        val archiveAssetPaths = entries.asSequence()
+            .filterNot { it.isDirectory }
+            .map { it.name }
+            .filter { it.startsWith("assets/") }
+            .toSet()
+        require(archiveAssetPaths == assetBindings.map(PortableAssetBinding::path).toSet()) {
+            "归档中的资产文件必须与 manifest descriptor 精确对应"
+        }
+        assetBindings.forEach { binding ->
+            val path = binding.path
+            require(zip.getEntry(path) != null)
             val bytes = zip.getInputStream(zip.getEntry(path)).use { it.readBounded(MAX_MANAGED_ASSET_BYTES) }
-            require(bytes.size.toLong() == descriptor.getValue("bytes").jsonPrimitive.content.toLong())
-            require(bytes.sha256() == descriptor.getValue("sha256").jsonPrimitive.content)
+            require(bytes.size.toLong() == binding.byteCount)
+            require(bytes.sha256() == binding.sha256)
         }
-        val assetIds = revisions.filter { it.entityKind.name == "ASSET" }.map { it.entityId }.toSet()
-        fun referencedAssets(value: kotlinx.serialization.json.JsonElement): Sequence<String> = sequence {
-            when (value) {
-                is JsonObject -> for ((key, child) in value) {
-                    if (key.endsWith("asset_id") && child is kotlinx.serialization.json.JsonPrimitive && child.isString) {
-                        yield(child.content)
-                    }
-                    yieldAll(referencedAssets(child))
-                }
-                is kotlinx.serialization.json.JsonArray -> for (child in value) yieldAll(referencedAssets(child))
-                else -> Unit
-            }
-        }
-        require(revisions.flatMap { referencedAssets(it.payload).toList() }.all { it in assetIds })
-        Parsed(revisions, heads, assetDescriptors)
+        requirePortableAssetReferences(revisions, assetBindings.mapTo(mutableSetOf(), PortableAssetBinding::id))
+        Parsed(revisions, heads, assetBindings)
     }
 
     private suspend fun extractAssets(file: File, parsed: Parsed): List<File> = ZipFile(file).use { zip ->
         val created = mutableListOf<File>()
-        val assetRevisions = parsed.revisions.filter { it.entityKind.name == "ASSET" }
-        parsed.assets.forEach { descriptor ->
-            val path = descriptor.getValue("path").jsonPrimitive.content
-            val digest = descriptor.getValue("sha256").jsonPrimitive.content
-            val bytes = zip.getInputStream(zip.getEntry(path) ?: error("Missing asset")).use {
-                it.readBounded(MAX_MANAGED_ASSET_BYTES)
+        val localAssets = repository.assets()
+        val localById = localAssets.associateBy(ManagedAssetEntity::id)
+        val localByDigest = localAssets.associateBy(ManagedAssetEntity::sha256)
+        val localAssetHeads = repository.heads().mapNotNull { head ->
+            repository.revision(head.revisionId)?.takeIf { it.entityKind == EntityKind.ASSET }
+        }.associateBy(DomainRevision::entityId)
+        parsed.assets.forEach { binding ->
+            localById[binding.id]?.let { existing ->
+                require(
+                    existing.sha256 == binding.sha256 &&
+                        existing.mediaType == binding.mediaType &&
+                        existing.extension == binding.extension &&
+                        existing.byteCount == binding.byteCount
+                ) { "本机资产 ${binding.id} 的元数据与导入包不一致" }
             }
-            require(bytes.sha256() == digest)
-            val extension = path.substringAfterLast(digest)
-            val relative = "assets/$digest$extension"
-            val target = context.filesDir.resolve(relative)
-            target.parentFile?.mkdirs()
-            if (target.exists()) require(target.readBytes().sha256() == digest)
-            else {
-                target.writeBytes(bytes)
-                created += target
+            localByDigest[binding.sha256]?.let { existing ->
+                require(existing.id == binding.id) {
+                    "导入资产 ${binding.id} 的哈希已属于另一项本机资产"
+                }
             }
-            val revision = assetRevisions.firstOrNull {
-                it.payload["archive_path"]?.jsonPrimitive?.content == path
+            localAssetHeads[binding.id]?.let { existing ->
+                val payload = existing.payload
+                require(
+                    payload["sha256"]?.jsonPrimitive?.content == binding.sha256 &&
+                        payload["media_type"]?.jsonPrimitive?.content == binding.mediaType &&
+                        payload["extension"]?.jsonPrimitive?.content == binding.extension &&
+                        payload["byte_count"]?.jsonPrimitive?.longOrNull == binding.byteCount
+                ) { "本机资产 ${binding.id} 的活动修订与导入包元数据不一致" }
             }
-            repository.putAsset(
-                ManagedAssetEntity(
-                    descriptor["id"]?.jsonPrimitive?.content ?: revision?.entityId ?: "asset_$digest",
-                    digest,
-                    descriptor["media_type"]?.jsonPrimitive?.content
-                        ?: revision?.payload?.get("media_type")?.jsonPrimitive?.content
-                        ?: "application/octet-stream",
-                    extension,
-                    bytes.size.toLong(),
-                    relative,
-                    false,
-                    revision?.createdAt ?: Instant.now().toString(),
-                )
-            )
         }
-        created
+
+        val filesRoot = context.filesDir.canonicalFile
+        val root = File(filesRoot, "assets").apply { mkdirs() }.canonicalFile
+        require(root.isDirectory && root.parentFile == filesRoot) { "受管资产目录不可用" }
+        try {
+            parsed.assets.forEach { binding ->
+                val relative = binding.path
+                val target = File(filesRoot, relative).canonicalFile
+                require(target.parentFile == root && target.name == "${binding.sha256}${binding.extension}") {
+                    "资产路径逃逸受管目录"
+                }
+                if (target.exists()) {
+                    require(
+                        target.isFile && target.length() == binding.byteCount && target.sha256() == binding.sha256
+                    ) { "本机资产文件与导入包冲突：${binding.id}" }
+                } else {
+                    val temporary = File.createTempFile(".${binding.sha256}.", ".part", root)
+                    try {
+                        val bytes = zip.getInputStream(
+                            zip.getEntry(binding.path) ?: error("导入包缺少资产：${binding.path}")
+                        ).use { it.readBounded(MAX_MANAGED_ASSET_BYTES) }
+                        require(bytes.size.toLong() == binding.byteCount && bytes.sha256() == binding.sha256) {
+                            "导入资产校验失败：${binding.id}"
+                        }
+                        FileOutputStream(temporary).use { output ->
+                            output.write(bytes)
+                            output.fd.sync()
+                        }
+                        Files.move(
+                            temporary.toPath(),
+                            target.toPath(),
+                            StandardCopyOption.ATOMIC_MOVE,
+                            StandardCopyOption.REPLACE_EXISTING,
+                        )
+                        created += target
+                    } finally {
+                        temporary.delete()
+                    }
+                }
+                repository.putAsset(
+                    ManagedAssetEntity(
+                        binding.id,
+                        binding.sha256,
+                        binding.mediaType,
+                        binding.extension,
+                        binding.byteCount,
+                        relative,
+                        false,
+                        binding.revision.createdAt,
+                    )
+                )
+            }
+            created
+        } catch (error: Throwable) {
+            created.forEach(File::delete)
+            throw error
+        }
     }
 
     private suspend fun commonAncestor(
@@ -382,17 +684,30 @@ class PortableData(
 
     private fun materializeArchive(input: InputStream, recoveryKey: String?): File {
         val source = File.createTempFile("mealcircuit-source-", ".bin", context.cacheDir)
-        input.use { stream ->
-            source.outputStream().use { output ->
-                stream.copyToBounded(output, MAX_ARCHIVE_BYTES + MAX_ENCRYPTED_OVERHEAD_BYTES)
+        var target: File? = null
+        var completed = false
+        try {
+            input.use { stream ->
+                source.outputStream().use { output ->
+                    stream.copyToBounded(output, MAX_ARCHIVE_BYTES + MAX_ENCRYPTED_OVERHEAD_BYTES)
+                }
+            }
+            if (!source.inputStream().use { it.readUpTo(5).contentEquals("MCX1\n".toByteArray()) }) {
+                completed = true
+                return source
+            }
+            require(recoveryKey != null) { "需要恢复密钥" }
+            target = File.createTempFile("mealcircuit-plain-", ".zip", context.cacheDir)
+            decryptMcx(source, target, parseRecoveryKey(recoveryKey))
+            check(source.delete()) { "无法删除加密导入暂存文件" }
+            completed = true
+            return target
+        } finally {
+            if (!completed) {
+                source.delete()
+                target?.delete()
             }
         }
-        if (!source.inputStream().use { it.readUpTo(5).contentEquals("MCX1\n".toByteArray()) }) return source
-        require(recoveryKey != null) { "Recovery key required" }
-        val target = File.createTempFile("mealcircuit-plain-", ".zip", context.cacheDir)
-        decryptMcx(source, target, parseRecoveryKey(recoveryKey))
-        source.delete()
-        return target
     }
 
     private fun encryptMcx(source: File, output: OutputStream, secret: ByteArray) {
@@ -424,9 +739,9 @@ class PortableData(
             val headerBytes = mutableListOf<Byte>()
             while (true) {
                 val value = data.read()
-                require(value >= 0) { "truncated MCX header" }
+                require(value >= 0) { "MCX 文件头不完整" }
                 if (value == '\n'.code) break
-                require(headerBytes.size < MAX_MCX_HEADER_BYTES) { "MCX header too large" }
+                require(headerBytes.size < MAX_MCX_HEADER_BYTES) { "MCX 文件头过大" }
                 headerBytes += value.toByte()
             }
             val header = headerBytes.toByteArray()
@@ -442,10 +757,10 @@ class PortableData(
                     require(size in 17..CHUNK + 16)
                     val nonce = data.readUpTo(12)
                     val cipher = data.readUpTo(size)
-                    require(nonce.size == 12 && cipher.size == size) { "truncated MCX chunk" }
+                    require(nonce.size == 12 && cipher.size == size) { "MCX 加密分块不完整" }
                     val plain = crypt(Cipher.DECRYPT_MODE, key, nonce, blobAad(header, index), cipher)
                     total += plain.size
-                    require(total <= MAX_ARCHIVE_BYTES) { "decrypted archive too large" }
+                    require(total <= MAX_ARCHIVE_BYTES) { "解密后的数据包过大" }
                     output.write(plain)
                     index += 1
                 }
@@ -466,12 +781,30 @@ class PortableData(
 
     private fun ByteArray.sha256() = MessageDigest.getInstance("SHA-256").digest(this).joinToString("") { "%02x".format(it) }
 
+    private fun File.sha256(): String {
+        val digest = MessageDigest.getInstance("SHA-256")
+        inputStream().buffered().use { input ->
+            val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+            while (true) {
+                val count = input.read(buffer)
+                if (count < 0) break
+                digest.update(buffer, 0, count)
+            }
+        }
+        return digest.digest().joinToString("") { "%02x".format(it) }
+    }
+
     companion object {
         private const val CHUNK = 4 * 1024 * 1024
-        private const val MAX_MANIFEST_BYTES = 8 * 1024 * 1024
-        private const val MAX_METADATA_ENTRY_BYTES = 64 * 1024 * 1024
+        private const val MAX_MANIFEST_BYTES = 2 * 1024 * 1024
+        private const val MAX_METADATA_ENTRY_BYTES = 16 * 1024 * 1024
         private const val MAX_MCX_HEADER_BYTES = 64 * 1024
-        private const val MAX_ARCHIVE_BYTES = 10L * 1024 * 1024 * 1024
-        private const val MAX_ENCRYPTED_OVERHEAD_BYTES = 64L * 1024 * 1024
+        private const val MAX_ARCHIVE_BYTES = 1024L * 1024 * 1024
+        private const val MAX_ENCRYPTED_OVERHEAD_BYTES = 16L * 1024 * 1024
+        private const val MAX_ARCHIVE_ENTRIES = 10_000
+        private const val MAX_REVISIONS = 20_000
+        private const val MAX_ENTITIES = 10_000
+        private const val MAX_ASSETS = 5_000
+        private const val MAX_COMPRESSION_RATIO = 100
     }
 }

@@ -4,10 +4,16 @@ import android.app.Application
 import android.net.Uri
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.json.put
@@ -24,10 +30,13 @@ import kotlinx.serialization.json.putJsonArray
 import kotlinx.serialization.json.add
 import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.doubleOrNull
+import kotlinx.serialization.SerializationException
 import org.mealcircuit.app.ai.AiClient
 import org.mealcircuit.app.ai.AiProvider
 import org.mealcircuit.app.data.ManagedAssetEntity
 import org.mealcircuit.app.data.MaterializedRecordEntity
+import org.mealcircuit.app.data.EntityHeadEntity
+import org.mealcircuit.app.data.DomainRepository
 import org.mealcircuit.app.domain.DomainRevision
 import org.mealcircuit.app.domain.EntityKind
 import org.mealcircuit.app.domain.CheckinContract
@@ -40,20 +49,28 @@ import org.mealcircuit.app.sync.PendingRegistration
 import org.mealcircuit.app.sync.KeyRotationManager
 import org.mealcircuit.app.sync.SyncAccountManager
 import org.mealcircuit.app.sync.SyncWorker
+import org.mealcircuit.app.sync.parsePairingPayload
 import org.mealcircuit.app.portable.ImportMode
 import org.mealcircuit.app.portable.PortableData
 import org.mealcircuit.app.portable.ImportPreview
+import org.mealcircuit.app.portable.PortableImportStaging
 import org.mealcircuit.app.io.readBounded
 import org.mealcircuit.app.io.MAX_MANAGED_ASSET_BYTES
+import java.io.File
+import java.io.FileOutputStream
+import java.nio.file.AtomicMoveNotSupportedException
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
 import java.security.MessageDigest
 import java.time.Instant
 import java.time.LocalDate
 import java.time.ZoneId
+import java.time.format.DateTimeParseException
+import java.security.GeneralSecurityException
 
 data class UiMessage(val text: String, val isError: Boolean = false)
 data class DeviceUi(val id: String, val name: String, val current: Boolean, val revoked: Boolean)
 data class PortableImportUi(
-    val uri: Uri,
     val recoveryKey: String,
     val mode: ImportMode,
     val preview: ImportPreview,
@@ -64,14 +81,96 @@ private val ASSET_EXTENSIONS = mapOf(
     "image/gif" to ".gif", "image/webp" to ".webp",
 )
 
+private data class TaskGenerationSnapshot(
+    val input: MaterializedRecordEntity,
+    val task: MaterializedRecordEntity,
+    val inputHeadRevisionId: String,
+    val taskHeadRevisionId: String,
+    val recentRecords: List<MaterializedRecordEntity>,
+    val recentCheckins: List<MaterializedRecordEntity>,
+    val foodLibrary: List<MaterializedRecordEntity>,
+    val memories: List<MaterializedRecordEntity>,
+    val adjustments: List<MaterializedRecordEntity>,
+    val domainPreferences: List<MaterializedRecordEntity>,
+    val sourceHeads: List<EntityHeadEntity>,
+)
+
+internal fun canReuseManagedAsset(
+    filesDir: File,
+    existing: ManagedAssetEntity,
+    activeRecord: MaterializedRecordEntity?,
+    digest: String,
+    mediaType: String,
+    extension: String,
+    byteCount: Long,
+): Boolean {
+    require(
+        existing.sha256 == digest &&
+            existing.mediaType == mediaType &&
+            existing.extension == extension &&
+            existing.byteCount == byteCount
+    ) { "已有照片资源的身份元数据不一致" }
+    val expected = filesDir.resolve("assets/${existing.sha256}${existing.extension}").canonicalFile
+    val configured = existing.relativePath?.let { filesDir.resolve(it).canonicalFile }
+    require(configured == null || configured == expected) { "已有照片资源路径不安全" }
+    val record = activeRecord?.takeUnless { it.deleted } ?: return false
+    require(record.entityKind == "asset") { "已有照片资源的领域类型不一致" }
+    val payload = runCatching { Json.parseToJsonElement(record.payloadJson).jsonObject }
+        .getOrElse { throw IllegalStateException("已有照片资源的领域元数据无效", it) }
+    require(
+        payload["sha256"]?.jsonPrimitive?.content == digest &&
+            payload["media_type"]?.jsonPrimitive?.content == mediaType &&
+            payload["extension"]?.jsonPrimitive?.content == extension &&
+            payload["byte_count"]?.jsonPrimitive?.content?.toLongOrNull() == byteCount
+    ) { "已有照片资源的领域元数据不一致" }
+    return configured?.isFile == true &&
+        configured.length() == byteCount &&
+        configured.sha256Hex() == digest
+}
+
+class SettingsEditorState {
+    var profile by mutableStateOf("")
+    var doctrine by mutableStateOf("")
+    var settingsJson by mutableStateOf(
+        """{
+  "schema_version": 1,
+  "timezone": "${ZoneId.systemDefault().id}",
+  "meal_environment": "用户自行配置",
+  "protein_target_g": [50, 65],
+  "portion_method": "按实际饥饿和正餐结构",
+  "missing_training_default": "保持未知，不推断为未训练",
+  "compensation_boundary": "不跳餐、不清零主食、不极端压低热量；只撤掉重复加餐并恢复标准份量。",
+  "home_cooking": {"enabled": false}
+}"""
+    )
+    var profileDirty by mutableStateOf(false)
+    var doctrineDirty by mutableStateOf(false)
+    var settingsDirty by mutableStateOf(false)
+    var profileSource by mutableStateOf<String?>(null)
+    var doctrineSource by mutableStateOf<String?>(null)
+    var settingsSource by mutableStateOf<String?>(null)
+}
+private const val EXPORT_RECOVERY_KEY = "portable.export_recovery_key"
+
+private fun zoneIdOrNull(value: String?): ZoneId? = value
+    ?.trim()
+    ?.takeIf(String::isNotEmpty)
+    ?.let { runCatching { ZoneId.of(it) }.getOrNull() }
+
+private fun normalizedTimezone(value: String?): String =
+    (zoneIdOrNull(value) ?: ZoneId.systemDefault()).id
+
+internal fun requireCheckinDate(value: String): String = LocalDate.parse(value).toString()
+
 class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val app = application as MealCircuitApplication
     val repository = app.repository
-    private val accounts = SyncAccountManager(repository, app.vault)
-    private val keyRotation = KeyRotationManager(application, repository, app.vault)
-    private val ai = AiClient(app.vault)
-    private val portable = PortableData(application, repository)
-    private val checkinContract = CheckinContract.load(application)
+    private val accounts = lazy { SyncAccountManager(repository, app.vault) }
+    private val keyRotation = lazy { KeyRotationManager(application, repository, app.vault) }
+    private val ai = lazy { AiClient(app.vault) }
+    private val portable = lazy { PortableData(application, repository) }
+    private val checkinContract = lazy { CheckinContract.load(application) }
+    val settingsEditor = SettingsEditorState()
     private val _message = MutableStateFlow<UiMessage?>(null)
     val message: StateFlow<UiMessage?> = _message.asStateFlow()
     private val _pendingRegistration = MutableStateFlow<PendingRegistration?>(null)
@@ -80,15 +179,19 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     val exportRecoveryKey: StateFlow<String?> = _exportRecoveryKey.asStateFlow()
     private val _portableImport = MutableStateFlow<PortableImportUi?>(null)
     val portableImport: StateFlow<PortableImportUi?> = _portableImport.asStateFlow()
+    private var stagedPortableImport: PortableImportStaging? = null
     private val _pairingQr = MutableStateFlow<String?>(null)
     val pairingQr: StateFlow<String?> = _pairingQr.asStateFlow()
+    private val _pairingServerUrl = MutableStateFlow<String?>(null)
+    val pairingServerUrl: StateFlow<String?> = _pairingServerUrl.asStateFlow()
     private val _devices = MutableStateFlow<List<DeviceUi>>(emptyList())
     val devices: StateFlow<List<DeviceUi>> = _devices.asStateFlow()
-    private val _pendingRotationRecovery = MutableStateFlow(keyRotation.pendingRecovery())
+    private val _pendingRotationRecovery = MutableStateFlow<String?>(null)
     val pendingRotationRecovery: StateFlow<String?> = _pendingRotationRecovery.asStateFlow()
     private val preferences = application.getSharedPreferences("user_settings", android.content.Context.MODE_PRIVATE)
-    private val _timezone = MutableStateFlow(preferences.getString("timezone", ZoneId.systemDefault().id)!!)
+    private val _timezone = MutableStateFlow(normalizedTimezone(preferences.getString("timezone", null)))
     val timezone: StateFlow<String> = _timezone.asStateFlow()
+    private val activeActionKeys = mutableSetOf<String>()
     private val defaultCheckinModules = setOf("weight", "training", "hunger", "sleep", "gut")
     private val _checkinModules = MutableStateFlow(
         preferences.getStringSet("checkin_modules", defaultCheckinModules)?.toSet() ?: defaultCheckinModules
@@ -96,6 +199,19 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     val checkinModules: StateFlow<Set<String>> = _checkinModules.asStateFlow()
 
     init {
+        if (preferences.getString("timezone", null) != _timezone.value) {
+            preferences.edit().putString("timezone", _timezone.value).apply()
+        }
+        viewModelScope.launch(Dispatchers.IO) {
+            val pendingRegistration = accounts.value.pendingRegistration()
+            val exportRecoveryKey = app.vault.get(EXPORT_RECOVERY_KEY)?.decodeToString()
+            val pendingRotationRecovery = keyRotation.value.pendingRecovery()
+            withContext(Dispatchers.Main.immediate) {
+                _pendingRegistration.value = pendingRegistration
+                _exportRecoveryKey.value = exportRecoveryKey
+                _pendingRotationRecovery.value = pendingRotationRecovery
+            }
+        }
         viewModelScope.launch {
             repository.observe(EntityKind.PREFERENCES).collect { records ->
                 records.forEach { record ->
@@ -105,10 +221,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     when (payload["kind"]?.jsonPrimitive?.content) {
                         "settings" -> runCatching {
                             Json.parseToJsonElement(content).jsonObject["timezone"]?.jsonPrimitive?.content
-                        }.getOrNull()?.let { timezone ->
-                            ZoneId.of(timezone)
-                            preferences.edit().putString("timezone", timezone).commit()
-                            _timezone.value = timezone
+                        }.getOrNull()?.let(::zoneIdOrNull)?.let { timezone ->
+                            preferences.edit().putString("timezone", timezone.id).apply()
+                            _timezone.value = timezone.id
                         }
                         "checkin_settings" -> runCatching {
                             Json.parseToJsonElement(content).jsonArray.mapNotNull { element ->
@@ -128,10 +243,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun dismissMessage() { _message.value = null }
 
-    fun addDailyRecord(text: String) = launchAction("记录已保存") {
+    fun addDailyRecord(text: String, onSuccess: () -> Unit = {}) =
+        launchAction("记录已保存", onSuccess = onSuccess) {
         require(text.isNotBlank())
         val recordId = DomainRevision.id("record")
-        val day = LocalDate.now(ZoneId.of(_timezone.value)).toString()
+        val day = LocalDate.now(currentZoneId()).toString()
         repository.save(
             EntityKind.DAILY_RECORD,
             buildJsonObject {
@@ -145,7 +261,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         SyncWorker.enqueue(getApplication())
     }
 
-    fun updateDailyRecord(recordId: String, text: String) = launchAction("记录已更新") {
+    fun updateDailyRecord(recordId: String, text: String, onSuccess: () -> Unit = {}) =
+        launchAction("记录已更新", onSuccess = onSuccess) {
         require(text.isNotBlank())
         val existing = requireNotNull(repository.record(recordId)) { "要修改的记录不存在" }
         require(existing.entityKind == "daily_record") { "只能修改饮食记录" }
@@ -165,25 +282,35 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun saveCheckinDraft(
+        day: String,
         raw: Map<String, Map<String, JsonElement>>,
         other: Map<String, Map<String, String>>,
         skipped: Set<String>,
-    ) = saveStructuredCheckin(raw, other, skipped, false)
+        onSuccess: () -> Unit = {},
+    ) = saveStructuredCheckin(day, raw, other, skipped, false, onSuccess)
     fun publishCheckin(
+        day: String,
         raw: Map<String, Map<String, JsonElement>>,
         other: Map<String, Map<String, String>>,
         skipped: Set<String>,
-    ) = saveStructuredCheckin(raw, other, skipped, true)
+        onSuccess: () -> Unit = {},
+    ) = saveStructuredCheckin(day, raw, other, skipped, true, onSuccess)
 
     private fun saveStructuredCheckin(
+        requestedDay: String,
         raw: Map<String, Map<String, JsonElement>>,
         other: Map<String, Map<String, String>>,
         skipped: Set<String>,
         published: Boolean,
-    ) =
-        launchAction(if (published) "状态已发布" else "状态草稿已保存") {
-            val day = LocalDate.now(ZoneId.of(_timezone.value)).toString()
-            val answers = checkinContract.modules.associate { module ->
+        onSuccess: () -> Unit = {},
+    ) {
+        val day = requireCheckinDate(requestedDay)
+        return launchAction(
+            if (published) "状态已发布" else "状态草稿已保存",
+            actionKey = "checkin:$day",
+            onSuccess = onSuccess,
+        ) {
+            val answers = checkinContract.value.modules.associate { module ->
                 val values = raw[module.key].orEmpty()
                 module.key to module.normalize(
                     values,
@@ -192,19 +319,20 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 )
             }
             require(answers.values.any { it.isNotEmpty() } || skipped.isNotEmpty())
-            val existingRecord = repository.records(EntityKind.CHECKIN_DAY).firstOrNull { record ->
-                runCatching {
-                    Json.parseToJsonElement(record.payloadJson).jsonObject
-                        .getValue("checkin").jsonObject.getValue("checkin_date").jsonPrimitive.content == day
-                }.getOrDefault(false)
-            }
-            val existing = existingRecord?.let { Json.parseToJsonElement(it.payloadJson).jsonObject }
-            val checkinId = existingRecord?.entityId ?: DomainRevision.id("checkin")
-            val timestamp = Instant.now().toString()
-            val previousModules = existing?.get("modules")?.jsonArray.orEmpty().associateBy {
-                it.jsonObject.getValue("module").jsonObject.getValue("module_key").jsonPrimitive.content
-            }
-            repository.save(
+            repository.withMutationGate {
+                val existingRecord = repository.records(EntityKind.CHECKIN_DAY).firstOrNull { record ->
+                    runCatching {
+                        Json.parseToJsonElement(record.payloadJson).jsonObject
+                            .getValue("checkin").jsonObject.getValue("checkin_date").jsonPrimitive.content == day
+                    }.getOrDefault(false)
+                }
+                val existing = existingRecord?.let { Json.parseToJsonElement(it.payloadJson).jsonObject }
+                val checkinId = existingRecord?.entityId ?: DomainRevision.id("checkin")
+                val timestamp = Instant.now().toString()
+                val previousModules = existing?.get("modules")?.jsonArray.orEmpty().associateBy {
+                    it.jsonObject.getValue("module").jsonObject.getValue("module_key").jsonPrimitive.content
+                }
+                repository.save(
                 EntityKind.CHECKIN_DAY,
                 buildJsonObject {
                     put("checkin", buildJsonObject {
@@ -269,71 +397,96 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     })
                 },
                 checkinId,
-            )
+                )
+            }
             SyncWorker.enqueue(getApplication())
         }
+    }
 
-    fun addMaterialTask(materials: String) = launchAction("原材料任务已创建") {
+    fun addMaterialTask(materials: String, onSuccess: () -> Unit = {}) =
+        launchAction("原材料任务已创建", onSuccess = onSuccess) {
         require(materials.isNotBlank())
         val taskId = DomainRevision.id("task")
-        repository.save(
-            EntityKind.TASK,
-            buildJsonObject {
-                put("task", buildJsonObject {
-                    put("id", taskId); put("type", "material"); put("status", "pending")
-                    put("created_at", Instant.now().toString()); put("result_version", 0)
-                })
-            },
-            taskId,
-        )
-        repository.save(
-            EntityKind.TASK_INPUT,
-            buildJsonObject {
-                put("task_id", taskId)
-                put("task_type", "material")
-                put("input_version", 1)
-                put("original_input", materials.trim())
-                put("input_history", buildJsonArray {})
-            },
-            taskInputId(taskId),
-        )
+        repository.mutateTransaction {
+            save(
+                EntityKind.TASK,
+                buildJsonObject {
+                    put("task", buildJsonObject {
+                        put("id", taskId); put("type", "material"); put("status", "pending")
+                        put("created_at", Instant.now().toString()); put("result_version", 0)
+                    })
+                },
+                taskId,
+            )
+            save(
+                EntityKind.TASK_INPUT,
+                buildJsonObject {
+                    put("task_id", taskId)
+                    put("task_type", "material")
+                    put("input_version", 1)
+                    put("original_input", materials.trim())
+                    put("input_history", buildJsonArray {})
+                },
+                taskInputId(taskId),
+            )
+        }
         SyncWorker.enqueue(getApplication())
     }
 
-    fun addPhotoTask(uri: Uri, note: String, afterRead: () -> Unit = {}) =
-        launchAction("照片任务已保存在本机") {
-        val asset = try {
-            ingestAsset(uri)
+    fun addPhotoTask(
+        uri: Uri,
+        note: String,
+        afterRead: () -> Unit = {},
+        onSuccess: () -> Unit = {},
+    ) = launchAction("照片任务已保存在本机", onSuccess = onSuccess) {
+        val createdTargets = mutableListOf<File>()
+        try {
+            withContext(Dispatchers.IO) {
+                repository.mutateTransaction(
+                    onFailure = {
+                        repository.cleanupUnreferencedAssetFiles(
+                            getApplication<Application>().filesDir,
+                            createdTargets,
+                        )
+                    },
+                ) {
+                    val asset = ingestAssetLocked(uri, this, createdTargets)
+                    val taskId = DomainRevision.id("task")
+                    save(
+                        EntityKind.TASK,
+                        buildJsonObject {
+                            put("task", buildJsonObject {
+                                put("id", taskId); put("type", "photo"); put("status", "pending")
+                                put("created_at", Instant.now().toString()); put("result_version", 0)
+                            })
+                        },
+                        taskId,
+                    )
+                    save(
+                        EntityKind.TASK_INPUT,
+                        buildJsonObject {
+                            put("task_id", taskId)
+                            put("task_type", "photo")
+                            put("input_version", 1)
+                            put("original_input", note.trim())
+                            put("asset_id", asset.id)
+                            put("input_history", buildJsonArray {})
+                        },
+                        taskInputId(taskId),
+                    )
+                }
+            }
         } finally {
             afterRead()
         }
-        val taskId = DomainRevision.id("task")
-        repository.save(
-            EntityKind.TASK,
-            buildJsonObject {
-                put("task", buildJsonObject {
-                    put("id", taskId); put("type", "photo"); put("status", "pending")
-                    put("created_at", Instant.now().toString()); put("result_version", 0)
-                })
-            },
-            taskId,
-        )
-        repository.save(
-            EntityKind.TASK_INPUT,
-            buildJsonObject {
-                put("task_id", taskId)
-                put("task_type", "photo")
-                put("input_version", 1)
-                put("original_input", note.trim())
-                put("asset_id", asset.id)
-                put("input_history", buildJsonArray {})
-            },
-            taskInputId(taskId),
-        )
         SyncWorker.enqueue(getApplication())
     }
 
-    private suspend fun ingestAsset(uri: Uri): ManagedAssetEntity {
+    private suspend fun ingestAssetLocked(
+        uri: Uri,
+        transaction: DomainRepository.MutationTransaction,
+        createdTargets: MutableList<File>,
+    ): ManagedAssetEntity {
         val application = getApplication<Application>()
         val resolver = application.contentResolver
         val bytes = try {
@@ -347,37 +500,64 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val extension = ASSET_EXTENSIONS.getValue(mediaType)
         val digest = MessageDigest.getInstance("SHA-256").digest(bytes).hex()
         val assetId = "asset_$digest"
-        repository.asset(assetId)?.let { existing ->
-            val file = existing.relativePath?.let(application.filesDir::resolve)
-            if (file?.isFile == true && file.length() == bytes.size.toLong()) return existing
+        transaction.asset(assetId)?.let { existing ->
+            val reusable = canReuseManagedAsset(
+                application.filesDir,
+                existing,
+                transaction.record(assetId),
+                digest,
+                mediaType,
+                extension,
+                bytes.size.toLong(),
+            )
+            if (reusable) return existing
         }
         val relative = "assets/$digest$extension"
-        val target = application.filesDir.resolve(relative)
+        val target = application.filesDir.resolve(relative).canonicalFile
         val parent = requireNotNull(target.parentFile)
         parent.mkdirs()
-        val temporary = parent.resolve(".${target.name}.${DomainRevision.id("tmp")}")
-        temporary.writeBytes(bytes)
-        if (!temporary.renameTo(target)) {
-            temporary.copyTo(target, overwrite = true)
-            check(temporary.delete()) { "临时照片清理失败" }
+        require(parent.isDirectory && parent.parentFile == application.filesDir.canonicalFile) {
+            "照片资源目录不可用"
         }
-        val asset = ManagedAssetEntity(
-            assetId, digest, mediaType, extension, bytes.size.toLong(), relative,
-            unresolved = false, createdAt = Instant.now().toString(),
-        )
-        repository.putAsset(asset)
-        repository.save(
-            EntityKind.ASSET,
-            buildJsonObject {
-                put("sha256", digest); put("media_type", mediaType)
-                put("extension", extension); put("byte_count", bytes.size)
-            },
-            assetId,
-        )
-        return asset
+        val temporary = parent.resolve(".${target.name}.${DomainRevision.id("tmp")}")
+        val targetExisted = target.exists()
+        return try {
+            FileOutputStream(temporary).use { output ->
+                output.write(bytes)
+                output.fd.sync()
+            }
+            try {
+                Files.move(
+                    temporary.toPath(), target.toPath(),
+                    StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING,
+                )
+            } catch (_: AtomicMoveNotSupportedException) {
+                Files.move(
+                    temporary.toPath(), target.toPath(), StandardCopyOption.REPLACE_EXISTING,
+                )
+            }
+            if (!targetExisted) createdTargets += target
+            val asset = ManagedAssetEntity(
+                assetId, digest, mediaType, extension, bytes.size.toLong(), relative,
+                unresolved = false, createdAt = Instant.now().toString(),
+            )
+            transaction.putAsset(asset)
+            transaction.save(
+                EntityKind.ASSET,
+                buildJsonObject {
+                    put("sha256", digest); put("media_type", mediaType)
+                    put("extension", extension); put("byte_count", bytes.size)
+                },
+                assetId,
+            )
+            asset
+        } finally {
+            temporary.delete()
+        }
     }
 
-    fun updateTaskInput(entityId: String, text: String) = launchAction("任务输入修订已保存") {
+    fun updateTaskInput(entityId: String, text: String, onSuccess: () -> Unit = {}) =
+        launchAction("任务输入修订已保存", onSuccess = onSuccess) {
         val record = repository.record(entityId) ?: error("任务输入不存在")
         val payload = Json.parseToJsonElement(record.payloadJson).jsonObject
         val taskId = payload.getValue("task_id").jsonPrimitive.content
@@ -406,7 +586,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         SyncWorker.enqueue(getApplication())
     }
 
-    fun addTaskCorrection(taskId: String, text: String) = launchAction("用户校正已追加") {
+    fun addTaskCorrection(taskId: String, text: String, onSuccess: () -> Unit = {}) =
+        launchAction("用户校正已追加", onSuccess = onSuccess) {
         require(text.isNotBlank())
         val task = repository.record(taskId)?.let { Json.parseToJsonElement(it.payloadJson).jsonObject.getValue("task").jsonObject }
             ?: error("任务不存在")
@@ -432,29 +613,43 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         carbs: String,
         fat: String,
         packagePhoto: Uri? = null,
-    ) = launchAction("食品已加入本地营养库") {
+        onSuccess: () -> Unit = {},
+    ) = launchAction("食品已加入本地营养库", onSuccess = onSuccess) {
         require(name.isNotBlank())
-        val foodId = DomainRevision.id("food")
-        val timestamp = Instant.now().toString()
-        val packageAsset = packagePhoto?.let { ingestAsset(it) }
-        repository.save(
-            EntityKind.FOOD_ITEM,
-            buildJsonObject {
-                put("food", buildJsonObject {
-                    put("id", foodId); put("name", name.trim()); put("brand", "")
-                    put("basis", "100g")
-                    put("energy_kcal", energy.toDoubleOrNull()?.let(::JsonPrimitive) ?: JsonNull)
-                    put("protein_g", protein.toDoubleOrNull()?.let(::JsonPrimitive) ?: JsonNull)
-                    put("carbs_g", carbs.toDoubleOrNull()?.let(::JsonPrimitive) ?: JsonNull)
-                    put("fat_g", fat.toDoubleOrNull()?.let(::JsonPrimitive) ?: JsonNull)
-                    put("category", "other"); put("menu_priority", "normal")
-                    put("notes", notes.trim()); put("created_at", timestamp); put("updated_at", timestamp)
-                    packageAsset?.let { put("package_photo_asset_id", it.id) }
-                })
-                put("history", buildJsonArray {})
-            },
-            foodId,
-        )
+        val nutrients = validatedNutrients(energy, protein, carbs, fat)
+        val createdTargets = mutableListOf<File>()
+        withContext(Dispatchers.IO) {
+            repository.mutateTransaction(
+                onFailure = {
+                    repository.cleanupUnreferencedAssetFiles(
+                        getApplication<Application>().filesDir,
+                        createdTargets,
+                    )
+                },
+            ) {
+                val foodId = DomainRevision.id("food")
+                val timestamp = Instant.now().toString()
+                val packageAsset = packagePhoto?.let { ingestAssetLocked(it, this, createdTargets) }
+                save(
+                    EntityKind.FOOD_ITEM,
+                    buildJsonObject {
+                        put("food", buildJsonObject {
+                            put("id", foodId); put("name", name.trim()); put("brand", "")
+                            put("basis", "100g")
+                            put("energy_kcal", nutrients.getValue("energy_kcal"))
+                            put("protein_g", nutrients.getValue("protein_g"))
+                            put("carbs_g", nutrients.getValue("carbs_g"))
+                            put("fat_g", nutrients.getValue("fat_g"))
+                            put("category", "other"); put("menu_priority", "normal")
+                            put("notes", notes.trim()); put("created_at", timestamp); put("updated_at", timestamp)
+                            packageAsset?.let { put("package_photo_asset_id", it.id) }
+                        })
+                        put("history", buildJsonArray {})
+                    },
+                    foodId,
+                )
+            }
+        }
         SyncWorker.enqueue(getApplication())
     }
 
@@ -467,38 +662,56 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         carbs: String,
         fat: String,
         packagePhoto: Uri? = null,
-    ) = launchAction("食品修订已保存") {
+        onSuccess: () -> Unit = {},
+    ) = launchAction("食品修订已保存", onSuccess = onSuccess) {
         require(name.isNotBlank())
-        val record = repository.record(entityId) ?: error("食品不存在")
-        val payload = Json.parseToJsonElement(record.payloadJson).jsonObject
-        val before = payload.getValue("food").jsonObject
-        val timestamp = Instant.now().toString()
-        val fields = mutableMapOf<String, JsonElement>(
-            "name" to JsonPrimitive(name.trim()),
-            "notes" to JsonPrimitive(notes.trim()),
-            "energy_kcal" to (energy.toDoubleOrNull()?.let(::JsonPrimitive) ?: JsonNull),
-            "protein_g" to (protein.toDoubleOrNull()?.let(::JsonPrimitive) ?: JsonNull),
-            "carbs_g" to (carbs.toDoubleOrNull()?.let(::JsonPrimitive) ?: JsonNull),
-            "fat_g" to (fat.toDoubleOrNull()?.let(::JsonPrimitive) ?: JsonNull),
-            "updated_at" to JsonPrimitive(timestamp),
-        )
-        packagePhoto?.let { fields["package_photo_asset_id"] = JsonPrimitive(ingestAsset(it).id) }
-        val after = JsonObject(before + fields)
-        repository.save(
-            EntityKind.FOOD_ITEM,
-            buildJsonObject {
-                put("food", after)
-                put("history", buildJsonArray {
-                    payload["history"]?.jsonArray?.forEach { add(it) }
-                    add(buildJsonObject {
-                        put("id", DomainRevision.id("food_history")); put("food_id", entityId)
-                        put("event", "update"); put("before_json", before); put("after_json", after)
-                        put("created_at", timestamp)
-                    })
-                })
-            },
-            entityId,
-        )
+        val nutrients = validatedNutrients(energy, protein, carbs, fat)
+        val createdTargets = mutableListOf<File>()
+        withContext(Dispatchers.IO) {
+            repository.mutateTransaction(
+                onFailure = {
+                    repository.cleanupUnreferencedAssetFiles(
+                        getApplication<Application>().filesDir,
+                        createdTargets,
+                    )
+                },
+            ) {
+                val record = repository.record(entityId) ?: error("食品不存在")
+                val payload = Json.parseToJsonElement(record.payloadJson).jsonObject
+                val before = payload.getValue("food").jsonObject
+                val timestamp = Instant.now().toString()
+                val fields = mutableMapOf<String, JsonElement>(
+                    "name" to JsonPrimitive(name.trim()),
+                    "notes" to JsonPrimitive(notes.trim()),
+                    "energy_kcal" to nutrients.getValue("energy_kcal"),
+                    "protein_g" to nutrients.getValue("protein_g"),
+                    "carbs_g" to nutrients.getValue("carbs_g"),
+                    "fat_g" to nutrients.getValue("fat_g"),
+                    "updated_at" to JsonPrimitive(timestamp),
+                )
+                packagePhoto?.let {
+                    fields["package_photo_asset_id"] = JsonPrimitive(
+                        ingestAssetLocked(it, this, createdTargets).id
+                    )
+                }
+                val after = JsonObject(before + fields)
+                save(
+                    EntityKind.FOOD_ITEM,
+                    buildJsonObject {
+                        put("food", after)
+                        put("history", buildJsonArray {
+                            payload["history"]?.jsonArray?.forEach { add(it) }
+                            add(buildJsonObject {
+                                put("id", DomainRevision.id("food_history")); put("food_id", entityId)
+                                put("event", "update"); put("before_json", before); put("after_json", after)
+                                put("created_at", timestamp)
+                            })
+                        })
+                    },
+                    entityId,
+                )
+            }
+        }
         SyncWorker.enqueue(getApplication())
     }
 
@@ -527,7 +740,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         SyncWorker.enqueue(getApplication())
     }
 
-    fun addMemory(text: String) = launchAction("长期记忆已保存") {
+    fun addMemory(text: String, onSuccess: () -> Unit = {}) =
+        launchAction("长期记忆已保存", onSuccess = onSuccess) {
         require(text.isNotBlank())
         val memoryId = DomainRevision.id("memory")
         val timestamp = Instant.now().toString()
@@ -543,7 +757,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         SyncWorker.enqueue(getApplication())
     }
 
-    fun addAdjustment(text: String) = launchAction("当前调整已保存") {
+    fun addAdjustment(text: String, onSuccess: () -> Unit = {}) =
+        launchAction("当前调整已保存", onSuccess = onSuccess) {
         require(text.isNotBlank())
         val adjustmentId = DomainRevision.id("adjustment")
         val timestamp = Instant.now().toString()
@@ -576,7 +791,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         SyncWorker.enqueue(getApplication())
     }
 
-    fun savePreference(kind: String, content: String) = launchAction("$kind 已保存") {
+    fun savePreference(kind: String, content: String, onSuccess: () -> Unit = {}) =
+        launchAction("$kind 已保存", onSuccess = onSuccess) {
         require(kind in setOf("profile", "doctrine"))
         repository.save(
             EntityKind.PREFERENCES,
@@ -586,14 +802,18 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         SyncWorker.enqueue(getApplication())
     }
 
-    fun saveSettings(content: String) = launchAction("settings 已保存") {
+    fun saveSettings(content: String, onSuccess: () -> Unit = {}) =
+        launchAction("settings 已保存", onSuccess = onSuccess) {
         val value = Json.parseToJsonElement(content).jsonObject
         require(value["schema_version"]?.jsonPrimitive?.content?.toIntOrNull() == 1)
-        val timezone = ZoneId.of(value.getValue("timezone").jsonPrimitive.content).id
+        val timezone = requireZoneId(value.getValue("timezone").jsonPrimitive.content).id
         require(value["meal_environment"]?.jsonPrimitive?.content?.isNotBlank() == true)
         val target = value["protein_target_g"]?.jsonArray ?: error("protein_target_g 缺失")
         val targetNumbers = target.map { it.jsonPrimitive.doubleOrNull ?: error("protein_target_g 必须是数字") }
-        require(targetNumbers.size == 2 && targetNumbers[0] > 0 && targetNumbers[1] >= targetNumbers[0])
+        require(
+            targetNumbers.size == 2 && targetNumbers.all { it.isFinite() } &&
+                targetNumbers[0] > 0 && targetNumbers[1] >= targetNumbers[0]
+        ) { "protein_target_g 必须是有限的正数区间" }
         require(value["portion_method"]?.jsonPrimitive?.content?.isNotBlank() == true)
         require(value["missing_training_default"]?.jsonPrimitive?.content?.isNotBlank() == true)
         require(value["compensation_boundary"]?.jsonPrimitive?.content?.isNotBlank() == true)
@@ -618,7 +838,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             buildJsonObject { put("kind", "settings"); put("content", value.toString()) },
             preferenceId("settings"),
         )
-        check(preferences.edit().putString("timezone", timezone).commit())
+        withContext(Dispatchers.IO) {
+            check(preferences.edit().putString("timezone", timezone).commit())
+        }
         _timezone.value = timezone
         SyncWorker.enqueue(getApplication())
     }
@@ -639,51 +861,90 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             buildJsonObject { put("kind", "checkin_settings"); put("content", content) },
             preferenceId("checkin_settings"),
         )
-        check(preferences.edit().putStringSet("checkin_modules", enabled).commit())
+        withContext(Dispatchers.IO) {
+            check(preferences.edit().putStringSet("checkin_modules", enabled).commit())
+        }
         _checkinModules.value = enabled
         SyncWorker.enqueue(getApplication())
     }
 
-    fun saveAiKey(provider: AiProvider, model: String, key: String) = launchAction("AI 配置已保存；API Key 已由 Android Keystore 包装") {
+    fun saveAiKey(
+        provider: AiProvider,
+        model: String,
+        key: String,
+        onSuccess: () -> Unit = {},
+    ) = launchAction(
+        "AI 配置已保存；API Key 已由 Android Keystore 包装",
+        actionKey = "ai",
+        onSuccess = onSuccess,
+    ) {
         require(model.isNotBlank())
-        ai.saveKey(provider, key)
-        check(preferences.edit().putString("ai_provider", provider.name).putString("ai_model", model.trim()).commit())
+        withContext(Dispatchers.IO) {
+            ai.value.saveKey(provider, key)
+            check(preferences.edit().putString("ai_provider", provider.name).putString("ai_model", model.trim()).commit())
+        }
     }
 
-    fun generateLatestTask() = launchAction("任务分析已保存到本机") {
-        val input = repository.records(EntityKind.TASK_INPUT).firstOrNull() ?: error("没有任务输入")
+    fun generateLatestTask() = launchAction("任务分析已保存到本机", actionKey = "ai") {
+        val today = LocalDate.now(currentZoneId())
+        val start = today.minusDays(13)
+        val snapshot = repository.mutateTransaction {
+            val capturedInput = records(EntityKind.TASK_INPUT).firstOrNull() ?: error("没有任务输入")
+            val capturedInputPayload = Json.parseToJsonElement(capturedInput.payloadJson).jsonObject
+            val capturedTaskId = capturedInputPayload.getValue("task_id").jsonPrimitive.content
+            val capturedTask = record(capturedTaskId) ?: error("任务主体缺失")
+            val capturedRecentRecords = records(EntityKind.DAILY_RECORD).filter { record ->
+                runCatching { LocalDate.parse(Json.parseToJsonElement(record.payloadJson).jsonObject
+                    .getValue("record_date").jsonPrimitive.content) in start..today }.getOrDefault(false)
+            }
+            val capturedRecentCheckins = records(EntityKind.CHECKIN_DAY).filter { record ->
+                runCatching { LocalDate.parse(Json.parseToJsonElement(record.payloadJson).jsonObject
+                    .getValue("checkin").jsonObject.getValue("checkin_date").jsonPrimitive.content) in start..today }
+                    .getOrDefault(false) && record.publishedCheckinPayload() != null
+            }
+            val capturedFoodLibrary = records(EntityKind.FOOD_ITEM).filterNot { it.deleted }
+            val capturedMemories = records(EntityKind.MEMORY).filter { it.activePayload() }
+            val capturedAdjustments = records(EntityKind.ADJUSTMENT).filter { it.activePayload() }
+            val capturedPreferences = records(EntityKind.PREFERENCES)
+            val sourceIds = setOf(capturedTaskId, capturedInput.entityId) +
+                capturedRecentRecords.map { it.entityId } + capturedRecentCheckins.map { it.entityId } +
+                capturedFoodLibrary.map { it.entityId } + capturedMemories.map { it.entityId } +
+                capturedAdjustments.map { it.entityId } + capturedPreferences.map { it.entityId }
+            val capturedHeads = heads().filter { it.entityId in sourceIds }
+            require(capturedHeads.map { it.entityId }.toSet() == sourceIds) { "任务来源版本信息不完整" }
+            TaskGenerationSnapshot(
+                input = capturedInput,
+                task = capturedTask,
+                inputHeadRevisionId = requireNotNull(head(capturedInput.entityId)) { "任务输入版本缺失" }.revisionId,
+                taskHeadRevisionId = requireNotNull(head(capturedTaskId)) { "任务版本缺失" }.revisionId,
+                recentRecords = capturedRecentRecords,
+                recentCheckins = capturedRecentCheckins,
+                foodLibrary = capturedFoodLibrary,
+                memories = capturedMemories,
+                adjustments = capturedAdjustments,
+                domainPreferences = capturedPreferences,
+                sourceHeads = capturedHeads,
+            )
+        }
+        val input = snapshot.input
         val inputPayload = Json.parseToJsonElement(input.payloadJson).jsonObject
         val taskId = inputPayload.getValue("task_id").jsonPrimitive.content
-        val task = repository.record(taskId) ?: error("任务主体缺失")
+        val task = snapshot.task
         val taskPayload = Json.parseToJsonElement(task.payloadJson).jsonObject
         val taskRow = taskPayload.getValue("task").jsonObject
         if (taskRow["status"]?.jsonPrimitive?.content == "completed") error("最新任务已完成")
         val taskType = taskRow.getValue("type").jsonPrimitive.content
-        val today = LocalDate.now(ZoneId.of(_timezone.value))
-        val start = today.minusDays(13)
-        val recentRecords = repository.records(EntityKind.DAILY_RECORD).filter { record ->
-            runCatching { LocalDate.parse(Json.parseToJsonElement(record.payloadJson).jsonObject
-                .getValue("record_date").jsonPrimitive.content) in start..today }.getOrDefault(false)
-        }
-        val recentCheckins = repository.records(EntityKind.CHECKIN_DAY).filter { record ->
-            runCatching { LocalDate.parse(Json.parseToJsonElement(record.payloadJson).jsonObject
-                .getValue("checkin").jsonObject.getValue("checkin_date").jsonPrimitive.content) in start..today }
-                .getOrDefault(false) && record.publishedCheckinPayload() != null
-        }
-        val foodLibrary = repository.records(EntityKind.FOOD_ITEM).filterNot { it.deleted }
-        val memories = repository.records(EntityKind.MEMORY).filter { it.activePayload() }
-        val adjustments = repository.records(EntityKind.ADJUSTMENT).filter { it.activePayload() }
-        val domainPreferences = repository.records(EntityKind.PREFERENCES)
+        val recentRecords = snapshot.recentRecords
+        val recentCheckins = snapshot.recentCheckins
+        val foodLibrary = snapshot.foodLibrary
+        val memories = snapshot.memories
+        val adjustments = snapshot.adjustments
+        val domainPreferences = snapshot.domainPreferences
         val settings = domainPreferences.preferenceContent("settings")?.let {
             runCatching { Json.parseToJsonElement(it).jsonObject }.getOrNull()
         }
         val doctrine = domainPreferences.preferenceContent("doctrine").orEmpty()
-        val source = sourceSnapshot(
-            setOf(taskId, input.entityId) + recentRecords.map { it.entityId } +
-                recentCheckins.map { it.entityId } + foodLibrary.map { it.entityId } +
-                memories.map { it.entityId } + adjustments.map { it.entityId } +
-                domainPreferences.map { it.entityId }
-        )
+        val source = sourceSnapshot(snapshot.sourceHeads)
         val context = buildJsonObject {
             put("task", taskRow)
             put("task_input", inputPayload)
@@ -705,33 +966,70 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             put("analysis_boundary", "照片与数量只能区间估算；不可伪造不可见油、酱汁、重量或品牌。")
         }
         val imageAsset = inputPayload["asset_id"]?.jsonPrimitive?.content?.let { repository.asset(it) }
-        val image = imageAsset?.relativePath?.let { getApplication<Application>().filesDir.resolve(it).readBytes() }
-        val result = ai.generate(aiConfiguration(), taskType, context, image, imageAsset?.mediaType)
+        val image = imageAsset?.relativePath?.let { relativePath ->
+            withContext(Dispatchers.IO) {
+                getApplication<Application>().filesDir.resolve(relativePath).inputStream().use {
+                    it.readBounded(MAX_MANAGED_ASSET_BYTES)
+                }
+            }
+        }
+        val result = ai.value.generate(aiConfiguration(), taskType, context, image, imageAsset?.mediaType)
         org.mealcircuit.app.domain.ResultValidator.task(
             taskType,
             result,
         )
         val provenance = provenance(source, domainPreferences)
-        repository.save(
-            EntityKind.ANALYSIS_RESULT,
-            buildJsonObject {
-                put("source_entity_id", taskId); put("source_kind", "task")
-                put("result_version", 1); put("result", result); put("provenance", provenance)
-            },
-        )
-        repository.save(
-            EntityKind.TASK,
-            buildJsonObject {
-                put("task", JsonObject(taskRow + mapOf(
-                    "status" to JsonPrimitive("completed"),
-                    "result_json" to result,
-                    "result_provenance_json" to provenance,
-                    "result_version" to JsonPrimitive((taskRow["result_version"]?.jsonPrimitive?.content?.toIntOrNull() ?: 0) + 1),
-                    "completed_at" to JsonPrimitive(Instant.now().toString()),
-                )))
-            },
-            taskId,
-        )
+        repository.mutateTransaction {
+            require(head(input.entityId)?.revisionId == snapshot.inputHeadRevisionId) {
+                "任务输入在分析期间已变化，请重新生成"
+            }
+            require(head(taskId)?.revisionId == snapshot.taskHeadRevisionId) {
+                "任务在分析期间已变化，请重新生成"
+            }
+            for (headRow in snapshot.sourceHeads) {
+                if (headRow.entityId == input.entityId || headRow.entityId == taskId) continue
+                require(head(headRow.entityId)?.revisionId == headRow.revisionId) {
+                    "分析期间相关数据已变化，请重新生成"
+                }
+            }
+            val currentInput = requireNotNull(record(input.entityId)) { "任务输入已不存在" }
+            val currentTask = requireNotNull(record(taskId)) { "任务主体已不存在" }
+            require(currentInput.entityKind == "task_input" && currentTask.entityKind == "task") {
+                "任务类型在分析期间已变化，请重新生成"
+            }
+            val currentInputPayload = Json.parseToJsonElement(currentInput.payloadJson).jsonObject
+            require(
+                currentInputPayload["input_version"]?.jsonPrimitive?.content ==
+                    inputPayload["input_version"]?.jsonPrimitive?.content
+            ) { "任务输入在分析期间已变化，请重新生成" }
+            val currentTaskRow = Json.parseToJsonElement(currentTask.payloadJson).jsonObject
+                .getValue("task").jsonObject
+            require(currentTaskRow["status"]?.jsonPrimitive?.content == "pending") {
+                "任务已被完成或修改，请重新检查"
+            }
+            save(
+                EntityKind.ANALYSIS_RESULT,
+                buildJsonObject {
+                    put("source_entity_id", taskId); put("source_kind", "task")
+                    put("result_version", 1); put("result", result); put("provenance", provenance)
+                },
+            )
+            save(
+                EntityKind.TASK,
+                buildJsonObject {
+                    put("task", JsonObject(currentTaskRow + mapOf(
+                        "status" to JsonPrimitive("completed"),
+                        "result_json" to result,
+                        "result_provenance_json" to provenance,
+                        "result_version" to JsonPrimitive(
+                            (currentTaskRow["result_version"]?.jsonPrimitive?.content?.toIntOrNull() ?: 0) + 1
+                        ),
+                        "completed_at" to JsonPrimitive(Instant.now().toString()),
+                    )))
+                },
+                taskId,
+            )
+        }
         SyncWorker.enqueue(getApplication())
     }
 
@@ -740,7 +1038,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     // seven-stage workflow.
     @Deprecated("每日复盘仅由 Windows 的七阶段工作流发布", level = DeprecationLevel.ERROR)
     private fun generateDailyReview() = launchAction("每日复盘请在 Windows 完成") {
-        val reviewDay = LocalDate.now(ZoneId.of(_timezone.value))
+        val reviewDay = LocalDate.now(currentZoneId())
         val windowStart = reviewDay.minusDays(13)
         val records = repository.records(EntityKind.DAILY_RECORD).filter { record ->
             runCatching { LocalDate.parse(Json.parseToJsonElement(record.payloadJson).jsonObject
@@ -828,14 +1126,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 })
             }
         }
-        val source = sourceSnapshot(
-            records.map { it.entityId }.toSet() + checkins.map { it.entityId } + foods.map { it.entityId } +
-                memories.map { it.entityId } + adjustments.map { it.entityId } + preferences.map { it.entityId } +
-                previousReviews.map { it.entityId }
-        )
+        val sourceIds = records.map { it.entityId }.toSet() + checkins.map { it.entityId } + foods.map { it.entityId } +
+            memories.map { it.entityId } + adjustments.map { it.entityId } + preferences.map { it.entityId } +
+            previousReviews.map { it.entityId }
+        val source = sourceSnapshot(repository.heads().filter { it.entityId in sourceIds })
         val context = buildJsonObject {
             put("recent_days", 14)
-            targetReview?.let { put("daily_review", it.getValue("review")) }
+            put("daily_review", targetReview.getValue("review"))
             put("doctrine", buildJsonObject {
                 put("mode", if (doctrine.isBlank()) "public_core" else "private_override")
                 put("sources", buildJsonArray { add(if (doctrine.isBlank()) "rules/core.md" else "doctrine.private.md") })
@@ -911,7 +1208,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 carryovers,
             ))
         }
-        val result = ai.generate(aiConfiguration(), "daily", context)
+        val result = ai.value.generate(aiConfiguration(), "daily", context)
         org.mealcircuit.app.domain.ResultValidator.daily(
             result,
             reviewDay.plusDays(1),
@@ -983,8 +1280,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         SyncWorker.enqueue(getApplication())
     }
 
-    private suspend fun sourceSnapshot(entityIds: Set<String>) = buildJsonArray {
-        repository.heads().filter { it.entityId in entityIds }.forEach { head ->
+    private fun sourceSnapshot(heads: List<EntityHeadEntity>) = buildJsonArray {
+        heads.forEach { head ->
             add(buildJsonObject {
                 put("entity_id", head.entityId); put("entity_kind", head.entityKind); put("revision_id", head.revisionId)
             })
@@ -1086,9 +1383,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     )
 
     fun saveTimezone(value: String) = launchAction("时区已保存") {
-        val normalized = ZoneId.of(value.trim()).id
-        check(preferences.edit().putString("timezone", normalized).commit())
-        _timezone.value = normalized
+        val normalized = requireZoneId(value).id
         val entityId = preferenceId("settings")
         val existing = repository.record(entityId)?.let {
             runCatching {
@@ -1110,75 +1405,144 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 put("content", JsonObject(existing + ("timezone" to JsonPrimitive(normalized))).toString())
             }, entityId,
         )
+        withContext(Dispatchers.IO) {
+            check(preferences.edit().putString("timezone", normalized).commit())
+        }
+        _timezone.value = normalized
         SyncWorker.enqueue(getApplication())
     }
 
-    fun exportPortable(uri: Uri) = launchAction("加密 Portable Data 已导出") {
-        val output = getApplication<Application>().contentResolver.openOutputStream(uri)
-            ?: error("无法打开导出目标")
-        _exportRecoveryKey.value = output.use { portable.export(it, encrypted = true) }
+    fun exportPortable(uri: Uri) = launchAction("加密 Portable Data 已导出", actionKey = "portable") {
+        require(_exportRecoveryKey.value == null && app.vault.get(EXPORT_RECOVERY_KEY) == null) {
+            "请先保存并确认上一份导出的恢复密钥"
+        }
+        val recoveryKey = portable.value.createRecoveryKey()
+        app.vault.put(EXPORT_RECOVERY_KEY, recoveryKey.toByteArray())
+        try {
+            withContext(Dispatchers.IO) {
+                val output = getApplication<Application>().contentResolver.openOutputStream(uri)
+                    ?: error("无法打开导出目标")
+                output.use { portable.value.export(it, encrypted = true, recoveryKey = recoveryKey) }
+            }
+        } catch (error: Throwable) {
+            app.vault.delete(EXPORT_RECOVERY_KEY)
+            throw error
+        }
+        _exportRecoveryKey.value = recoveryKey
     }
 
-    fun previewPortable(uri: Uri, recoveryKey: String, merge: Boolean) = launchAction("预检完成；确认后才会写入") {
-        val input = getApplication<Application>().contentResolver.openInputStream(uri)
-            ?: error("无法读取数据包")
+    fun previewPortable(uri: Uri, recoveryKey: String, merge: Boolean) = launchAction(
+        "预检完成；确认后才会写入",
+        actionKey = "portable",
+    ) {
         val mode = if (merge) ImportMode.MERGE else ImportMode.RESTORE
-        val preview = input.use { portable.preview(it, recoveryKey.ifBlank { null }, mode) }
-        _portableImport.value = PortableImportUi(uri, recoveryKey, mode, preview)
+        val staging = withContext(Dispatchers.IO) {
+            val input = getApplication<Application>().contentResolver.openInputStream(uri)
+                ?: error("无法读取数据包")
+            input.use { portable.value.previewAndStage(it, recoveryKey.ifBlank { null }, mode) }
+        }
+        val previous = stagedPortableImport
+        stagedPortableImport = staging
+        _portableImport.value = PortableImportUi(recoveryKey, mode, staging.preview)
+        previous?.let { runCatching { portable.value.discardStaged(it) } }
     }
 
-    fun applyPortable() = launchAction("Portable Data 已导入") {
+    fun applyPortable() = launchAction("Portable Data 已导入", actionKey = "portable") {
         val request = _portableImport.value ?: error("请先预检数据包")
-        val input = getApplication<Application>().contentResolver.openInputStream(request.uri)
-            ?: error("无法重新读取数据包")
-        input.use { portable.import(it, request.recoveryKey.ifBlank { null }, request.mode) }
+        val staging = stagedPortableImport ?: error("临时导入数据包已失效，请重新预检")
+        portable.value.importStaged(staging, request.recoveryKey.ifBlank { null }, request.mode)
+        stagedPortableImport = null
         _portableImport.value = null
+        runCatching { portable.value.discardStaged(staging) }
     }
 
-    fun cancelPortableImport() { _portableImport.value = null }
+    fun cancelPortableImport() {
+        val staging = stagedPortableImport
+        stagedPortableImport = null
+        _portableImport.value = null
+        staging?.let { runCatching { portable.value.discardStaged(it) } }
+    }
 
-    fun clearExportRecoveryKey() { _exportRecoveryKey.value = null }
+    fun clearExportRecoveryKey() = launchAction(null, actionKey = "portable-recovery") {
+        withContext(Dispatchers.IO) { app.vault.delete(EXPORT_RECOVERY_KEY) }
+        _exportRecoveryKey.value = null
+    }
 
     fun beginRegistration(url: String, login: String, password: String, device: String) =
-        launchAction(null) {
-            _pendingRegistration.value = accounts.beginRegistration(url, login, password, device)
+        launchAction(null, actionKey = "sync-registration") {
+            _pendingRegistration.value = accounts.value.beginRegistration(url, login, password, device)
         }
 
     fun confirmRegistration(value: String) = launchAction("端到端加密同步已启用") {
         val pending = _pendingRegistration.value ?: error("注册确认已失效")
-        accounts.confirmRegistration(pending, value)
+        accounts.value.confirmRegistration(pending, value)
         _pendingRegistration.value = null
         SyncWorker.enqueue(getApplication())
     }
 
     fun login(url: String, login: String, password: String, device: String, recovery: String) =
-        launchAction("同步账户已解锁") {
-            accounts.login(url, login, password, device, recovery)
-            SyncWorker.enqueue(getApplication())
+        launchAction(null, actionKey = "sync-login") {
+            val pending = accounts.value.login(url, login, password, device, recovery)
+            _pendingRegistration.value = pending
+            if (pending == null) {
+                SyncWorker.enqueue(getApplication())
+                _message.value = UiMessage("同步账户已解锁")
+            } else {
+                _message.value = UiMessage("请保存并确认新的恢复密钥")
+            }
         }
 
-    fun syncNow() = launchAction("同步任务已排队") { SyncWorker.enqueue(getApplication()) }
-    fun syncOnDemandMediaNow() = launchAction("缺失照片按需同步完成") {
-        val engine = app.syncEngineOrNull() ?: error("同步尚未启用或密钥未解锁")
-        engine.run(includeOnDemandMedia = true)
+    fun syncNow() = launchAction("同步任务已排队", actionKey = "sync") { SyncWorker.enqueue(getApplication()) }
+    fun syncOnDemandMediaNow() = launchAction("缺失照片按需同步完成", actionKey = "sync") {
+        val summary = app.runSync(includeOnDemandMedia = true)
+            ?: error("同步尚未启用或密钥未解锁")
+        require(summary.assetErrors.isEmpty()) {
+            "结构化数据已同步，但有 ${summary.assetErrors.size} 个照片资源失败：${summary.assetErrors.first()}"
+        }
     }
     fun setMediaPolicy(value: String) = launchAction("照片同步策略已更新") {
-        val config = repository.syncConfiguration() ?: error("同步尚未启用")
-        repository.putSyncConfiguration(config.copy(mediaPolicy = value, updatedAt = Instant.now().toString()))
+        repository.updateMediaPolicy(value)
         SyncWorker.enqueue(getApplication())
     }
-    fun unlink() = launchAction("已取消同步；本地数据完整保留") { accounts.unlink() }
+    fun unlink() = launchAction("已取消同步；本地数据完整保留") {
+        require(repository.rotationReadiness().second == 0) { "请先解决所有同步冲突，再取消同步" }
+        require(keyRotation.value.pendingRecovery() == null) { "请先完成或取消正在进行的密钥轮换" }
+        keyRotation.value.abort()
+        accounts.value.unlink()
+        _pendingRotationRecovery.value = null
+        _pairingQr.value = null
+        _devices.value = emptyList()
+    }
     fun createPairingQr() = launchAction("10 分钟配对二维码已生成") {
-        _pairingQr.value = accounts.createPairingQr()
+        _pairingQr.value = accounts.value.createPairingQr()
     }
     fun clearPairingQr() { _pairingQr.value = null }
-    fun claimPairing(payload: String, login: String, password: String, device: String) =
+    fun previewPairing(payload: String) {
+        try {
+            _pairingServerUrl.value = parsePairingPayload(payload, repository.json).serverUrl
+        } catch (error: Exception) {
+            _pairingServerUrl.value = null
+            _message.value = UiMessage(error.message ?: "配对二维码内容无效", true)
+        }
+    }
+    fun clearPairingPreview() { _pairingServerUrl.value = null }
+    fun claimPairing(
+        payload: String,
+        expectedServerUrl: String,
+        login: String,
+        password: String,
+        device: String,
+    ) =
         launchAction("新设备已通过二维码加入") {
-            accounts.claimPairing(payload, login, password, device)
+            accounts.value.claimPairing(payload, expectedServerUrl, login, password, device)
+            _pairingServerUrl.value = null
             SyncWorker.enqueue(getApplication())
         }
-    fun refreshDevices() = launchAction(null) {
-        _devices.value = accounts.devices().getValue("devices").jsonArray.map { value ->
+    fun refreshDevices() = launchAction(null, actionKey = "refresh-devices") {
+        loadDevices()
+    }
+    private suspend fun loadDevices() {
+        _devices.value = accounts.value.devices().getValue("devices").jsonArray.map { value ->
             val item = value.jsonObject
             DeviceUi(
                 item.getValue("id").jsonPrimitive.content,
@@ -1189,59 +1553,184 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
     fun revokeDevice(id: String) = launchAction("设备已撤销") {
-        accounts.revokeDevice(id)
-        refreshDevices()
+        accounts.value.revokeDevice(id)
+        loadDevices()
     }
-    fun deleteSyncAccount(password: String) = launchAction("远端账户已删除；本机数据完整保留") {
-        accounts.deleteAccount(password)
+    fun deleteSyncAccount(password: String, onSuccess: () -> Unit = {}) = launchAction(
+        "远端账户已删除；本机数据完整保留",
+        onSuccess = onSuccess,
+    ) {
+        require(repository.rotationReadiness().second == 0) { "请先解决所有同步冲突，再删除同步账户" }
+        keyRotation.value.abort()
+        accounts.value.deleteAccount(password)
+        _pendingRotationRecovery.value = null
+        _pairingQr.value = null
         _devices.value = emptyList()
     }
-    fun prepareKeyRotation() = launchAction(null) {
-        _pendingRotationRecovery.value = keyRotation.prepare()
+    fun prepareKeyRotation() = launchAction(null, actionKey = "key-rotation") {
+        _pendingRotationRecovery.value = keyRotation.value.prepare()
     }
     fun confirmKeyRotation(value: String) = launchAction("安全轮换完成；其他设备已撤销") {
-        keyRotation.confirm(value)
+        keyRotation.value.confirm(value)
         _pendingRotationRecovery.value = null
-        refreshDevices()
+        loadDevices()
     }
     fun abortKeyRotation() = launchAction("密钥轮换已中止") {
-        keyRotation.abort()
+        keyRotation.value.abort()
         _pendingRotationRecovery.value = null
     }
 
     fun resolveConflict(id: String, chooseLocal: Boolean) = launchAction("冲突已解决并生成合并 revision") {
-        val conflict = repository.conflict(id) ?: error("冲突不存在")
-        val local = repository.json.decodeFromString<org.mealcircuit.app.domain.DomainRevision>(conflict.localRevisionJson)
-        val remote = repository.json.decodeFromString<org.mealcircuit.app.domain.DomainRevision>(conflict.remoteRevisionJson)
-        val selected = if (chooseLocal) local else remote
-        val canonicalId = minOf(local.entityId, remote.entityId)
-        val merged = org.mealcircuit.app.domain.DomainRevision.create(
-            kind = local.entityKind, entityId = canonicalId,
-            parents = listOf(local.revisionId, remote.revisionId), deviceId = repository.deviceId,
-            payload = if (local.entityId == remote.entityId) selected.payload
-                else canonicalizeLogicalPayload(local.entityKind, selected.payload, canonicalId),
-            deleted = selected.deleted,
-        )
-        val alias = if (local.entityId == remote.entityId) null else if (local.entityId == canonicalId) remote else local
-        val tombstone = alias?.let {
-            DomainRevision.create(
-                it.entityKind, it.entityId, listOf(it.revisionId), repository.deviceId,
-                it.payload, deleted = true,
-            )
+        repository.withMutationGate {
+            val conflict = repository.conflict(id) ?: error("冲突不存在")
+            val local = repository.json.decodeFromString<DomainRevision>(conflict.localRevisionJson)
+            val remote = repository.json.decodeFromString<DomainRevision>(conflict.remoteRevisionJson)
+            if (local.entityKind != remote.entityKind) {
+                require(chooseLocal) { "实体类型冲突只能保留本地类型，不能直接切换数据类型" }
+                repository.commitKindConflictResolutionKeepingLocal(id, local)
+            } else {
+                val selected = if (chooseLocal) local else remote
+                val canonicalId = minOf(local.entityId, remote.entityId)
+                val merged = DomainRevision.create(
+                    kind = local.entityKind, entityId = canonicalId,
+                    parents = listOf(local.revisionId, remote.revisionId), deviceId = repository.deviceId,
+                    payload = if (local.entityId == remote.entityId) selected.payload
+                        else canonicalizeLogicalPayload(local.entityKind, selected.payload, canonicalId),
+                    deleted = selected.deleted,
+                )
+                val alias = if (local.entityId == remote.entityId) null
+                    else if (local.entityId == canonicalId) remote else local
+                val tombstone = alias?.let {
+                    DomainRevision.create(
+                        it.entityKind, it.entityId, listOf(it.revisionId), repository.deviceId,
+                        it.payload, deleted = true,
+                    )
+                }
+                repository.commitConflictResolution(id, merged, tombstone, managedAssetForRevision(merged))
+            }
         }
-        repository.commitConflictResolution(id, merged, tombstone)
         SyncWorker.enqueue(getApplication())
     }
 
-    private fun launchAction(success: String?, action: suspend () -> Unit) {
+    private suspend fun managedAssetForRevision(revision: DomainRevision): ManagedAssetEntity? {
+        if (revision.entityKind != EntityKind.ASSET) return null
+        val payload = revision.payload
+        val sha256 = payload.getValue("sha256").jsonPrimitive.content
+        val mediaType = payload.getValue("media_type").jsonPrimitive.content
+        val extension = payload.getValue("extension").jsonPrimitive.content
+        val byteCount = payload.getValue("byte_count").jsonPrimitive.content.toLong()
+        val existing = repository.asset(revision.entityId)
+        val metadataMatches = existing != null &&
+            existing.sha256 == sha256 && existing.mediaType == mediaType &&
+            existing.extension == extension && existing.byteCount == byteCount
+        val reusablePath = if (metadataMatches && canReuseManagedAsset(
+                getApplication<Application>().filesDir,
+                requireNotNull(existing),
+                repository.record(revision.entityId),
+                sha256,
+                mediaType,
+                extension,
+                byteCount,
+            )
+        ) existing.relativePath else null
+        return ManagedAssetEntity(
+            id = revision.entityId,
+            sha256 = sha256,
+            mediaType = mediaType,
+            extension = extension,
+            byteCount = byteCount,
+            relativePath = reusablePath,
+            unresolved = reusablePath == null,
+            createdAt = revision.createdAt,
+        )
+    }
+
+    private fun currentZoneId(): ZoneId = zoneIdOrNull(_timezone.value) ?: ZoneId.systemDefault()
+
+    private fun requireZoneId(value: String): ZoneId = zoneIdOrNull(value)
+        ?: throw IllegalArgumentException("无效时区：${value.trim()}")
+
+    private fun validatedNutrients(
+        energy: String,
+        protein: String,
+        carbs: String,
+        fat: String,
+    ): Map<String, JsonElement> = mapOf(
+        "energy_kcal" to optionalNonNegativeNumber("能量", energy),
+        "protein_g" to optionalNonNegativeNumber("蛋白质", protein),
+        "carbs_g" to optionalNonNegativeNumber("碳水", carbs),
+        "fat_g" to optionalNonNegativeNumber("脂肪", fat),
+    )
+
+    private fun optionalNonNegativeNumber(label: String, raw: String): JsonElement {
+        if (raw.isBlank()) return JsonNull
+        val value = raw.trim().toDoubleOrNull()
+        require(value != null && value.isFinite() && value >= 0.0) {
+            "${label}必须是有限且非负的数字"
+        }
+        return JsonPrimitive(value)
+    }
+
+    private fun launchAction(
+        success: String?,
+        actionKey: String? = success,
+        onSuccess: () -> Unit = {},
+        action: suspend () -> Unit,
+    ) {
         viewModelScope.launch {
-            runCatching { action() }.onSuccess {
+            if (actionKey != null && !activeActionKeys.add(actionKey)) {
+                _message.value = UiMessage("操作正在进行，请勿重复提交", true)
+                return@launch
+            }
+            try {
+                action()
+                withContext(Dispatchers.Main.immediate) { onSuccess() }
                 if (success != null) _message.value = UiMessage(success)
-            }.onFailure { _message.value = UiMessage(it.message ?: "操作失败", true) }
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                _message.value = UiMessage(actionErrorMessage(error), true)
+            } finally {
+                if (actionKey != null) activeActionKeys.remove(actionKey)
+            }
         }
     }
 
     private fun ByteArray.hex() = joinToString("") { "%02x".format(it) }
+
+    override fun onCleared() {
+        if (portable.isInitialized()) {
+            stagedPortableImport?.let { runCatching { portable.value.discardStaged(it) } }
+        }
+        stagedPortableImport = null
+        super.onCleared()
+    }
+}
+
+private fun actionErrorMessage(error: Exception): String {
+    val message = error.message?.trim().orEmpty()
+    return when {
+        error is SerializationException -> "JSON 或同步数据格式无效"
+        error is DateTimeParseException -> "日期或时间格式无效"
+        error is GeneralSecurityException -> "加密数据验证失败"
+        error is NoSuchElementException -> "数据缺少必需字段"
+        error is NumberFormatException -> "数字格式无效"
+        message.isEmpty() || message == "Failed requirement." -> "输入或同步数据不符合要求"
+        else -> message
+    }
+}
+
+private fun File.sha256Hex(): String {
+    val digest = MessageDigest.getInstance("SHA-256")
+    inputStream().use { input ->
+        val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+        while (true) {
+            val read = input.read(buffer)
+            if (read < 0) break
+            if (read > 0) digest.update(buffer, 0, read)
+        }
+    }
+    return digest.digest().joinToString("") { "%02x".format(it) }
 }
 
 private fun MaterializedRecordEntity.activePayload(): Boolean = !deleted && runCatching {

@@ -88,6 +88,7 @@ data class UnknownEntity(
     val keyVersion: Int,
     val encryptedEnvelope: String,
     val updatedAt: String,
+    val reprocessAttempts: Int = 0,
 )
 
 @Entity(tableName = "managed_assets", indices = [Index(value = ["sha256"], unique = true)])

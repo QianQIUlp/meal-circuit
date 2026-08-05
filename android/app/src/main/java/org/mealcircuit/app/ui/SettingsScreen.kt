@@ -16,6 +16,7 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.ExposedDropdownMenuBox
+import androidx.compose.material3.ExposedDropdownMenuAnchorType
 import androidx.compose.material3.ExposedDropdownMenuDefaults
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -29,6 +30,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.ui.Modifier
@@ -45,43 +47,41 @@ import kotlinx.serialization.json.jsonPrimitive
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun SettingsScreen(viewModel: MainViewModel) {
-    var provider by remember { mutableStateOf(AiProvider.OPENAI) }
-    var expanded by remember { mutableStateOf(false) }
+    var provider by rememberSaveable { mutableStateOf(AiProvider.OPENAI) }
+    var expanded by rememberSaveable { mutableStateOf(false) }
+    // Secrets intentionally stay outside SavedState and are discarded with the process.
     var key by remember { mutableStateOf("") }
-    var model by remember { mutableStateOf("") }
-    var importUri by remember { mutableStateOf<Uri?>(null) }
+    var model by rememberSaveable { mutableStateOf("") }
+    var importUri by rememberSaveable { mutableStateOf<Uri?>(null) }
     var importRecovery by remember { mutableStateOf("") }
-    var merge by remember { mutableStateOf(false) }
+    var merge by rememberSaveable { mutableStateOf(false) }
     val exportRecovery by viewModel.exportRecoveryKey.collectAsState()
     val importPreview by viewModel.portableImport.collectAsState()
     val savedTimezone by viewModel.timezone.collectAsState()
-    var timezone by remember(savedTimezone) { mutableStateOf(savedTimezone) }
-    var profile by remember { mutableStateOf("") }
-    var doctrine by remember { mutableStateOf("") }
-    var settingsJson by remember {
-        mutableStateOf(
-            """{
-  "schema_version": 1,
-  "timezone": "${java.time.ZoneId.systemDefault().id}",
-  "meal_environment": "用户自行配置",
-  "protein_target_g": [50, 65],
-  "portion_method": "按实际饥饿和正餐结构",
-  "missing_training_default": "保持未知，不推断为未训练",
-  "compensation_boundary": "不跳餐、不清零主食、不极端压低热量；只撤掉重复加餐并恢复标准份量。",
-  "home_cooking": {"enabled": false}
-}"""
-        )
-    }
+    var timezone by rememberSaveable(savedTimezone) { mutableStateOf(savedTimezone) }
+    // Large editable documents live in the ViewModel, not SavedState, so tab changes preserve
+    // drafts without risking TransactionTooLargeException during process state saving.
+    val editor = viewModel.settingsEditor
     val domainPreferences by viewModel.repository.observe(EntityKind.PREFERENCES).collectAsState(emptyList())
     val enabledModules by viewModel.checkinModules.collectAsState()
-    var selectedModules by remember(enabledModules) { mutableStateOf(enabledModules) }
+    var selectedModules by rememberSaveable(enabledModules) { mutableStateOf(enabledModules) }
     LaunchedEffect(domainPreferences) {
         domainPreferences.forEach { record ->
             val payload = runCatching { Json.parseToJsonElement(record.payloadJson).jsonObject }.getOrNull() ?: return@forEach
+            val content = payload["content"]?.jsonPrimitive?.content.orEmpty()
             when (payload["kind"]?.jsonPrimitive?.content) {
-                "profile" -> if (profile.isBlank()) profile = payload["content"]?.jsonPrimitive?.content.orEmpty()
-                "doctrine" -> if (doctrine.isBlank()) doctrine = payload["content"]?.jsonPrimitive?.content.orEmpty()
-                "settings" -> settingsJson = payload["content"]?.jsonPrimitive?.content.orEmpty()
+                "profile" -> if (record.updatedAt != editor.profileSource &&
+                    (!editor.profileDirty || editor.profile == content)) {
+                    editor.profile = content; editor.profileDirty = false; editor.profileSource = record.updatedAt
+                }
+                "doctrine" -> if (record.updatedAt != editor.doctrineSource &&
+                    (!editor.doctrineDirty || editor.doctrine == content)) {
+                    editor.doctrine = content; editor.doctrineDirty = false; editor.doctrineSource = record.updatedAt
+                }
+                "settings" -> if (record.updatedAt != editor.settingsSource &&
+                    (!editor.settingsDirty || editor.settingsJson == content)) {
+                    editor.settingsJson = content; editor.settingsDirty = false; editor.settingsSource = record.updatedAt
+                }
             }
         }
     }
@@ -102,20 +102,47 @@ fun SettingsScreen(viewModel: MainViewModel) {
         )
         Button(onClick = { viewModel.saveTimezone(timezone) }, enabled = timezone.isNotBlank()) { Text("保存时区") }
         SectionTitle("档案与私人总纲", "Markdown 文本会作为版本化配置实体同步；私人总纲仍是饮食判断最高规则。")
-        OutlinedTextField(profile, { profile = it }, Modifier.fillMaxWidth(), label = { Text("profile.md") }, minLines = 4)
-        Button(onClick = { viewModel.savePreference("profile", profile) }, enabled = profile.isNotBlank()) { Text("保存档案") }
-        OutlinedTextField(doctrine, { doctrine = it }, Modifier.fillMaxWidth(), label = { Text("doctrine.private.md") }, minLines = 5)
-        Button(onClick = { viewModel.savePreference("doctrine", doctrine) }, enabled = doctrine.isNotBlank()) { Text("保存私人总纲") }
+        OutlinedTextField(
+            editor.profile,
+            { editor.profile = it; editor.profileDirty = true },
+            Modifier.fillMaxWidth(),
+            label = { Text("profile.md") },
+            minLines = 4,
+        )
+        Button(
+            onClick = {
+                viewModel.savePreference("profile", editor.profile) { editor.profileDirty = false }
+            },
+            enabled = editor.profile.isNotBlank(),
+        ) { Text("保存档案") }
+        OutlinedTextField(
+            editor.doctrine,
+            { editor.doctrine = it; editor.doctrineDirty = true },
+            Modifier.fillMaxWidth(),
+            label = { Text("doctrine.private.md") },
+            minLines = 5,
+        )
+        Button(
+            onClick = {
+                viewModel.savePreference("doctrine", editor.doctrine) { editor.doctrineDirty = false }
+            },
+            enabled = editor.doctrine.isNotBlank(),
+        ) { Text("保存私人总纲") }
         SectionTitle("完整私人设置", "JSON 会作为 Domain v1 配置 revision 保存；时区、用餐环境、蛋白目标和居家烹饪都由用户自行配置。")
         OutlinedTextField(
-            settingsJson,
-            { settingsJson = it },
+            editor.settingsJson,
+            { editor.settingsJson = it; editor.settingsDirty = true },
             Modifier.fillMaxWidth(),
             label = { Text("settings.json") },
             minLines = 8,
             supportingText = { Text("需包含模板中的全部字段；开启 home_cooking 时还需完整烹饪配置") },
         )
-        Button(onClick = { viewModel.saveSettings(settingsJson) }, enabled = settingsJson.isNotBlank()) { Text("校验并保存设置") }
+        Button(
+            onClick = {
+                viewModel.saveSettings(editor.settingsJson) { editor.settingsDirty = false }
+            },
+            enabled = editor.settingsJson.isNotBlank(),
+        ) { Text("校验并保存设置") }
         SectionTitle("每日状态模块", "关闭的模块不会出现在 Android 问卷中；设置会作为版本化配置同步。")
         listOf("weight" to "体重", "training" to "训练", "hunger" to "饥饿与饱腹", "sleep" to "睡眠", "gut" to "肠胃").forEach { (keyName, label) ->
             FilterChip(
@@ -131,7 +158,9 @@ fun SettingsScreen(viewModel: MainViewModel) {
                 provider.name, {}, readOnly = true,
                 label = { Text("供应商") },
                 trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded) },
-                modifier = Modifier.menuAnchor().fillMaxWidth(),
+                modifier = Modifier
+                    .menuAnchor(ExposedDropdownMenuAnchorType.PrimaryNotEditable)
+                    .fillMaxWidth(),
             )
             ExposedDropdownMenu(expanded, { expanded = false }) {
                 AiProvider.entries.forEach { item ->
@@ -154,7 +183,7 @@ fun SettingsScreen(viewModel: MainViewModel) {
             singleLine = true,
         )
         Button(
-            onClick = { viewModel.saveAiKey(provider, model, key); key = "" },
+            onClick = { viewModel.saveAiKey(provider, model, key) { key = "" } },
             enabled = key.isNotBlank() && model.isNotBlank(),
         ) { Text("安全保存到本设备") }
         SectionTitle("Portable Data", "加密 .mcx 的导入导出入口将在系统文件选择器中操作，不授予整盘权限。")
@@ -162,6 +191,7 @@ fun SettingsScreen(viewModel: MainViewModel) {
         Button(
             onClick = { exporter.launch("mealcircuit-${java.time.LocalDate.now()}.mcx") },
             modifier = Modifier.fillMaxWidth(),
+            enabled = exportRecovery == null,
         ) { Text("导出加密 .mcx") }
         exportRecovery?.let { recovery ->
             Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer)) {

@@ -1,6 +1,9 @@
 package org.mealcircuit.app.ui
 
+import android.Manifest
+import android.content.pm.PackageManager
 import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -25,21 +28,29 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import com.journeyapps.barcodescanner.ScanContract
 import com.journeyapps.barcodescanner.ScanOptions
+import androidx.core.content.ContextCompat
 import kotlinx.serialization.json.Json
 import org.mealcircuit.app.MainViewModel
+import org.mealcircuit.app.data.SyncConflictEntity
+import org.mealcircuit.app.data.serialized
+import org.mealcircuit.app.domain.DomainRevision
+import kotlinx.serialization.decodeFromString
 
 @Composable
 fun SyncSettingsScreen(viewModel: MainViewModel) {
     val configuration by viewModel.repository.observeSyncConfiguration().collectAsState(null)
     val pendingCount by viewModel.repository.observePendingCount().collectAsState(0)
+    val unknownCount by viewModel.repository.observeUnknownCount().collectAsState(0)
     val pendingRegistration by viewModel.pendingRegistration.collectAsState()
     val pairingQr by viewModel.pairingQr.collectAsState()
     val devices by viewModel.devices.collectAsState()
@@ -47,6 +58,9 @@ fun SyncSettingsScreen(viewModel: MainViewModel) {
     var rotationConfirmation by remember { mutableStateOf("") }
     var accountDeletePassword by remember { mutableStateOf("") }
     var accountDeleteConfirmation by remember { mutableStateOf("") }
+    LaunchedEffect(rotationRecovery) {
+        if (rotationRecovery == null) rotationConfirmation = ""
+    }
     if (pendingRegistration != null) {
         RecoveryConfirmation(viewModel)
         return
@@ -63,6 +77,23 @@ fun SyncSettingsScreen(viewModel: MainViewModel) {
                     Text(configuration?.serverUrl.orEmpty())
                     Text("待上传 $pendingCount 项 · 游标 ${configuration?.cursor ?: 0}")
                     Text("照片策略：${configuration?.mediaPolicy}")
+                }
+            }
+            if (unknownCount > 0) {
+                Card(
+                    colors = CardDefaults.cardColors(
+                        containerColor = if (unknownCount >= 2_000) MaterialTheme.colorScheme.errorContainer
+                        else MaterialTheme.colorScheme.secondaryContainer,
+                    )
+                ) {
+                    Text(
+                        if (unknownCount >= 2_000) {
+                            "检测到 2000 条当前版本无法识别的加密记录；同步已安全暂停。请先升级应用，现有本地数据不会被覆盖。"
+                        } else {
+                            "有 $unknownCount 条来自更高版本的加密记录暂未应用；升级应用后会自动重试。"
+                        },
+                        Modifier.fillMaxWidth().padding(16.dp),
+                    )
                 }
             }
             Button(onClick = viewModel::syncNow, Modifier.fillMaxWidth()) { Text("立即同步") }
@@ -89,7 +120,11 @@ fun SyncSettingsScreen(viewModel: MainViewModel) {
                     OutlinedButton(onClick = viewModel::clearPairingQr) { Text("关闭二维码") }
                 }
             }
-            OutlinedButton(onClick = viewModel::unlink, Modifier.fillMaxWidth()) { Text("取消本机同步（保留数据）") }
+            OutlinedButton(
+                onClick = viewModel::unlink,
+                enabled = rotationRecovery == null,
+                modifier = Modifier.fillMaxWidth(),
+            ) { Text("取消本机同步（保留数据）") }
             SectionTitle("设备", "撤销会立即使该设备的服务端令牌失效。")
             devices.forEach { device ->
                 Card(Modifier.fillMaxWidth()) {
@@ -140,10 +175,13 @@ fun SyncSettingsScreen(viewModel: MainViewModel) {
             )
             OutlinedButton(
                 onClick = {
-                    viewModel.deleteSyncAccount(accountDeletePassword)
-                    accountDeletePassword = ""; accountDeleteConfirmation = ""
+                    viewModel.deleteSyncAccount(accountDeletePassword) {
+                        accountDeletePassword = ""
+                        accountDeleteConfirmation = ""
+                    }
                 },
-                enabled = accountDeletePassword.isNotBlank() && accountDeleteConfirmation == "DELETE",
+                enabled = rotationRecovery == null &&
+                    accountDeletePassword.isNotBlank() && accountDeleteConfirmation == "DELETE",
                 modifier = Modifier.fillMaxWidth(),
             ) { Text("永久删除远端同步账户") }
             Text(
@@ -158,54 +196,105 @@ fun SyncSettingsScreen(viewModel: MainViewModel) {
 
 @Composable
 private fun SyncOnboarding(viewModel: MainViewModel) {
-    var register by remember { mutableStateOf(false) }
-    var pairing by remember { mutableStateOf(false) }
-    var url by remember { mutableStateOf("") }
-    var login by remember { mutableStateOf("") }
-    var device by remember { mutableStateOf(android.os.Build.MODEL) }
+    var register by rememberSaveable { mutableStateOf(false) }
+    var pairing by rememberSaveable { mutableStateOf(false) }
+    var url by rememberSaveable { mutableStateOf("") }
+    var login by rememberSaveable { mutableStateOf("") }
+    var device by rememberSaveable { mutableStateOf(android.os.Build.MODEL) }
     var password by remember { mutableStateOf("") }
     var confirmation by remember { mutableStateOf("") }
     var recovery by remember { mutableStateOf("") }
     var pairingPayload by remember { mutableStateOf("") }
-    val scanner = rememberLauncherForActivityResult(ScanContract()) { result ->
-        result.contents?.let { pairingPayload = it }
+    var scanError by remember { mutableStateOf<String?>(null) }
+    val pairingServerUrl by viewModel.pairingServerUrl.collectAsState()
+    val context = LocalContext.current
+    val scanOptions = remember {
+        ScanOptions().setPrompt("扫描已登录设备显示的 MealCircuit 配对二维码").setBeepEnabled(false)
     }
+    val scanner = rememberLauncherForActivityResult(ScanContract()) { result ->
+        result.contents?.let { payload ->
+            pairingPayload = payload
+            viewModel.previewPairing(payload)
+            scanError = null
+        }
+    }
+    val cameraPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        if (granted) {
+            runCatching { scanner.launch(scanOptions) }
+                .onFailure { scanError = "无法启动扫码相机：${it.message ?: "未知错误"}" }
+        } else {
+            scanError = "未授予相机权限，无法扫描配对二维码"
+        }
+    }
+    val trustedServerUrl = remember(url) {
+        runCatching { org.mealcircuit.app.sync.validateServerUrl(url) }.getOrNull()
+    }
+    val pairingServerMatches = pairingServerUrl != null && pairingServerUrl == trustedServerUrl
     Column(
         Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp).widthIn(max = 720.dp),
         verticalArrangement = Arrangement.spacedBy(14.dp),
     ) {
         SectionTitle("可选自托管同步", "不登录也能永久离线使用；自定义 URL 在正式版中必须是 HTTPS。")
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            FilterChip(!register && !pairing, { register = false; pairing = false }, label = { Text("登录") })
-            FilterChip(register, { register = true; pairing = false }, label = { Text("注册") })
+            FilterChip(!register && !pairing, {
+                register = false; pairing = false; pairingPayload = ""; viewModel.clearPairingPreview()
+            }, label = { Text("登录") })
+            FilterChip(register, {
+                register = true; pairing = false; pairingPayload = ""; viewModel.clearPairingPreview()
+            }, label = { Text("注册") })
             FilterChip(pairing, { register = false; pairing = true }, label = { Text("扫码加入") })
         }
-        if (!pairing) {
-            OutlinedTextField(url, { url = it }, Modifier.fillMaxWidth(), label = { Text("同步服务 URL") }, singleLine = true)
-        }
+        OutlinedTextField(
+            url,
+            { url = it },
+            Modifier.fillMaxWidth(),
+            label = { Text(if (pairing) "可信同步服务 URL（请手动输入）" else "同步服务 URL") },
+            supportingText = {
+                if (pairing) Text("密码只会发送到这里；它必须与二维码显示的地址完全一致。")
+            },
+            singleLine = true,
+        )
         OutlinedTextField(login, { login = it }, Modifier.fillMaxWidth(), label = { Text("登录名") }, singleLine = true)
         OutlinedTextField(device, { device = it }, Modifier.fillMaxWidth(), label = { Text("设备名称") }, singleLine = true)
         SecretField("账户密码", password) { password = it }
         if (register) SecretField("再次输入密码", confirmation) { confirmation = it }
-        else if (!pairing) SecretField("恢复密钥", recovery) { recovery = it }
+        else if (!pairing) SecretField("恢复密钥（未完成首次确认时可留空）", recovery) { recovery = it }
         if (pairing) {
             OutlinedButton(
                 onClick = {
-                    scanner.launch(ScanOptions().setPrompt("扫描已登录设备显示的 MealCircuit 配对二维码").setBeepEnabled(false))
+                    scanError = null
+                    if (ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
+                        runCatching { scanner.launch(scanOptions) }
+                            .onFailure { scanError = "无法启动扫码相机：${it.message ?: "未知错误"}" }
+                    } else {
+                        cameraPermission.launch(Manifest.permission.CAMERA)
+                    }
                 },
                 modifier = Modifier.fillMaxWidth(),
-            ) { Text(if (pairingPayload.isBlank()) "扫描配对二维码" else "已扫描配对二维码") }
+            ) { Text(if (pairingPayload.isBlank()) "扫描配对二维码" else "重新扫描配对二维码") }
+            pairingServerUrl?.let { scannedUrl ->
+                Card(Modifier.fillMaxWidth()) {
+                    Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Text("二维码声明的服务地址")
+                        Text(scannedUrl, fontFamily = FontFamily.Monospace)
+                        if (url.isNotBlank() && !pairingServerMatches) {
+                            Text("地址不一致，已阻止发送密码。", color = MaterialTheme.colorScheme.error)
+                        }
+                    }
+                }
+            }
+            scanError?.let { Text(it, color = MaterialTheme.colorScheme.error) }
         }
         Button(
             onClick = {
                 if (register) viewModel.beginRegistration(url, login, password, device)
-                else if (pairing) viewModel.claimPairing(pairingPayload, login, password, device)
+                else if (pairing) viewModel.claimPairing(pairingPayload, url, login, password, device)
                 else viewModel.login(url, login, password, device, recovery)
             },
             enabled = login.isNotBlank() && device.isNotBlank() && password.length >= 12 && when {
                 register -> url.isNotBlank() && password == confirmation
-                pairing -> pairingPayload.isNotBlank()
-                else -> url.isNotBlank() && recovery.isNotBlank()
+                pairing -> pairingPayload.isNotBlank() && pairingServerMatches
+                else -> url.isNotBlank()
             },
             modifier = Modifier.fillMaxWidth(),
         ) { Text(if (register) "创建账户" else if (pairing) "加入并恢复数据" else "登录并解锁") }
@@ -252,22 +341,31 @@ fun ConflictScreen(viewModel: MainViewModel) {
         Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp).widthIn(max = 880.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
-        SectionTitle("冲突中心", "不会按时间覆盖同字段并发值；两个 sibling revision 都会保留。")
+        SectionTitle("冲突中心", "不会按时间覆盖并发修改；冲突版本会保留，确认后才会继续同步。")
         if (conflicts.isEmpty()) {
             EmptyState("没有待解决冲突", "离线编辑不同实体或不同字段会自动合并。")
         }
         conflicts.forEach { conflict ->
+            val remoteKind = conflict.remoteEntityKind(viewModel)
+            val crossKind = remoteKind != null && remoteKind != conflict.entityKind
             Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer)) {
                 Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
                     Text("${conflict.entityKind} · ${conflict.entityId}")
-                    Text("冲突路径：${conflict.conflictingPathsJson}")
-                    Text("本机 sibling")
+                    if (crossKind) {
+                        Text("数据类型冲突：本机为 ${conflict.entityKind}，远端为 $remoteKind。为避免把一种数据改名成另一种，只能保留本机类型。")
+                    } else {
+                        Text("冲突位置：${conflict.conflictingPathsJson}")
+                    }
+                    Text("本机版本")
                     Text(pretty(conflict.localRevisionJson), maxLines = 8, fontFamily = FontFamily.Monospace)
-                    Text("远端 sibling")
+                    Text("远端版本")
                     Text(pretty(conflict.remoteRevisionJson), maxLines = 8, fontFamily = FontFamily.Monospace)
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         Button(onClick = { viewModel.resolveConflict(conflict.id, true) }) { Text("保留本机") }
-                        OutlinedButton(onClick = { viewModel.resolveConflict(conflict.id, false) }) { Text("保留远端") }
+                        OutlinedButton(
+                            onClick = { viewModel.resolveConflict(conflict.id, false) },
+                            enabled = !crossKind,
+                        ) { Text("保留远端") }
                     }
                 }
             }
@@ -275,9 +373,15 @@ fun ConflictScreen(viewModel: MainViewModel) {
     }
 }
 
+private val prettyJson = Json { prettyPrint = true }
+
 private fun pretty(value: String) = runCatching {
-    Json { prettyPrint = true }.encodeToString(
+    prettyJson.encodeToString(
         kotlinx.serialization.json.JsonElement.serializer(),
         Json.parseToJsonElement(value),
     )
 }.getOrDefault(value)
+
+private fun SyncConflictEntity.remoteEntityKind(viewModel: MainViewModel): String? = runCatching {
+    viewModel.repository.json.decodeFromString<DomainRevision>(remoteRevisionJson).entityKind.serialized()
+}.getOrNull()

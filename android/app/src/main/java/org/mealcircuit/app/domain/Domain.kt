@@ -11,6 +11,8 @@ import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.long
+import org.mealcircuit.app.io.MAX_MANAGED_ASSET_BYTES
 import java.time.Instant
 import java.time.LocalDate
 import java.util.UUID
@@ -47,7 +49,7 @@ data class DomainRevision(
     val payload: JsonObject,
 ) {
     fun validate(): DomainRevision {
-        require(schemaVersion == DOMAIN_SCHEMA_VERSION) { "Unsupported domain schema $schemaVersion" }
+        require(schemaVersion == DOMAIN_SCHEMA_VERSION) { "不支持的数据结构版本 $schemaVersion" }
         require(ID.matches(entityId) && ID.matches(revisionId) && ID.matches(authorDeviceId))
         require(parentRevisionIds.distinct().size == parentRevisionIds.size)
         parentRevisionIds.forEach { require(ID.matches(it)) }
@@ -71,7 +73,7 @@ data class DomainRevision(
             EntityKind.PREFERENCES -> listOf("kind", "content")
             EntityKind.ASSET -> listOf("sha256", "media_type", "extension", "byte_count")
         }
-        require(required.all(payload::containsKey)) { "${entityKind.name} payload is incomplete" }
+        require(required.all(payload::containsKey)) { "${entityKind.name} 数据字段不完整" }
         val nested = when (entityKind) {
             EntityKind.TASK -> "task" to listOf("id", "type", "status", "created_at")
             EntityKind.FOOD_ITEM -> "food" to listOf("id", "name", "basis", "created_at", "updated_at")
@@ -80,10 +82,10 @@ data class DomainRevision(
             else -> null
         }
         nested?.let { (key, fields) ->
-            val value = payload[key] as? JsonObject ?: error("$key must be an object")
-            require(fields.all(value::containsKey)) { "$key is incomplete" }
+            val value = payload[key] as? JsonObject ?: error("$key 必须是对象")
+            require(fields.all(value::containsKey)) { "$key 字段不完整" }
             require(value.getValue("id").jsonPrimitive.content == entityId) {
-                "${entityKind.name} payload ID does not match entity_id"
+                "${entityKind.name} 数据 ID 与 entity_id 不一致"
             }
         }
         when (entityKind) {
@@ -98,6 +100,7 @@ data class DomainRevision(
                 LocalDate.parse(payload.getValue("checkin").jsonObject.getValue("checkin_date").jsonPrimitive.content)
             EntityKind.DAILY_REVIEW ->
                 LocalDate.parse(payload.getValue("review").jsonObject.getValue("review_date").jsonPrimitive.content)
+            EntityKind.ASSET -> validateAssetPayload()
             else -> Unit
         }
         listOf("task_id", "source_entity_id").forEach { key ->
@@ -105,8 +108,42 @@ data class DomainRevision(
         }
     }
 
+    private fun validateAssetPayload() {
+        fun stringField(name: String): String {
+            val value = payload.getValue(name).jsonPrimitive
+            require(value.isString) { "$name 必须是字符串" }
+            return value.content
+        }
+
+        val sha256 = stringField("sha256")
+        val mediaType = stringField("media_type")
+        val extension = stringField("extension")
+        val byteCountValue = payload.getValue("byte_count").jsonPrimitive
+
+        require(ASSET_SHA256.matches(sha256)) { "sha256 必须是 64 位小写十六进制字符串" }
+        require(extension.none { it == '/' || it == '\\' || it == '\u0000' }) {
+            "extension 不得包含路径字符"
+        }
+        val allowedExtensions = ASSET_MEDIA_EXTENSIONS[mediaType]
+            ?: throw IllegalArgumentException("不支持的资源媒体类型")
+        require(extension in allowedExtensions) { "extension 与 media_type 不匹配" }
+        require(!byteCountValue.isString) { "byte_count 必须是整数" }
+        val byteCount = byteCountValue.long
+        require(byteCount in 0L..MAX_MANAGED_ASSET_BYTES.toLong()) {
+            "byte_count 必须在 0 到 $MAX_MANAGED_ASSET_BYTES 之间"
+        }
+    }
+
     companion object {
         private val ID = Regex("^[A-Za-z][A-Za-z0-9_-]{0,95}$")
+        private val ASSET_SHA256 = Regex("^[0-9a-f]{64}$")
+        private val ASSET_MEDIA_EXTENSIONS = mapOf(
+            "image/jpeg" to setOf(".jpg", ".jpeg"),
+            "image/png" to setOf(".png"),
+            "image/gif" to setOf(".gif"),
+            "image/webp" to setOf(".webp"),
+        )
+
         fun id(prefix: String): String = "${prefix}_${UUID.randomUUID()}"
         fun create(
             kind: EntityKind,
@@ -147,15 +184,25 @@ val STATE_TRANSITIONS = mapOf(
 fun validateStateChange(kind: EntityKind, before: JsonObject, after: JsonObject) {
     fun transition(machine: String, old: String, new: String) {
         require(new in STATE_TRANSITIONS.getValue(machine).getValue(old)) {
-            "$machine does not allow $old -> $new"
+            val label = when (machine) {
+                "task" -> "任务"
+                "daily_review" -> "每日复盘"
+                "checkin_module" -> "每日状态模块"
+                else -> "记录"
+            }
+            "${label}状态不允许从「$old」变为「$new」"
         }
     }
     when (kind) {
-        EntityKind.TASK -> transition(
-            "task",
-            before.getValue("task").jsonObject.getValue("status").jsonPrimitive.content,
-            after.getValue("task").jsonObject.getValue("status").jsonPrimitive.content,
-        )
+        EntityKind.TASK -> {
+            val oldTask = before.getValue("task").jsonObject
+            val newTask = after.getValue("task").jsonObject
+            val oldStatus = oldTask.getValue("status").jsonPrimitive.content
+            transition("task", oldStatus, newTask.getValue("status").jsonPrimitive.content)
+            require(oldStatus != "completed" || oldTask == newTask) {
+                "已完成任务的结果不可直接覆盖"
+            }
+        }
         EntityKind.DAILY_REVIEW -> transition(
             "daily_review",
             before.getValue("review").jsonObject.getValue("status").jsonPrimitive.content,

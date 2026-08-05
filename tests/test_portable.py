@@ -23,7 +23,7 @@ from mealcircuit.crypto import format_recovery_key, parse_recovery_key, random_k
 from mealcircuit.db import connect, init_db
 from mealcircuit.db_migrations import CURRENT_SCHEMA_VERSION
 from mealcircuit import db_migrations
-from mealcircuit.domain import make_revision, three_way_merge, validate_revision
+from mealcircuit.domain import DomainRevision, make_revision, three_way_merge, validate_revision
 from mealcircuit.domain_store import capture_task_input, materialize_revision
 from mealcircuit.portable import apply_import, export_data, preview_import
 from mealcircuit import portable as portable_module
@@ -120,6 +120,79 @@ def complete_standard_onboarding() -> None:
 
 
 class DomainAndPortableTest(unittest.TestCase):
+
+    def test_portable_revision_graph_handles_twenty_thousand_deep_chain_iteratively(self) -> None:
+        depth = 20_000
+        revisions = {
+            f"rev_deep_{index}": DomainRevision(
+                entity_id="preferences_deep",
+                entity_kind="preferences",
+                revision_id=f"rev_deep_{index}",
+                parent_revision_ids=() if index == 0 else (f"rev_deep_{index - 1}",),
+                created_at="2026-08-01T00:00:00Z",
+                author_device_id="device_deep",
+                deleted=False,
+                payload={"kind": "settings", "content": "{}"},
+            )
+            for index in range(depth)
+        }
+
+        portable_module._validate_revision_graph(revisions)
+
+        first = revisions["rev_deep_0"]
+        cyclic = dict(revisions)
+        cyclic[first.revision_id] = DomainRevision(
+            entity_id=first.entity_id,
+            entity_kind=first.entity_kind,
+            revision_id=first.revision_id,
+            parent_revision_ids=(f"rev_deep_{depth - 1}",),
+            created_at=first.created_at,
+            author_device_id=first.author_device_id,
+            deleted=first.deleted,
+            payload=first.payload,
+        )
+        with self.assertRaisesRegex(ValidationError, "循环"):
+            portable_module._validate_revision_graph(cyclic)
+
+    def test_portable_revision_parent_must_belong_to_same_entity_and_kind(self) -> None:
+        parent = DomainRevision(
+            entity_id="preferences_parent",
+            entity_kind="preferences",
+            revision_id="rev_parent_identity",
+            parent_revision_ids=(),
+            created_at="2026-08-01T00:00:00Z",
+            author_device_id="device_graph",
+            deleted=False,
+            payload={"kind": "settings", "content": "{}"},
+        )
+        for child in (
+            DomainRevision(
+                entity_id="preferences_child",
+                entity_kind=parent.entity_kind,
+                revision_id="rev_child_entity",
+                parent_revision_ids=(parent.revision_id,),
+                created_at=parent.created_at,
+                author_device_id=parent.author_device_id,
+                deleted=False,
+                payload=parent.payload,
+            ),
+            DomainRevision(
+                entity_id=parent.entity_id,
+                entity_kind="memory",
+                revision_id="rev_child_kind",
+                parent_revision_ids=(parent.revision_id,),
+                created_at=parent.created_at,
+                author_device_id=parent.author_device_id,
+                deleted=False,
+                payload={"content": "different kind"},
+            ),
+        ):
+            with self.subTest(revision_id=child.revision_id):
+                with self.assertRaisesRegex(ValidationError, "同一实体和类型"):
+                    portable_module._validate_revision_graph(
+                        {parent.revision_id: parent, child.revision_id: child}
+                    )
+
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.old_home = os.environ.get("MEALCIRCUIT_HOME")
@@ -401,6 +474,32 @@ class DomainAndPortableTest(unittest.TestCase):
         service.add_memory("preference", "合成偏好", "合成证据")
         exported = export_data(archive, encrypted=False)
         self.assertEqual(exported["asset_count"], 1)
+        with zipfile.ZipFile(archive) as portable:
+            manifest = json.loads(portable.read("manifest.json"))
+            self.assertEqual(len(manifest["assets"]), 1)
+            descriptor = manifest["assets"][0]
+            self.assertEqual(
+                set(descriptor), {"id", "sha256", "path", "bytes", "media_type"}
+            )
+            asset_revisions = [
+                json.loads(line)
+                for line in portable.read("entities/asset.jsonl").decode("utf-8").splitlines()
+                if line.strip()
+            ]
+            head = next(
+                item
+                for item in asset_revisions
+                if item["revision_id"] == manifest["entity_heads"][descriptor["id"]]
+            )
+            self.assertEqual(descriptor["id"], head["entity_id"])
+            self.assertEqual(descriptor["sha256"], head["payload"]["sha256"])
+            self.assertEqual(descriptor["bytes"], head["payload"]["byte_count"])
+            self.assertEqual(descriptor["media_type"], head["payload"]["media_type"])
+            self.assertEqual(descriptor["path"], head["payload"]["archive_path"])
+            self.assertEqual(
+                descriptor["path"],
+                f"assets/{descriptor['sha256']}{head['payload']['extension']}",
+            )
 
         configure_home(target)
         preview = preview_import(archive, mode="restore")
@@ -410,6 +509,243 @@ class DomainAndPortableTest(unittest.TestCase):
         restored = service.get_task(task["id"])
         self.assertEqual(restored["original_input"], "合成照片")
         self.assertTrue(resolve_data_path(restored["image_path"]).is_file())
+
+    def test_historical_v1_asset_descriptor_without_id_or_media_type_is_supported(self) -> None:
+        root = Path(self.temp.name)
+        source, target = root / "legacy-asset-source", root / "legacy-asset-target"
+        archive, legacy_archive = root / "current.zip", root / "legacy-v1.zip"
+        configure_home(source)
+        task = service.create_photo_task(
+            io.BytesIO(b"\xff\xd8\xfflegacy-v1-asset"), "历史资产"
+        )
+        export_data(archive, encrypted=False)
+
+        with zipfile.ZipFile(archive) as input_zip, zipfile.ZipFile(
+            legacy_archive, "w", compression=zipfile.ZIP_DEFLATED
+        ) as output_zip:
+            for info in input_zip.infolist():
+                data = input_zip.read(info.filename)
+                if info.filename == "manifest.json":
+                    manifest = json.loads(data)
+                    manifest["assets"] = [
+                        {
+                            "path": descriptor["path"],
+                            "bytes": descriptor["bytes"],
+                            "sha256": descriptor["sha256"],
+                        }
+                        for descriptor in manifest["assets"]
+                    ]
+                    data = json.dumps(manifest, ensure_ascii=False).encode("utf-8")
+                output_zip.writestr(info, data)
+
+        configure_home(target)
+        preview = preview_import(legacy_archive, mode="restore")
+        self.assertEqual(preview["asset_count"], 1)
+        imported = apply_import(legacy_archive, mode="restore")
+        self.assertEqual(imported["round_trip"], "ok")
+        restored = service.get_task(task["id"])
+        self.assertTrue(resolve_data_path(restored["image_path"]).is_file())
+
+    def test_apply_import_uses_one_private_snapshot_when_source_changes(self) -> None:
+        root = Path(self.temp.name)
+        source, target, archive = (
+            root / "source-snapshot",
+            root / "target-snapshot",
+            root / "snapshot.zip",
+        )
+        configure_home(source)
+        task = service.create_photo_task(
+            io.BytesIO(b"\xff\xd8\xffstable-snapshot"),
+            "快照导入",
+        )
+        export_data(archive, encrypted=False)
+
+        configure_home(target)
+        temporary_root = portable_module._portable_temp_root()
+        stale = temporary_root / "mealcircuit-source-stale.portable"
+        recent = temporary_root / "mealcircuit-source-recent.portable"
+        stale.write_bytes(b"stale")
+        recent.write_bytes(b"recent")
+        os.utime(stale, (1, 1))
+        real_preview = portable_module.preview_import
+        preview_sources: list[Path] = []
+
+        def preview_after_replacement(path, *args, **kwargs):
+            preview_sources.append(Path(path).resolve())
+            if len(preview_sources) == 1:
+                archive.write_bytes(b"source replaced after snapshot")
+            return real_preview(path, *args, **kwargs)
+
+        with patch.object(
+            portable_module,
+            "preview_import",
+            side_effect=preview_after_replacement,
+        ):
+            imported = apply_import(archive, mode="restore")
+
+        self.assertEqual(imported["round_trip"], "ok")
+        self.assertTrue(preview_sources)
+        self.assertTrue(all(path != archive.resolve() for path in preview_sources))
+        self.assertTrue(all(path.parent == temporary_root for path in preview_sources))
+        self.assertFalse(stale.exists())
+        self.assertTrue(recent.exists())
+        self.assertTrue(all(not path.exists() for path in preview_sources))
+        restored = service.get_task(task["id"])
+        self.assertEqual(restored["original_input"], "快照导入")
+        self.assertTrue(resolve_data_path(restored["image_path"]).is_file())
+
+    def test_export_rejects_dangling_asset_reference_before_writing_backup(self) -> None:
+        root = Path(self.temp.name)
+        source, archive = root / "source-dangling", root / "dangling.zip"
+        configure_home(source)
+        service.create_photo_task(io.BytesIO(b"\xff\xd8\xffdangling-source"), "悬空引用")
+        missing_id = f"asset_{'f' * 64}"
+        with connect() as connection:
+            head = connection.execute(
+                """SELECT r.revision_id,r.payload_json
+                   FROM entity_heads h JOIN domain_revisions r ON r.revision_id=h.revision_id
+                   WHERE h.entity_kind='task_input'"""
+            ).fetchone()
+            self.assertIsNotNone(head)
+            payload = json.loads(head["payload_json"])
+            payload["asset_id"] = missing_id
+            connection.execute(
+                "UPDATE domain_revisions SET payload_json=? WHERE revision_id=?",
+                (
+                    json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+                    head["revision_id"],
+                ),
+            )
+            connection.commit()
+
+        with self.assertRaisesRegex(ValidationError, "缺失资产"):
+            export_data(archive, encrypted=False)
+        self.assertFalse(archive.exists())
+
+        tombstone = make_revision(
+            "asset",
+            {
+                "sha256": "1" * 64,
+                "media_type": "image/jpeg",
+                "extension": ".jpg",
+                "byte_count": 4,
+            },
+            entity_id="asset_" + "1" * 64,
+            author_device_id="device_portable_tombstone",
+            deleted=True,
+        )
+        referencing = make_revision(
+            "task_input",
+            {
+                "task_id": "task_019f4a15-5fd1-7582-ae7e-5d45b235d399",
+                "task_type": "photo",
+                "input_version": 1,
+                "original_input": "",
+                "asset_id": tombstone.entity_id,
+                "input_history": [],
+            },
+            entity_id="task_input_019f4a15-5fd1-7582-ae7e-5d45b235d398",
+            author_device_id="device_portable_tombstone",
+        )
+        portable_module._require_asset_references(
+            [referencing, tombstone],
+            {tombstone.entity_id},
+        )
+
+    def test_portable_asset_manifest_is_strictly_bound_to_asset_head(self) -> None:
+        root = Path(self.temp.name)
+        source, target, archive = root / "source-contract", root / "target-contract", root / "base.zip"
+        configure_home(source)
+        service.create_photo_task(io.BytesIO(b"\xff\xd8\xffasset-contract"), "资产契约")
+        export_data(archive, encrypted=False)
+
+        with zipfile.ZipFile(archive) as portable:
+            base_entries = {
+                info.filename: portable.read(info.filename)
+                for info in portable.infolist()
+                if not info.is_dir()
+            }
+        base_manifest = json.loads(base_entries["manifest.json"])
+        base_descriptor = base_manifest["assets"][0]
+
+        def write_variant(name: str, mutate) -> Path:
+            entries = dict(base_entries)
+            manifest = json.loads(json.dumps(base_manifest))
+            mutate(manifest, entries)
+            entries["manifest.json"] = json.dumps(
+                manifest, ensure_ascii=False, sort_keys=True
+            ).encode("utf-8")
+            path = root / f"asset-contract-{name}.zip"
+            with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as output:
+                for entry_name, data in entries.items():
+                    output.writestr(entry_name, data)
+            return path
+
+        descriptor_variants = {
+            "missing-field": {key: value for key, value in base_descriptor.items() if key != "media_type"},
+            "extra-field": {**base_descriptor, "unexpected": True},
+            "id-type": {**base_descriptor, "id": 1},
+            "sha-type": {**base_descriptor, "sha256": 1},
+            "path-type": {**base_descriptor, "path": 1},
+            "bytes-string": {**base_descriptor, "bytes": str(base_descriptor["bytes"])},
+            "bytes-bool": {**base_descriptor, "bytes": True},
+            "bytes-float": {**base_descriptor, "bytes": float(base_descriptor["bytes"])},
+            "media-type-type": {**base_descriptor, "media_type": 1},
+            "id-mismatch": {**base_descriptor, "id": "asset_unknown"},
+            "sha-mismatch": {**base_descriptor, "sha256": "0" * 64},
+            "path-mismatch": {**base_descriptor, "path": "assets/unrelated.bin"},
+            "bytes-mismatch": {**base_descriptor, "bytes": base_descriptor["bytes"] + 1},
+            "media-type-mismatch": {**base_descriptor, "media_type": "application/octet-stream"},
+        }
+        variants: dict[str, list[dict]] = {
+            name: [descriptor] for name, descriptor in descriptor_variants.items()
+        }
+        variants["missing-mapping"] = []
+        variants["duplicate-mapping"] = [dict(base_descriptor), dict(base_descriptor)]
+        variants["extra-mapping"] = [
+            {**base_descriptor, "id": "asset_unknown"},
+            dict(base_descriptor),
+        ]
+
+        configure_home(target)
+        for name, descriptors in variants.items():
+            with self.subTest(name=name):
+                tampered = write_variant(
+                    name,
+                    lambda manifest, _entries, value=descriptors: manifest.__setitem__("assets", value),
+                )
+                with self.assertRaises(ValidationError):
+                    preview_import(tampered, mode="restore")
+
+        def corrupt_asset_head(manifest: dict, entries: dict[str, bytes]) -> None:
+            path = "entities/asset.jsonl"
+            revisions = [
+                json.loads(line)
+                for line in entries[path].decode("utf-8").splitlines()
+                if line.strip()
+            ]
+            head_id = manifest["entity_heads"][base_descriptor["id"]]
+            for revision in revisions:
+                if revision["revision_id"] == head_id:
+                    revision["payload"]["archive_path"] = "assets/wrong.bin"
+            raw = (
+                "\n".join(
+                    json.dumps(item, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+                    for item in revisions
+                )
+                + "\n"
+            ).encode("utf-8")
+            entries[path] = raw
+            manifest["content"][path]["sha256"] = portable_module._sha256_bytes(raw)
+
+        with self.assertRaises(ValidationError):
+            preview_import(write_variant("head-archive-path", corrupt_asset_head), mode="restore")
+
+        def add_unlisted_asset(_manifest: dict, entries: dict[str, bytes]) -> None:
+            entries["assets/unlisted.bin"] = b"unlisted"
+
+        with self.assertRaisesRegex(ValidationError, "精确对应"):
+            preview_import(write_variant("unlisted-file", add_unlisted_asset), mode="restore")
 
     def test_agent_user_model_projection_round_trips_and_hydrates_locally(self) -> None:
         root = Path(self.temp.name)
@@ -657,9 +993,100 @@ class DomainAndPortableTest(unittest.TestCase):
         with zipfile.ZipFile(archive_file, "w") as writer:
             writer.writestr(archive_path, b"asset")
         with zipfile.ZipFile(archive_file) as reader:
+            manifest = {
+                "entity_heads": {unsafe.entity_id: unsafe.revision_id},
+                "assets": [
+                    {
+                        "id": unsafe.entity_id,
+                        "sha256": digest,
+                        "path": archive_path,
+                        "bytes": 5,
+                        "media_type": "image/png",
+                    }
+                ],
+            }
             with self.assertRaises(ValidationError):
-                portable_module._asset_paths(reader, [unsafe])
+                portable_module._asset_paths(reader, manifest, [unsafe])
         self.assertFalse(escaped.exists())
+
+    def test_merge_records_entity_kind_collision_without_overwriting_head(self) -> None:
+        root = Path(self.temp.name)
+        source, target, archive = root / "kind-source", root / "kind-target", root / "kind.zip"
+        configure_home(source)
+        task = service.create_material_task("同 ID 不同类型")
+        export_data(archive, encrypted=False)
+
+        configure_home(target)
+        init_db()
+        local = DomainRevision(
+            entity_id=task["id"],
+            entity_kind="preferences",
+            revision_id="rev_local_kind_collision",
+            parent_revision_ids=(),
+            created_at="2026-08-01T00:00:00Z",
+            author_device_id="device_local_kind",
+            deleted=False,
+            payload={"kind": "settings", "content": "{}"},
+        )
+        with connect() as connection:
+            portable_module._store_revision_only(connection, local)
+            connection.execute(
+                """INSERT INTO entity_heads(entity_id,entity_kind,revision_id,conflicted,updated_at)
+                   VALUES(?,?,?,0,?)""",
+                (local.entity_id, local.entity_kind, local.revision_id, local.created_at),
+            )
+            connection.commit()
+
+        preview = preview_import(archive, mode="merge")
+        self.assertIn(
+            {"kind": "task", "id": task["id"]},
+            preview["conflicts"],
+        )
+        self.assertNotIn(
+            {"kind": "task", "id": task["id"]},
+            preview["new"],
+        )
+        result = apply_import(archive, mode="merge")
+        self.assertEqual(result["conflicts"], 1)
+        with connect() as connection:
+            head = connection.execute(
+                "SELECT entity_kind,revision_id,conflicted FROM entity_heads WHERE entity_id=?",
+                (task["id"],),
+            ).fetchone()
+            conflict = connection.execute(
+                "SELECT conflicting_paths_json FROM sync_conflicts WHERE entity_id=?",
+                (task["id"],),
+            ).fetchone()
+        self.assertEqual(tuple(head), (local.entity_kind, local.revision_id, 1))
+        self.assertEqual(json.loads(conflict["conflicting_paths_json"]), ["$entity_kind"])
+
+    def test_merge_rejects_existing_revision_id_with_different_content(self) -> None:
+        root = Path(self.temp.name)
+        source, target, archive = (
+            root / "revision-source",
+            root / "revision-target",
+            root / "revision.zip",
+        )
+        configure_home(source)
+        service.create_material_task("revision 冲突")
+        export_data(archive, encrypted=False)
+        with zipfile.ZipFile(archive) as portable:
+            entity_path = "entities/task_input.jsonl"
+            remote_value = json.loads(
+                portable.read(entity_path).decode("utf-8").splitlines()[0]
+            )
+
+        configure_home(target)
+        init_db()
+        local_value = json.loads(json.dumps(remote_value))
+        local_value["payload"]["original_input"] = "本机不同内容"
+        local = validate_revision(local_value)
+        with connect() as connection:
+            portable_module._store_revision_only(connection, local)
+            connection.commit()
+
+        with self.assertRaisesRegex(ValidationError, "已有不同内容冲突"):
+            preview_import(archive, mode="merge")
 
     def test_portable_preserves_revision_graph_and_auto_merges_disjoint_fields(self) -> None:
         root = Path(self.temp.name)

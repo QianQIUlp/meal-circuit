@@ -147,6 +147,11 @@ class ClientTransport:
         self.client = client
         self.headers = {"Authorization": f"Bearer {access_token}"}
 
+    def capabilities(self) -> dict:
+        response = self.client.get("/v1/capabilities")
+        response.raise_for_status()
+        return response.json()
+
     def push(self, operations: list[dict]) -> dict:
         response = self.client.post("/v1/sync/push", headers=self.headers, json={"operations": operations})
         response.raise_for_status()
@@ -1361,6 +1366,12 @@ class SyncIntegrationTest(unittest.TestCase):
         ).json()
         self.keys = create_key_material(account["account_id"])
         self.account = account
+        recovery = self.client.put(
+            "/v1/key-envelopes/recovery",
+            headers={"Authorization": f"Bearer {account['access_token']}"},
+            json={"envelope": self.keys["recovery_envelope"]},
+        )
+        self.assertEqual(recovery.status_code, 200, recovery.text)
         self.transport_a = ClientTransport(self.client, account["access_token"])
         phone = self.client.post(
             "/v1/sessions",
@@ -1558,7 +1569,8 @@ class SyncIntegrationTest(unittest.TestCase):
         with self.assertRaisesRegex(ConnectionError, "response loss"):
             sync_now(LoseFirstPushResponse(self.transport_a))
         self.assertEqual(sync_status()["pending"], pending_before)
-        server_after_loss = self.transport_a.pull(0)
+        negotiated_pull_limit = min(500, int(self.transport_a.capabilities()["max_pull"]))
+        server_after_loss = self.transport_a.pull(0, limit=negotiated_pull_limit)
         remote_versions = {
             (item["remote_id"], item["server_version"])
             for item in server_after_loss["changes"]
@@ -1567,7 +1579,7 @@ class SyncIntegrationTest(unittest.TestCase):
         retried = sync_now(self.transport_a)
         self.assertGreater(retried["accepted"], 0)
         self.assertEqual(sync_status()["pending"], 0)
-        server_after_retry = self.transport_a.pull(0)
+        server_after_retry = self.transport_a.pull(0, limit=negotiated_pull_limit)
         self.assertEqual(
             remote_versions,
             {(item["remote_id"], item["server_version"]) for item in server_after_retry["changes"]},
@@ -1793,7 +1805,7 @@ class SyncIntegrationTest(unittest.TestCase):
         self.assertTrue(rotated["recovery_key"].startswith("MC1-"))
         self.assertEqual(sync_status()["key_version"], 2)
         self.assertEqual(self.client.get("/v1/devices", headers=self.transport_b.headers).status_code, 401)
-        snapshot = self.transport_a.pull(0)
+        snapshot = self.transport_a.pull(0, limit=min(500, int(self.transport_a.capabilities()["max_pull"])))
         self.assertTrue(snapshot["requires_full_resync"])
         self.assertTrue(all(item["key_version"] == 2 for item in snapshot["changes"]))
 

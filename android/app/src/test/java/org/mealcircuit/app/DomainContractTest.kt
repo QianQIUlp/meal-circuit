@@ -1,32 +1,68 @@
 package org.mealcircuit.app
 
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.CancellationException
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.decodeFromString
+import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.mealcircuit.app.domain.DomainRevision
+import org.mealcircuit.app.domain.EntityKind
 import org.mealcircuit.app.domain.ResultValidator
 import org.mealcircuit.app.domain.threeWayMerge
 import org.mealcircuit.app.domain.preferenceId
 import org.mealcircuit.app.domain.CheckinContract
 import org.mealcircuit.app.domain.STATE_TRANSITIONS
 import org.mealcircuit.app.domain.normalize
+import org.mealcircuit.app.domain.validateStateChange
 import org.mealcircuit.app.data.MaterializedRecordEntity
+import org.mealcircuit.app.data.ManagedAssetEntity
+import org.mealcircuit.app.io.MAX_MANAGED_ASSET_BYTES
 import org.mealcircuit.app.io.readUpTo
 import org.mealcircuit.app.io.readBounded
+import org.mealcircuit.app.portable.bindPortableAssetDescriptors
+import org.mealcircuit.app.portable.portableStorageRevision
+import org.mealcircuit.app.portable.requirePortableAssetReferences
+import org.mealcircuit.app.portable.validatePortableRevisionGraph
 import org.mealcircuit.app.sync.AccountCipher
+import org.mealcircuit.app.sync.SyncBudget
+import org.mealcircuit.app.sync.PermanentAssetException
+import org.mealcircuit.app.sync.classifyManagedAssetsByReachability
+import org.mealcircuit.app.sync.referencedAssetIds
+import org.mealcircuit.app.sync.shouldPauseSyncForUnknownCount
+import org.mealcircuit.app.sync.shouldEvictUnknown
+import org.mealcircuit.app.sync.allowsAssetDownload
+import org.mealcircuit.app.sync.shouldDeferAssetTransfer
+import org.mealcircuit.app.ui.visibleCheckinInput
 import org.mealcircuit.app.sync.formatRecoveryKey
+import org.mealcircuit.app.sync.isRevisionDescendant
+import org.mealcircuit.app.sync.safelyProcessAssets
 import org.mealcircuit.app.sync.parseRecoveryKey
+import org.mealcircuit.app.sync.parsePairingPayload
+import org.mealcircuit.app.sync.requireMatchingPairingServer
 import org.mealcircuit.app.sync.SyncFailureDisposition
 import org.mealcircuit.app.sync.SyncHttpException
+import org.mealcircuit.app.sync.readBoundedBytes
+import org.mealcircuit.app.sync.readBoundedText
 import org.mealcircuit.app.sync.syncFailureDisposition
+import org.mealcircuit.app.sync.validateServerUrl
+import org.mealcircuit.app.sync.deriveSafePullLimit
+import org.mealcircuit.app.sync.PendingRegistration
+import org.mealcircuit.app.sync.RecoveryMaterial
+import org.mealcircuit.app.sync.accountNeedsRecoverySetup
+import java.io.IOException
 import org.mealcircuit.app.ui.CAMERA_FAILURE_MESSAGE
 import org.mealcircuit.app.ui.finalizeCameraResult
 import org.mealcircuit.app.ui.mealModeLabel
@@ -34,10 +70,176 @@ import org.mealcircuit.app.ui.publishedPlan
 import java.util.Base64
 import java.io.ByteArrayInputStream
 import java.nio.file.Files
+import java.security.MessageDigest
 import java.time.LocalDate
+import okhttp3.MediaType
+import okhttp3.ResponseBody
+import okio.Buffer
+import okio.BufferedSource
 
 class DomainContractTest {
     private val json = Json { ignoreUnknownKeys = true }
+
+    @Test
+    fun managedAssetReuseRepairsLegacyPartialRowsAndTombstones() {
+        val filesDir = Files.createTempDirectory("managed-asset-reuse-").toFile()
+        try {
+            val bytes = "synthetic managed asset".toByteArray()
+            val digest = MessageDigest.getInstance("SHA-256")
+                .digest(bytes)
+                .joinToString("") { "%02x".format(it) }
+            val relative = "assets/$digest.jpg"
+            val target = filesDir.resolve(relative)
+            target.parentFile?.mkdirs()
+            target.writeBytes(bytes)
+            val asset = ManagedAssetEntity(
+                id = "asset_$digest",
+                sha256 = digest,
+                mediaType = "image/jpeg",
+                extension = ".jpg",
+                byteCount = bytes.size.toLong(),
+                relativePath = relative,
+                unresolved = false,
+                createdAt = "2026-08-01T00:00:00Z",
+            )
+            val payload = buildJsonObject {
+                put("sha256", digest)
+                put("media_type", "image/jpeg")
+                put("extension", ".jpg")
+                put("byte_count", bytes.size)
+            }.toString()
+            fun record(deleted: Boolean) = MaterializedRecordEntity(
+                entityId = asset.id,
+                entityKind = "asset",
+                payloadJson = payload,
+                deleted = deleted,
+                sortKey = asset.id,
+                updatedAt = "2026-08-01T00:00:00Z",
+            )
+
+            assertFalse(canReuseManagedAsset(
+                filesDir, asset, null, digest, "image/jpeg", ".jpg", bytes.size.toLong()
+            ))
+            assertFalse(canReuseManagedAsset(
+                filesDir, asset, record(deleted = true), digest, "image/jpeg", ".jpg", bytes.size.toLong()
+            ))
+            assertTrue(canReuseManagedAsset(
+                filesDir, asset, record(deleted = false), digest, "image/jpeg", ".jpg", bytes.size.toLong()
+            ))
+            assertTrue(runCatching {
+                canReuseManagedAsset(
+                    filesDir,
+                    asset,
+                    record(deleted = false).copy(payloadJson = payload.replace(digest, "0".repeat(64))),
+                    digest,
+                    "image/jpeg",
+                    ".jpg",
+                    bytes.size.toLong(),
+                )
+            }.isFailure)
+        } finally {
+            filesDir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun portableRevisionGraphHandlesTwentyThousandDeepChainIteratively() {
+        val template = json.decodeFromString<DomainRevision>(resource("fixtures/domain-revision.json"))
+        val depth = 20_000
+        val revisions = (0 until depth).map { index ->
+            template.copy(
+                revisionId = "rev_deep_$index",
+                parentRevisionIds = if (index == 0) emptyList() else listOf("rev_deep_${index - 1}"),
+            )
+        }
+
+        validatePortableRevisionGraph(revisions)
+
+        val cyclic = revisions.toMutableList()
+        cyclic[0] = cyclic[0].copy(parentRevisionIds = listOf(cyclic.last().revisionId))
+        assertTrue(runCatching { validatePortableRevisionGraph(cyclic) }.isFailure)
+
+        val foreignParent = revisions[0].copy(
+            entityId = "entity_foreign",
+            revisionId = "rev_foreign",
+        )
+        val crossEntityChild = revisions[1].copy(parentRevisionIds = listOf(foreignParent.revisionId))
+        assertTrue(runCatching {
+            validatePortableRevisionGraph(listOf(foreignParent, crossEntityChild))
+        }.isFailure)
+    }
+
+    @Test
+    fun managedAssetReachabilityTraversesIterativelyAndPreservesRotationInventory() {
+        val template = json.decodeFromString<DomainRevision>(resource("fixtures/domain-revision.json"))
+        var deeplyNested: JsonElement = buildJsonObject {
+            put("photo_asset_id", "asset_deep")
+        }
+        repeat(20_000) {
+            deeplyNested = JsonArray(listOf(deeplyNested))
+        }
+        val current = template.copy(
+            entityKind = EntityKind.TASK_INPUT,
+            payload = buildJsonObject {
+                put("cover_asset_id", "asset_top")
+                put("numeric_asset_id", 7)
+                put("asset_ids", "asset_plural_is_not_a_reference")
+                put("nested", buildJsonObject {
+                    put("meal_photo_asset_id", "asset_nested")
+                    put("deep", deeplyNested)
+                })
+            },
+        )
+        val deletedHistorical = template.copy(
+            entityKind = EntityKind.DAILY_RECORD,
+            deleted = true,
+            payload = buildJsonObject {
+                put("receipt_asset_id", "asset_historical")
+            },
+        )
+        val assetMetadata = template.copy(
+            entityKind = EntityKind.ASSET,
+            payload = buildJsonObject {
+                put("preview_asset_id", "asset_metadata_only")
+            },
+        )
+
+        val referencedIds = referencedAssetIds(listOf(current, deletedHistorical, assetMetadata))
+        assertEquals(
+            setOf("asset_top", "asset_nested", "asset_deep", "asset_historical"),
+            referencedIds,
+        )
+
+        fun asset(id: String) = ManagedAssetEntity(
+            id = id,
+            sha256 = id.hashCode().toUInt().toString(16).padStart(64, '0'),
+            mediaType = "image/jpeg",
+            extension = ".jpg",
+            byteCount = 0,
+            relativePath = "assets/$id.jpg",
+            unresolved = false,
+            createdAt = "2026-08-01T00:00:00Z",
+        )
+        val assets = listOf(
+            asset("asset_orphan"),
+            asset("asset_nested"),
+            asset("asset_top"),
+            asset("asset_deep"),
+            asset("asset_historical"),
+            asset("asset_metadata_only"),
+        )
+        val reachability = classifyManagedAssetsByReachability(assets, referencedIds)
+
+        assertEquals(
+            listOf("asset_nested", "asset_top", "asset_deep", "asset_historical"),
+            reachability.referenced.map { it.id },
+        )
+        assertEquals(
+            listOf("asset_orphan", "asset_metadata_only"),
+            reachability.unreferenced.map { it.id },
+        )
+        assertEquals(assets.map { it.id }, reachability.allForKeyRotation.map { it.id })
+    }
 
     @Test
     fun pythonAndAndroidShareTheSameEncryptedEnvelopeVector() {
@@ -124,12 +326,31 @@ class DomainContractTest {
 
     @Test
     fun backgroundSyncRetriesOnlyTransientFailures() {
-        assertEquals(SyncFailureDisposition.FAILURE, syncFailureDisposition(SyncHttpException(401, "expired")))
-        assertEquals(SyncFailureDisposition.FAILURE, syncFailureDisposition(SyncHttpException(409, "conflict")))
-        assertEquals(SyncFailureDisposition.RETRY, syncFailureDisposition(SyncHttpException(503, "offline")))
+        listOf(401, 403, 404, 409, 413, 422, 426).forEach { status ->
+            assertEquals(
+                "HTTP $status must not be retried",
+                SyncFailureDisposition.FAILURE,
+                syncFailureDisposition(SyncHttpException(status, "permanent")),
+            )
+        }
+        listOf(408, 425, 429, 503).forEach { status ->
+            assertEquals(
+                "HTTP $status must be retried",
+                SyncFailureDisposition.RETRY,
+                syncFailureDisposition(SyncHttpException(status, "transient")),
+            )
+        }
         assertEquals(SyncFailureDisposition.RETRY, syncFailureDisposition(java.io.IOException("network")))
         assertEquals(SyncFailureDisposition.FAILURE, syncFailureDisposition(IllegalStateException("schema mismatch")))
         assertEquals(SyncFailureDisposition.FAILURE, syncFailureDisposition(javax.crypto.AEADBadTagException("tampered")))
+        assertEquals(
+            SyncFailureDisposition.FAILURE,
+            syncFailureDisposition(PermanentAssetException("资源 asset_x 缺少分块 2")),
+        )
+        assertEquals(
+            SyncFailureDisposition.FAILURE,
+            syncFailureDisposition(PermanentAssetException("资源 asset_x 与认证元数据不一致")),
+        )
     }
 
     @Test
@@ -141,6 +362,421 @@ class DomainContractTest {
         assertTrue(ByteArrayInputStream(ByteArray(8)).readBounded(8).contentEquals(ByteArray(8)))
         runCatching { ByteArrayInputStream(ByteArray(9)).readBounded(8) }
             .onSuccess { error("oversized stream accepted") }
+    }
+
+    @Test
+    fun pendingRegistrationSurvivesSerializationAndCheckinDateStaysExplicit() {
+        val pending = PendingRegistration(
+            serverUrl = "https://sync.example",
+            accountId = "account_fixture",
+            deviceId = "device_fixture",
+            deviceName = "测试设备",
+            material = RecoveryMaterial(
+                accountDataKey = ByteArray(32) { it.toByte() },
+                recoveryKey = formatRecoveryKey(ByteArray(32) { it.toByte() }),
+                envelopeNonce = "nonce",
+                envelopeCiphertext = "ciphertext",
+                keyVersion = 1,
+            ),
+        )
+        val restored = json.decodeFromString<PendingRegistration>(json.encodeToString(pending))
+        assertEquals(json.encodeToString(pending), json.encodeToString(restored))
+        assertTrue(pending.material.accountDataKey.contentEquals(restored.material.accountDataKey))
+        assertEquals("2026-08-01", requireCheckinDate("2026-08-01"))
+        runCatching { requireCheckinDate("2026-08-01T00:00:00") }
+            .onSuccess { error("date-time was accepted as a check-in date") }
+        assertTrue(accountNeedsRecoverySetup("false"))
+        assertTrue(!accountNeedsRecoverySetup("true"))
+        assertTrue(!accountNeedsRecoverySetup(null))
+        runCatching { accountNeedsRecoverySetup("unknown") }
+            .onSuccess { error("invalid recovery setup state was accepted") }
+    }
+
+    @Test
+    fun boundedHttpBodiesCheckDeclaredAndActualLength() {
+        assertEquals("1234", responseBody("1234".encodeToByteArray()).readBoundedText(4, "test body"))
+        runCatching { responseBody(ByteArray(5)).readBoundedBytes(4, "declared body") }
+            .onSuccess { error("oversized declared body accepted") }
+        runCatching { responseBody(ByteArray(5), declaredLength = -1).readBoundedBytes(4, "streamed body") }
+            .onSuccess { error("oversized streamed body accepted") }
+    }
+
+    @Test
+    fun syncPullLimitRespectsEntityAndResponseByteBudgets() {
+        assertEquals(
+            31,
+            deriveSafePullLimit(
+                serverMaxPull = 500,
+                maxEntityBytes = 1024L * 1024L,
+                maxPullResponseBytes = 32L * 1024L * 1024L,
+            ),
+        )
+        assertEquals(
+            1,
+            deriveSafePullLimit(
+                serverMaxPull = 500,
+                maxEntityBytes = 16L * 1024L * 1024L,
+                maxPullResponseBytes = 32L * 1024L * 1024L,
+            ),
+        )
+        assertTrue(runCatching {
+            deriveSafePullLimit(
+                serverMaxPull = 7,
+                maxEntityBytes = 8L * 1024L,
+                maxPullResponseBytes = 8L * 1024L,
+            )
+        }.isFailure)
+    }
+
+    @Test
+    fun synchronizationUrlsAreCanonicalAndRejectCredentialRoutingTricks() {
+        assertEquals("https://example.com/sync", validateServerUrl("HTTPS://Example.COM:443/sync/"))
+        assertEquals("http://127.0.0.1:18080", validateServerUrl("http://127.0.0.1:18080/"))
+        listOf(
+            "http://example.com",
+            "https://user@example.com",
+            "https://example.com/path?next=https://attacker.invalid",
+            "https://example.com/path#fragment",
+            "https://example.com/%2e%2e/private",
+            "https://example.com/path\\escape",
+        ).forEach { malicious ->
+            runCatching { validateServerUrl(malicious) }
+                .onSuccess { error("unsafe synchronization URL accepted: $malicious") }
+        }
+    }
+
+    @Test
+    fun pairingQrCannotSilentlyChooseWhereCredentialsAreSent() {
+        val claimToken = Base64.getUrlEncoder().withoutPadding().encodeToString(ByteArray(32) { it.toByte() })
+        val payload = buildJsonObject {
+            put("format", "mealcircuit.pairing")
+            put("version", 1)
+            put("server_url", "https://Sync.Example:443/base/")
+            put("account_id", "account_00000000-0000-4000-8000-000000000001")
+            put("pairing_id", "pairing_00000000-0000-4000-8000-000000000002")
+            put("claim_token", claimToken)
+        }
+        val pairing = parsePairingPayload(payload.toString(), json)
+        assertEquals("https://sync.example/base", pairing.serverUrl)
+        assertEquals(
+            "https://sync.example/base",
+            requireMatchingPairingServer(pairing, "https://sync.example:443/base/"),
+        )
+        runCatching { requireMatchingPairingServer(pairing, "https://attacker.invalid") }
+            .onSuccess { error("pairing server substitution accepted") }
+
+        val unsafeId = JsonObject(payload + ("pairing_id" to JsonPrimitive("../account")))
+        runCatching { parsePairingPayload(unsafeId.toString(), json) }
+            .onSuccess { error("pairing path injection accepted") }
+        val unsafeToken = JsonObject(payload + ("claim_token" to JsonPrimitive("not-a-32-byte-token")))
+        runCatching { parsePairingPayload(unsafeToken.toString(), json) }
+            .onSuccess { error("malformed pairing token accepted") }
+        runCatching { parsePairingPayload("x".repeat(8_193), json) }
+            .onSuccess { error("oversized pairing payload accepted") }
+    }
+
+    @Test
+    fun assetRevisionValidatesSafeMetadataAndRejectsPathOrSizeAbuse() {
+        val valid = DomainRevision.create(
+            kind = EntityKind.ASSET,
+            entityId = "asset_fixture",
+            deviceId = "device_fixture",
+            payload = buildJsonObject {
+                put("sha256", "0".repeat(64))
+                put("media_type", "image/jpeg")
+                put("extension", ".jpg")
+                put("byte_count", 4)
+            },
+        )
+        valid.copy(payload = JsonObject(valid.payload + ("extension" to JsonPrimitive(".jpeg")))).validate()
+        valid.copy(payload = JsonObject(valid.payload + ("byte_count" to JsonPrimitive(0)))).validate()
+        valid.copy(
+            payload = JsonObject(valid.payload + ("byte_count" to JsonPrimitive(MAX_MANAGED_ASSET_BYTES))),
+        ).validate()
+
+        val invalidFields = listOf(
+            "sha256" to JsonPrimitive("A".repeat(64)),
+            "sha256" to JsonPrimitive("0".repeat(63)),
+            "media_type" to JsonPrimitive("application/octet-stream"),
+            "extension" to JsonPrimitive(".png"),
+            "extension" to JsonPrimitive("/../../escape-canary"),
+            "extension" to JsonPrimitive("..\\escape-canary.jpg"),
+            "byte_count" to JsonPrimitive(-1),
+            "byte_count" to JsonPrimitive(MAX_MANAGED_ASSET_BYTES + 1),
+            "byte_count" to JsonPrimitive("4"),
+        )
+        invalidFields.forEachIndexed { index, (field, value) ->
+            val malicious = valid.copy(payload = JsonObject(valid.payload + (field to value)))
+            runCatching(malicious::validate)
+                .onSuccess { error("invalid asset metadata case $index was accepted") }
+        }
+    }
+
+    @Test
+    fun portableAssetDescriptorsBindExactlyToAssetHeads() {
+        val assetId = "asset_portable_fixture"
+        val digest = "1".repeat(64)
+        val path = "assets/$digest.jpg"
+        fun assetRevision(
+            id: String = assetId,
+            sha256: String = digest,
+            archivePath: String = "assets/$sha256.jpg",
+        ) = DomainRevision.create(
+            kind = EntityKind.ASSET,
+            entityId = id,
+            deviceId = "device_portable_fixture",
+            payload = buildJsonObject {
+                put("sha256", sha256)
+                put("media_type", "image/jpeg")
+                put("extension", ".jpg")
+                put("byte_count", 4)
+                put("archive_path", archivePath)
+            },
+        )
+        fun descriptor(
+            id: String = assetId,
+            sha256: String = digest,
+            descriptorPath: String = "assets/$sha256.jpg",
+            bytes: JsonPrimitive = JsonPrimitive(4),
+            mediaType: String = "image/jpeg",
+        ) = buildJsonObject {
+            put("id", id)
+            put("sha256", sha256)
+            put("path", descriptorPath)
+            put("bytes", bytes)
+            put("media_type", mediaType)
+        }
+
+        val head = assetRevision()
+        val valid = descriptor()
+        val binding = bindPortableAssetDescriptors(
+            revisions = listOf(head),
+            heads = mapOf(assetId to head.revisionId),
+            descriptors = listOf(valid),
+        ).single()
+        assertEquals(assetId, binding.id)
+        assertEquals(path, binding.path)
+        assertEquals(head, binding.revision)
+        val legacyBinding = bindPortableAssetDescriptors(
+            revisions = listOf(head),
+            heads = mapOf(assetId to head.revisionId),
+            descriptors = listOf(buildJsonObject {
+                put("sha256", digest)
+                put("path", path)
+                put("bytes", 4)
+            }),
+        ).single()
+        assertEquals(assetId, legacyBinding.id)
+        assertEquals("image/jpeg", legacyBinding.mediaType)
+        val storageHead = portableStorageRevision(head)
+        assertEquals(head.revisionId, storageHead.revisionId)
+        assertTrue("archive_path" !in storageHead.payload)
+        assertEquals(JsonObject(head.payload - "archive_path"), storageHead.payload)
+
+        val taskInput = DomainRevision.create(
+            kind = EntityKind.TASK_INPUT,
+            entityId = "task_input_portable_fixture",
+            deviceId = "device_portable_fixture",
+            payload = buildJsonObject {
+                put("task_id", "task_portable_fixture")
+                put("task_type", "photo")
+                put("input_version", 1)
+                put("original_input", "")
+                put("asset_id", assetId)
+                put("input_history", JsonArray(emptyList()))
+            },
+        )
+        requirePortableAssetReferences(listOf(taskInput, head.copy(deleted = true)), setOf(assetId))
+        assertTrue(runCatching {
+            requirePortableAssetReferences(listOf(taskInput), emptySet())
+        }.isFailure)
+
+        val extraId = "asset_portable_extra"
+        val extraDigest = "2".repeat(64)
+        val extraHead = assetRevision(extraId, extraDigest)
+        val invalidCases = listOf(
+            emptyList(),
+            listOf(valid, valid),
+            listOf(descriptor(id = extraId, sha256 = extraDigest)),
+            listOf(descriptor(sha256 = "3".repeat(64))),
+            listOf(descriptor(descriptorPath = "assets/$digest.png")),
+            listOf(descriptor(bytes = JsonPrimitive(5))),
+            listOf(descriptor(bytes = JsonPrimitive("4"))),
+            listOf(descriptor(mediaType = "image/png")),
+            listOf(JsonObject(valid + ("unexpected" to JsonPrimitive(true)))),
+        )
+        invalidCases.forEachIndexed { index, descriptors ->
+            runCatching {
+                bindPortableAssetDescriptors(listOf(head), mapOf(assetId to head.revisionId), descriptors)
+            }.onSuccess { error("invalid portable asset descriptor case $index was accepted") }
+        }
+
+        val wrongArchiveHead = assetRevision(archivePath = "assets/$digest.png")
+        runCatching {
+            bindPortableAssetDescriptors(
+                listOf(wrongArchiveHead),
+                mapOf(assetId to wrongArchiveHead.revisionId),
+                listOf(valid),
+            )
+        }.onSuccess { error("mismatched archive_path was accepted") }
+
+        runCatching {
+            bindPortableAssetDescriptors(
+                listOf(head, extraHead),
+                mapOf(assetId to head.revisionId, extraId to extraHead.revisionId),
+                listOf(valid, descriptor(id = extraId)),
+            )
+        }.onSuccess { error("duplicate portable asset path was accepted") }
+    }
+
+    @Test
+    fun remoteRevisionMustReachCurrentHeadThroughBoundedSameEntityAncestry() = runBlocking {
+        val root = json.decodeFromString<DomainRevision>(resource("fixtures/domain-revision.json"))
+        val child = DomainRevision.create(
+            kind = root.entityKind,
+            entityId = root.entityId,
+            parents = listOf(root.revisionId),
+            deviceId = root.authorDeviceId,
+            payload = root.payload,
+        )
+        val grandchild = DomainRevision.create(
+            kind = root.entityKind,
+            entityId = root.entityId,
+            parents = listOf(child.revisionId),
+            deviceId = root.authorDeviceId,
+            payload = root.payload,
+        )
+        val known = mapOf(root.revisionId to root, child.revisionId to child)
+        assertTrue(isRevisionDescendant(grandchild, root, known::get))
+        assertTrue(isRevisionDescendant(root, root, known::get))
+
+        val replay = DomainRevision.create(
+            kind = root.entityKind,
+            entityId = root.entityId,
+            deviceId = root.authorDeviceId,
+            payload = root.payload,
+        )
+        assertTrue(!isRevisionDescendant(replay, root, known::get))
+        assertTrue(!isRevisionDescendant(grandchild, root, known::get, maxVisited = 1))
+
+        val foreign = child.copy(
+            entityId = DomainRevision.id("food"),
+            parentRevisionIds = listOf(root.revisionId),
+        )
+        val forged = grandchild.copy(parentRevisionIds = listOf(foreign.revisionId))
+        assertTrue(!isRevisionDescendant(forged, root, mapOf(foreign.revisionId to foreign)::get))
+        assertTrue(!isRevisionDescendant(foreign, root, emptyMap<String, DomainRevision>()::get))
+    }
+
+    @Test
+    fun unknownCapacityChargesOnlyNewRowsAndForcedMediaIgnoresPolicy() {
+        val full = SyncBudget(storedAtStart = 2_000)
+        assertTrue(shouldPauseSyncForUnknownCount(2_000))
+        assertTrue(!shouldPauseSyncForUnknownCount(1_999))
+        full.reserve(isNew = false)
+        assertEquals(0, full.addedThisRun)
+        runCatching { full.reserve(isNew = true) }
+            .onSuccess { error("new unknown row was accepted above the storage cap") }
+        assertTrue(!full.tryReserve(isNew = true))
+
+        val perRun = SyncBudget(storedAtStart = 0, addedThisRun = 500)
+        perRun.reserve(isNew = false)
+        runCatching { perRun.reserve(isNew = true) }
+            .onSuccess { error("new unknown row was accepted above the per-run cap") }
+        assertTrue(!perRun.tryReserve(isNew = true))
+
+        val available = SyncBudget(storedAtStart = 1_999)
+        assertTrue(available.tryReserve(isNew = true))
+        assertEquals(1, available.addedThisRun)
+        assertTrue(!available.tryReserve(isNew = true))
+
+        assertTrue(allowsAssetDownload("on_demand", unmetered = false, includeOnDemandMedia = true))
+        assertTrue(allowsAssetDownload("all_wifi", unmetered = false, includeOnDemandMedia = true))
+        assertTrue(!allowsAssetDownload("all_wifi", unmetered = false, includeOnDemandMedia = false))
+        assertTrue(allowsAssetDownload("all_wifi", unmetered = true, includeOnDemandMedia = false))
+
+        assertTrue(shouldDeferAssetTransfer("all_wifi", unmetered = false, hasPendingAssets = true))
+        assertTrue(!shouldDeferAssetTransfer("all_wifi", unmetered = true, hasPendingAssets = true))
+        assertTrue(!shouldDeferAssetTransfer("all_wifi", unmetered = false, hasPendingAssets = false))
+        assertTrue(!shouldDeferAssetTransfer("all", unmetered = false, hasPendingAssets = true))
+        assertTrue(!shouldDeferAssetTransfer("on_demand", unmetered = false, hasPendingAssets = true))
+    }
+
+    @Test
+    fun unknownReprocessAttemptsAreBoundedBeforeEviction() {
+        assertTrue(!shouldEvictUnknown(9))
+        assertTrue(shouldEvictUnknown(10))
+        assertTrue(shouldEvictUnknown(99))
+    }
+
+    @Test
+    fun oneAssetFailureDoesNotBlockLaterAssetsButCancellationStillStops() = runBlocking {
+        fun asset(id: String) = ManagedAssetEntity(
+            id = id,
+            sha256 = "0".repeat(64),
+            mediaType = "image/jpeg",
+            extension = ".jpg",
+            byteCount = 0,
+            relativePath = null,
+            unresolved = true,
+            createdAt = "2026-08-01T00:00:00Z",
+        )
+        val assets = listOf(asset("asset_one"), asset("asset_bad"), asset("asset_three"))
+        val visited = mutableListOf<String>()
+        val errors = mutableListOf<String>()
+        val result = safelyProcessAssets(assets, errors) { value ->
+            visited += value.id
+            if (value.id == "asset_bad") error("fixture failure")
+        }
+        assertEquals(listOf("asset_one", "asset_bad", "asset_three"), visited)
+        assertEquals(1, errors.size)
+        assertTrue(errors.single().startsWith("asset_bad:"))
+        assertEquals(0, result.transientFailures)
+        assertEquals(1, result.permanentFailures)
+
+        val transient = safelyProcessAssets(listOf(asset("asset_network")), mutableListOf()) {
+            throw IOException("temporary")
+        }
+        assertEquals(1, transient.transientFailures)
+        assertEquals(0, transient.permanentFailures)
+
+        val missing = safelyProcessAssets(listOf(asset("asset_missing")), mutableListOf()) {
+            throw PermanentAssetException("资源 asset_missing 缺少分块 0")
+        }
+        assertEquals(0, missing.transientFailures)
+        assertEquals(1, missing.permanentFailures)
+
+        val cancelledVisits = mutableListOf<String>()
+        val cancellation = runCatching {
+            safelyProcessAssets(assets, mutableListOf()) { value ->
+                cancelledVisits += value.id
+                if (value.id == "asset_bad") throw CancellationException("stop")
+            }
+        }
+        assertTrue(cancellation.exceptionOrNull() is CancellationException)
+        assertEquals(listOf("asset_one", "asset_bad"), cancelledVisits)
+    }
+
+    @Test
+    fun unknownEnvelopeBudgetLimitsSingleRunAndPersistentBytes() {
+        val single = SyncBudget(storedAtStart = 0)
+        assertTrue(runCatching {
+            single.reserve(isNew = true, previousBytes = 0, newBytes = 16 * 1024 * 1024 + 1)
+        }.isFailure)
+
+        val perRun = SyncBudget(storedAtStart = 0)
+        perRun.reserve(isNew = true, previousBytes = 0, newBytes = 16 * 1024 * 1024)
+        perRun.reserve(isNew = true, previousBytes = 0, newBytes = 16 * 1024 * 1024)
+        assertTrue(runCatching {
+            perRun.reserve(isNew = true, previousBytes = 0, newBytes = 1)
+        }.isFailure)
+        assertTrue(!perRun.tryReserve(isNew = true, previousBytes = 0, newBytes = 1))
+
+        val persistent = SyncBudget(storedAtStart = 1, storedBytes = 63L * 1024L * 1024L)
+        assertTrue(runCatching {
+            persistent.reserve(isNew = true, previousBytes = 0, newBytes = 2 * 1024 * 1024)
+        }.isFailure)
+        assertTrue(!persistent.tryReserve(isNew = true, previousBytes = 0, newBytes = 2 * 1024 * 1024))
     }
 
     @Test
@@ -195,6 +831,78 @@ class DomainContractTest {
                 )
             }
         }
+    }
+
+    @Test
+    fun checkinSubmissionIncludesOnlyVisibleModules() {
+        val visible = visibleCheckinInput(
+            enabledModules = setOf("training"),
+            answers = mapOf(
+                "weight" to mapOf("weight_kg" to JsonPrimitive("70")),
+                "training" to mapOf("trained" to JsonPrimitive("yes")),
+            ),
+            other = mapOf(
+                "gut" to mapOf("symptoms" to "隐藏说明"),
+                "training" to mapOf("training_types" to "力量"),
+            ),
+            skipped = setOf("sleep", "training"),
+        )
+
+        assertEquals(setOf("training"), visible.answers.keys)
+        assertEquals(setOf("training"), visible.other.keys)
+        assertEquals(setOf("training"), visible.skipped)
+        assertTrue(visible.hasContent)
+
+        val hiddenOnly = visibleCheckinInput(
+            enabledModules = setOf("sleep"),
+            answers = mapOf("weight" to mapOf("weight_kg" to JsonPrimitive("70"))),
+            other = mapOf("gut" to mapOf("symptoms" to "隐藏说明")),
+            skipped = setOf("training"),
+        )
+        assertFalse(hiddenOnly.hasContent)
+        assertTrue(hiddenOnly.answers.isEmpty())
+        assertTrue(hiddenOnly.other.isEmpty())
+        assertTrue(hiddenOnly.skipped.isEmpty())
+    }
+
+    @Test
+    fun invalidStateTransitionUsesNaturalChineseMessage() {
+        val before = buildJsonObject {
+            put("task", buildJsonObject { put("status", "completed") })
+        }
+        val after = buildJsonObject {
+            put("task", buildJsonObject { put("status", "pending") })
+        }
+
+        val error = runCatching {
+            validateStateChange(EntityKind.TASK, before, after)
+        }.exceptionOrNull()
+
+        assertTrue(error is IllegalArgumentException)
+        assertEquals("任务状态不允许从「completed」变为「pending」", error?.message)
+    }
+
+    @Test
+    fun completedTaskPayloadCannotBeOverwritten() {
+        val before = buildJsonObject {
+            put("task", buildJsonObject {
+                put("status", "completed")
+                put("result_version", 1)
+                put("result_json", buildJsonObject { put("summary", "原结果") })
+            })
+        }
+        val after = buildJsonObject {
+            put("task", buildJsonObject {
+                put("status", "completed")
+                put("result_version", 2)
+                put("result_json", buildJsonObject { put("summary", "被覆盖") })
+            })
+        }
+
+        val error = runCatching { validateStateChange(EntityKind.TASK, before, after) }.exceptionOrNull()
+
+        assertTrue(error is IllegalArgumentException)
+        assertEquals("已完成任务的结果不可直接覆盖", error?.message)
     }
 
     @Test
@@ -301,4 +1009,11 @@ class DomainContractTest {
         checkNotNull(javaClass.classLoader?.getResourceAsStream(name)).bufferedReader().use { it.readText() }
 
     private fun String.hexBytes() = chunked(2).map { it.toInt(16).toByte() }.toByteArray()
+
+    private fun responseBody(value: ByteArray, declaredLength: Long = value.size.toLong()) =
+        object : ResponseBody() {
+            override fun contentType(): MediaType? = null
+            override fun contentLength(): Long = declaredLength
+            override fun source(): BufferedSource = Buffer().write(value)
+        }
 }
