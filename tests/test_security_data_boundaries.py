@@ -512,15 +512,25 @@ class DataSecurityBoundaryTest(unittest.TestCase):
     def test_deep_revision_graph_validation_is_iterative(self) -> None:
         revisions = {
             f"rev_{index}": SimpleNamespace(
-                parent_revision_ids=() if index == 0 else (f"rev_{index - 1}",)
+                entity_id="same_entity",
+                entity_kind="task",
+                parent_revision_ids=() if index == 0 else (f"rev_{index - 1}",),
             )
             for index in range(10_000)
         }
         portable._validate_revision_graph(revisions)
 
         cycle = {
-            "rev_a": SimpleNamespace(parent_revision_ids=("rev_b",)),
-            "rev_b": SimpleNamespace(parent_revision_ids=("rev_a",)),
+            "rev_a": SimpleNamespace(
+                entity_id="same_entity",
+                entity_kind="task",
+                parent_revision_ids=("rev_b",),
+            ),
+            "rev_b": SimpleNamespace(
+                entity_id="same_entity",
+                entity_kind="task",
+                parent_revision_ids=("rev_a",),
+            ),
         }
         with self.assertRaisesRegex(ValidationError, "包含循环"):
             portable._validate_revision_graph(cycle)
