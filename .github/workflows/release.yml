@@ -23,18 +23,18 @@ jobs:
     env:
       WINDOWS_SIGNING_AVAILABLE: ${{ secrets.WINDOWS_CERTIFICATE_BASE64 != '' && secrets.WINDOWS_CERTIFICATE_PASSWORD != '' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Warn when Windows tagged release is unsigned
         if: startsWith(github.ref, 'refs/tags/v') && env.WINDOWS_SIGNING_AVAILABLE != 'true'
         shell: pwsh
         run: |
           Write-Output "::warning::Windows portable ZIP and installer will be published unsigned; Windows may show Unknown Publisher."
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.13"
-      - uses: astral-sh/setup-uv@v6
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
         with:
-          version: "0.8.22"
+          version: "0.11.16"
           enable-cache: true
       - run: uv sync --locked --extra desktop --no-dev
       - run: .\.venv\Scripts\pyinstaller.exe --noconfirm --clean packaging/mealcircuit.spec
@@ -42,7 +42,8 @@ jobs:
         shell: pwsh
         run: |
           $env:MEALCIRCUIT_HOME = Join-Path $env:RUNNER_TEMP "desktop-smoke"
-          & .\dist\MealCircuit\MealCircuit.exe --smoke-test
+          $process = Start-Process -FilePath ".\dist\MealCircuit\MealCircuit.exe" -ArgumentList "--smoke-test" -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "Packaged smoke test failed with exit code $($process.ExitCode)" }
       - name: Authenticode sign packaged executable when configured
         if: env.WINDOWS_SIGNING_AVAILABLE == 'true'
         shell: pwsh
@@ -56,11 +57,34 @@ jobs:
       - name: Build portable ZIP
         shell: pwsh
         run: Compress-Archive -Path .\dist\MealCircuit -DestinationPath ".\dist\MealCircuit-$env:VERSION-windows-x64-portable.zip"
+      - name: Smoke test portable ZIP
+        shell: pwsh
+        run: |
+          $portableRoot = Join-Path $env:RUNNER_TEMP "portable-smoke"
+          Expand-Archive -Path ".\dist\MealCircuit-$env:VERSION-windows-x64-portable.zip" -DestinationPath $portableRoot
+          $env:MEALCIRCUIT_HOME = Join-Path $env:RUNNER_TEMP "portable-home"
+          $process = Start-Process -FilePath "$portableRoot\MealCircuit\MealCircuit.exe" -ArgumentList "--smoke-test" -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "Portable ZIP smoke test failed with exit code $($process.ExitCode)" }
       - name: Build installer
         shell: pwsh
         run: |
-          choco install innosetup --no-progress -y
-          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" "/DMyAppVersion=$env:VERSION" "/DSourceDir=$pwd\dist\MealCircuit" "/DOutputDir=$pwd\dist" packaging\windows\MealCircuit.iss
+          $innoInstaller = Join-Path $env:RUNNER_TEMP "innosetup-6.7.3.exe"
+          $innoDir = Join-Path $env:RUNNER_TEMP "inno-6.7.3"
+          Invoke-WebRequest -Uri "https://github.com/jrsoftware/issrc/releases/download/is-6_7_3/innosetup-6.7.3.exe" -OutFile $innoInstaller
+          $innoHash = (Get-FileHash $innoInstaller -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($innoHash -ne "9c73c3bae7ed48d44112a0f48e66742c00090bdb5bef71d9d3c056c66e97b732") { throw "Inno Setup checksum mismatch" }
+          if ((Get-AuthenticodeSignature $innoInstaller).Status -ne "Valid") { throw "Inno Setup signature invalid" }
+          $innoInstall = Start-Process -FilePath $innoInstaller -ArgumentList "/CURRENTUSER", "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/NOICONS", "/DIR=$innoDir" -Wait -PassThru
+          if ($innoInstall.ExitCode -ne 0) { throw "Inno Setup bootstrap failed with exit code $($innoInstall.ExitCode)" }
+          try {
+            & "$innoDir\ISCC.exe" "/DMyAppVersion=$env:VERSION" "/DSourceDir=$pwd\dist\MealCircuit" "/DOutputDir=$pwd\dist" packaging\windows\MealCircuit.iss
+            if ($LASTEXITCODE -ne 0) { throw "Inno Setup compiler failed with exit code $LASTEXITCODE" }
+          } finally {
+            $innoUninstall = Start-Process -FilePath "$innoDir\unins000.exe" -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART" -Wait -PassThru
+            if ($innoUninstall.ExitCode -ne 0) { throw "Inno Setup cleanup failed with exit code $($innoUninstall.ExitCode)" }
+            for ($attempt = 0; $attempt -lt 40 -and (Test-Path $innoDir); $attempt++) { Start-Sleep -Milliseconds 250 }
+            if (Test-Path $innoDir) { throw "Inno Setup cleanup left its temporary installation behind: $innoDir" }
+          }
       - name: Authenticode sign installer when certificate secrets are available
         if: env.WINDOWS_SIGNING_AVAILABLE == 'true'
         shell: pwsh
@@ -72,9 +96,23 @@ jobs:
           & $signtool sign /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 /f "$env:RUNNER_TEMP\signing.pfx" /p $env:WINDOWS_CERTIFICATE_PASSWORD ".\dist\MealCircuit-$env:VERSION-windows-x64-setup.exe"
           if ((Get-AuthenticodeSignature ".\dist\MealCircuit\MealCircuit.exe").Status -ne "Valid") { throw "Executable signature invalid" }
           if ((Get-AuthenticodeSignature ".\dist\MealCircuit-$env:VERSION-windows-x64-setup.exe").Status -ne "Valid") { throw "Installer signature invalid" }
-      - uses: actions/upload-artifact@v4
+      - name: Smoke test installed application and uninstaller
+        shell: pwsh
+        run: |
+          $installDir = Join-Path $env:RUNNER_TEMP "installed-smoke"
+          $installer = Start-Process -FilePath ".\dist\MealCircuit-$env:VERSION-windows-x64-setup.exe" -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/NOICONS", "/DIR=$installDir" -Wait -PassThru
+          if ($installer.ExitCode -ne 0) { throw "Installer smoke test failed with exit code $($installer.ExitCode)" }
+          $env:MEALCIRCUIT_HOME = Join-Path $env:RUNNER_TEMP "installed-home"
+          $application = Start-Process -FilePath "$installDir\MealCircuit.exe" -ArgumentList "--smoke-test" -Wait -PassThru
+          if ($application.ExitCode -ne 0) { throw "Installed application smoke test failed with exit code $($application.ExitCode)" }
+          $uninstaller = Start-Process -FilePath "$installDir\unins000.exe" -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART" -Wait -PassThru
+          if ($uninstaller.ExitCode -ne 0) { throw "Uninstaller smoke test failed with exit code $($uninstaller.ExitCode)" }
+          for ($attempt = 0; $attempt -lt 40 -and (Test-Path $installDir); $attempt++) { Start-Sleep -Milliseconds 250 }
+          if (Test-Path $installDir) { throw "Uninstaller left the application directory behind: $installDir" }
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: desktop-windows
+          if-no-files-found: error
           path: |
             dist/MealCircuit-*-windows-x64-portable.zip
             dist/MealCircuit-*-windows-x64-setup.exe

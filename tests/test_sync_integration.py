@@ -2,12 +2,18 @@ from __future__ import annotations
 
 import io
 import base64
+import hashlib
 import json
 import os
 import tempfile
+import threading
 import unittest
 from datetime import date, timedelta
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from types import SimpleNamespace
+from urllib.error import HTTPError
+from unittest.mock import patch
 
 try:
     from fastapi.testclient import TestClient
@@ -18,12 +24,15 @@ except ImportError:
     TestClient = None
 
 from mealcircuit import personalization, service
+from mealcircuit import secret_store as secret_store_module
+from mealcircuit import sync as sync_module
 from mealcircuit.configuration import initialize_private_home, load_resolved_settings
 from mealcircuit.crypto import encrypt
-from mealcircuit.db import init_db
+from mealcircuit.db import connect, init_db
 from mealcircuit.domain import make_revision
-from mealcircuit.secret_store import get_secret, set_secret
+from mealcircuit.secret_store import delete_secret, get_secret, set_secret
 from mealcircuit.storage import resolve_data_path
+from mealcircuit.validation import ValidationError
 from mealcircuit.sync import (
     AccountCipher,
     configure_sync,
@@ -249,6 +258,1083 @@ class ReversePullOrder(TransportFault):
     def pull(self, cursor: int, limit: int = 500, snapshot_offset: int = 0) -> dict:
         response = self.inner.pull(cursor, limit=limit, snapshot_offset=snapshot_offset)
         return {**response, "changes": list(reversed(response.get("changes", [])))}
+
+
+class MemorySyncSecretStore:
+    def __init__(self) -> None:
+        self.values: dict[str, bytes | str] = {}
+        self.fail_next_write = False
+        self.fail_deletes: set[str] = set()
+
+    def set(self, name: str, value: bytes | str) -> str:
+        if self.fail_next_write:
+            self.fail_next_write = False
+            raise secret_store_module.SecretStorageError(
+                "synthetic Windows Credential Manager failure"
+            )
+        self.values[name] = value
+        return "system"
+
+    def get(self, name: str, *, binary: bool = False):
+        value = self.values.get(name)
+        if binary:
+            return value if isinstance(value, bytes) else None
+        return value if isinstance(value, str) else None
+
+    def delete(self, name: str) -> bool:
+        if name in self.fail_deletes:
+            return False
+        self.values.pop(name, None)
+        return True
+
+
+class FakeHttpResponse:
+    def __init__(self, payload: bytes, *, content_length: int | str | None = None) -> None:
+        self.headers: dict[str, str] = {}
+        if content_length is not None:
+            self.headers["Content-Length"] = str(content_length)
+        self.stream = io.BytesIO(payload)
+        self.read_sizes: list[int] = []
+
+    def read(self, size: int = -1) -> bytes:
+        self.read_sizes.append(size)
+        return self.stream.read(size)
+
+    def close(self) -> None:
+        self.stream.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        self.close()
+
+
+class WindowsSecurityBoundaryTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.old_home = os.environ.get("MEALCIRCUIT_HOME")
+        self.old_db = os.environ.get("MEALCIRCUIT_DB")
+        with secret_store_module._LOCK:
+            secret_store_module._SESSION.clear()
+
+    def tearDown(self) -> None:
+        with secret_store_module._LOCK:
+            secret_store_module._SESSION.clear()
+        if self.old_home is None:
+            os.environ.pop("MEALCIRCUIT_HOME", None)
+        else:
+            os.environ["MEALCIRCUIT_HOME"] = self.old_home
+        if self.old_db is None:
+            os.environ.pop("MEALCIRCUIT_DB", None)
+        else:
+            os.environ["MEALCIRCUIT_DB"] = self.old_db
+        self.temp.cleanup()
+
+    def configure_test_home(self, name: str) -> None:
+        os.environ["MEALCIRCUIT_HOME"] = str(self.root / name)
+        os.environ.pop("MEALCIRCUIT_DB", None)
+        initialize_private_home()
+        init_db()
+
+    def secret_patches(self, store: MemorySyncSecretStore):
+        return patch.multiple(
+            sync_module,
+            set_secret=store.set,
+            get_secret=store.get,
+            delete_secret=store.delete,
+        )
+
+    @staticmethod
+    def seed_legacy_credentials(store: MemorySyncSecretStore) -> None:
+        store.values.update(
+            {
+                "sync.account_data_key": b"o" * 32,
+                "sync.access_token": "old-access",
+                "sync.refresh_token": "old-refresh",
+            }
+        )
+
+    def test_sync_http_rejects_redirect_without_forwarding_authorization(self) -> None:
+        requests: list[tuple[str, str | None]] = []
+
+        class RedirectHandler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                requests.append((self.path, self.headers.get("Authorization")))
+                if self.path == "/start":
+                    self.send_response(302)
+                    self.send_header(
+                        "Location",
+                        f"http://127.0.0.1:{self.server.server_address[1]}/target",
+                    )
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                payload = b'{"followed":true}'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, format: str, *args) -> None:
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), RedirectHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with self.assertRaises(sync_module.SyncHttpError) as raised:
+                sync_module._http_json(
+                    f"http://127.0.0.1:{server.server_address[1]}/start",
+                    token="sensitive-token",
+                )
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+        self.assertEqual(302, raised.exception.status)
+        self.assertEqual([("/start", "Bearer sensitive-token")], requests)
+
+    def test_sync_http_json_prechecks_declared_response_size(self) -> None:
+        response = FakeHttpResponse(b"{}", content_length=9)
+        with (
+            patch.object(sync_module, "MAX_SYNC_JSON_RESPONSE_BYTES", 8),
+            patch.object(sync_module, "urlopen", return_value=response),
+            self.assertRaisesRegex(ValidationError, "响应超过大小限制"),
+        ):
+            sync_module._http_json("https://sync.example.test/v1/capabilities")
+        self.assertEqual([], response.read_sizes)
+
+    def test_sync_http_binary_stream_read_is_bounded(self) -> None:
+        response = FakeHttpResponse(b"123456789")
+        with (
+            patch.object(sync_module, "MAX_SYNC_BINARY_RESPONSE_BYTES", 8),
+            patch.object(sync_module, "urlopen", return_value=response),
+            self.assertRaisesRegex(ValidationError, "响应超过大小限制"),
+        ):
+            sync_module._http_bytes("https://sync.example.test/v1/blob")
+        self.assertEqual([9], response.read_sizes)
+
+    def test_sync_http_error_body_stream_read_is_bounded(self) -> None:
+        response = FakeHttpResponse(b'{"x":123}')
+        error = HTTPError(
+            "https://sync.example.test/v1/failure",
+            400,
+            "Bad Request",
+            response.headers,
+            response,
+        )
+        with (
+            patch.object(sync_module, "MAX_SYNC_ERROR_RESPONSE_BYTES", 8),
+            patch.object(sync_module, "urlopen", side_effect=error),
+            self.assertRaisesRegex(ValidationError, "响应超过大小限制"),
+        ):
+            sync_module._http_json("https://sync.example.test/v1/failure")
+        self.assertEqual([9], response.read_sizes)
+
+    def test_sync_http_limits_preserve_valid_json_and_binary_responses(self) -> None:
+        json_response = FakeHttpResponse(b'{"ok":true}', content_length=11)
+        binary_response = FakeHttpResponse(b"ciphertext", content_length=10)
+        with patch.object(
+            sync_module,
+            "urlopen",
+            side_effect=[json_response, binary_response],
+        ):
+            self.assertEqual(
+                {"ok": True},
+                sync_module._http_json("https://sync.example.test/v1/status"),
+            )
+            self.assertEqual(
+                b"ciphertext",
+                sync_module._http_bytes("https://sync.example.test/v1/blob"),
+            )
+        self.assertNotIn(-1, json_response.read_sizes)
+        self.assertNotIn(-1, binary_response.read_sizes)
+
+    def test_staged_credential_slot_is_registered_for_crash_cleanup(self) -> None:
+        self.configure_test_home("credential-orphan-home")
+        store = MemorySyncSecretStore()
+        with self.secret_patches(store):
+            slot, backend = sync_module._stage_sync_credentials(
+                b"k" * 32,
+                "access",
+                "refresh",
+            )
+            self.assertEqual("system", backend)
+            with connect() as connection:
+                self.assertEqual(
+                    [slot],
+                    sync_module._obsolete_credential_slots(connection),
+                )
+            secret_name = f"{sync_module._SYNC_CREDENTIAL_PREFIX}{slot}"
+            self.assertIn(secret_name, store.values)
+            self.assertEqual([], sync_module._cleanup_obsolete_credential_slots())
+            self.assertNotIn(secret_name, store.values)
+
+    def test_rotation_finalization_requeues_heads_created_during_network_window(self) -> None:
+        self.configure_test_home("rotation-network-window-home")
+        store = MemorySyncSecretStore()
+        with self.secret_patches(store):
+            configure_sync(
+                server_url="https://sync.example.test",
+                account_id="account",
+                device_name="desktop",
+                account_data_key=b"o" * 32,
+                access_token="access",
+                refresh_token="refresh",
+            )
+            service.create_material_task("before rotation inventory")
+            with connect() as connection:
+                connection.execute("DELETE FROM sync_outbox")
+            inventory, _ = sync_module._rotation_inventory()
+
+            created_during_network = service.create_material_task("created during rotation network wait")
+            with connect() as connection:
+                created_head = connection.execute(
+                    "SELECT revision_id FROM entity_heads WHERE entity_id=?",
+                    (created_during_network["id"],),
+                ).fetchone()[0]
+            self.assertNotIn(created_head, {item.revision_id for item in inventory})
+
+            sync_module._finalize_local_rotation(
+                2,
+                {"account_data_key": b"n" * 32},
+                {},
+            )
+
+            with connect() as connection:
+                heads = {
+                    row["entity_id"]: row["revision_id"]
+                    for row in connection.execute(
+                        "SELECT entity_id,revision_id FROM entity_heads"
+                    )
+                }
+                queued = {
+                    row["entity_id"]: row["revision_id"]
+                    for row in connection.execute(
+                        "SELECT entity_id,revision_id FROM sync_outbox WHERE state='pending'"
+                    )
+                }
+                queued_epochs = {
+                    row[0]
+                    for row in connection.execute(
+                        "SELECT DISTINCT key_version FROM sync_outbox WHERE state='pending'"
+                    )
+                }
+                encrypted_count = connection.execute(
+                    "SELECT COUNT(*) FROM sync_outbox WHERE encrypted_envelope IS NOT NULL"
+                ).fetchone()[0]
+            self.assertEqual(heads, queued)
+            self.assertEqual(created_head, queued[created_during_network["id"]])
+            self.assertEqual({2}, queued_epochs)
+            self.assertEqual(0, encrypted_count)
+
+    def test_sync_rejects_managed_asset_paths_outside_private_home(self) -> None:
+        self.configure_test_home("asset-read-boundary-home")
+        payload = b"private file outside app home"
+        outside = self.root / "outside-private.bin"
+        outside.write_bytes(payload)
+        digest = hashlib.sha256(payload).hexdigest()
+        with connect() as connection:
+            connection.execute(
+                """INSERT INTO managed_assets(
+                       id,sha256,media_type,extension,byte_count,relative_path,unresolved,created_at
+                   ) VALUES(?,?,?,?,?,?,0,?)""",
+                (
+                    "asset_outside_home",
+                    digest,
+                    "application/octet-stream",
+                    ".bin",
+                    len(payload),
+                    str(outside),
+                    "2026-07-31T00:00:00Z",
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM managed_assets WHERE id='asset_outside_home'"
+            ).fetchone()
+
+        class RejectingTransport:
+            def create_blob(self, *args, **kwargs):
+                raise AssertionError("unsafe asset path reached network transport")
+
+        cipher = AccountCipher("account", b"k" * 32)
+        uploaded, errors = sync_module._sync_upload_assets(RejectingTransport(), cipher)
+        self.assertEqual(0, uploaded)
+        self.assertTrue(errors)
+        with self.assertRaisesRegex(ValidationError, "受管目录"):
+            sync_module._upload_rotation_assets(RejectingTransport(), cipher, [row])
+
+    def test_sync_credentials_activate_as_one_copy_on_write_slot(self) -> None:
+        self.configure_test_home("activate-home")
+        store = MemorySyncSecretStore()
+        self.seed_legacy_credentials(store)
+        with self.secret_patches(store):
+            result = configure_sync(
+                server_url="https://sync.example.test",
+                account_id="new-account",
+                device_name="windows-desktop",
+                account_data_key=b"n" * 32,
+                access_token="new-access",
+                refresh_token="new-refresh",
+            )
+            with connect() as connection:
+                slot = connection.execute(
+                    "SELECT value FROM app_metadata WHERE key=?",
+                    (sync_module._SYNC_ACTIVE_CREDENTIAL_SLOT,),
+                ).fetchone()[0]
+                self.assertEqual([], sync_module._obsolete_credential_slots(connection))
+            self.assertEqual("system", result["key_backend"])
+            self.assertEqual(
+                {
+                    "account_data_key": b"n" * 32,
+                    "access_token": "new-access",
+                    "refresh_token": "new-refresh",
+                },
+                sync_module._current_sync_credentials(),
+            )
+        self.assertIn(f"{sync_module._SYNC_CREDENTIAL_PREFIX}{slot}", store.values)
+        self.assertFalse(any(name in store.values for name in sync_module._SYNC_LEGACY_CREDENTIALS))
+
+    def test_configure_write_failure_preserves_legacy_account_and_database(self) -> None:
+        self.configure_test_home("write-failure-home")
+        store = MemorySyncSecretStore()
+        self.seed_legacy_credentials(store)
+        with connect() as connection:
+            connection.execute(
+                """UPDATE sync_configuration SET enabled=1,server_url=?,account_id=?,device_name=?
+                   WHERE singleton=1""",
+                ("https://old.example.test", "old-account", "old-device"),
+            )
+        store.fail_next_write = True
+        with (
+            self.secret_patches(store),
+            self.assertRaises(secret_store_module.SecretStorageError),
+        ):
+            configure_sync(
+                server_url="https://new.example.test",
+                account_id="new-account",
+                device_name="new-device",
+                account_data_key=b"n" * 32,
+                access_token="new-access",
+                refresh_token="new-refresh",
+            )
+        with self.secret_patches(store):
+            self.assertEqual("old-account", sync_status()["account_id"])
+            self.assertEqual(b"o" * 32, sync_module._get_sync_secret("sync.account_data_key", binary=True))
+            self.assertEqual("old-access", sync_module._get_sync_secret("sync.access_token"))
+        self.assertFalse(any(name.startswith(sync_module._SYNC_CREDENTIAL_PREFIX) for name in store.values))
+
+    def test_configure_database_failure_discards_unactivated_slot(self) -> None:
+        self.configure_test_home("database-failure-home")
+        store = MemorySyncSecretStore()
+        with self.secret_patches(store):
+            configure_sync(
+                server_url="https://old.example.test",
+                account_id="old-account",
+                device_name="old-device",
+                account_data_key=b"o" * 32,
+                access_token="old-access",
+                refresh_token="old-refresh",
+            )
+            with connect() as connection:
+                old_slot = sync_module._active_credential_slot(connection)
+        with (
+            self.secret_patches(store),
+            patch.object(sync_module, "_activate_credential_slot", side_effect=RuntimeError("activation failed")),
+            self.assertRaisesRegex(RuntimeError, "activation failed"),
+        ):
+            configure_sync(
+                server_url="https://new.example.test",
+                account_id="new-account",
+                device_name="new-device",
+                account_data_key=b"n" * 32,
+                access_token="new-access",
+                refresh_token="new-refresh",
+            )
+        with connect() as connection:
+            account_id = connection.execute(
+                "SELECT account_id FROM sync_configuration WHERE singleton=1"
+            ).fetchone()[0]
+            pointer = connection.execute(
+                "SELECT value FROM app_metadata WHERE key=?",
+                (sync_module._SYNC_ACTIVE_CREDENTIAL_SLOT,),
+            ).fetchone()
+        self.assertEqual("old-account", account_id)
+        self.assertEqual(old_slot, pointer[0])
+        with self.secret_patches(store):
+            self.assertEqual(
+                {
+                    "account_data_key": b"o" * 32,
+                    "access_token": "old-access",
+                    "refresh_token": "old-refresh",
+                },
+                sync_module._current_sync_credentials(),
+            )
+        self.assertEqual(
+            [f"{sync_module._SYNC_CREDENTIAL_PREFIX}{old_slot}"],
+            [name for name in store.values if name.startswith(sync_module._SYNC_CREDENTIAL_PREFIX)],
+        )
+
+    def test_failed_old_slot_cleanup_is_recorded_and_retried(self) -> None:
+        self.configure_test_home("cleanup-retry-home")
+        store = MemorySyncSecretStore()
+        with self.secret_patches(store):
+            configure_sync(
+                server_url="https://old.example.test",
+                account_id="old-account",
+                device_name="old-device",
+                account_data_key=b"o" * 32,
+                access_token="old-access",
+                refresh_token="old-refresh",
+            )
+            with connect() as connection:
+                old_slot = sync_module._active_credential_slot(connection)
+            old_name = f"{sync_module._SYNC_CREDENTIAL_PREFIX}{old_slot}"
+            store.fail_deletes.add(old_name)
+            configure_sync(
+                server_url="https://new.example.test",
+                account_id="new-account",
+                device_name="new-device",
+                account_data_key=b"n" * 32,
+                access_token="new-access",
+                refresh_token="new-refresh",
+            )
+            with connect() as connection:
+                self.assertEqual(
+                    [old_slot],
+                    sync_module._obsolete_credential_slots(connection),
+                )
+            self.assertIn(old_name, store.values)
+            store.fail_deletes.clear()
+            self.assertEqual([], sync_module._cleanup_obsolete_credential_slots())
+            with connect() as connection:
+                self.assertEqual([], sync_module._obsolete_credential_slots(connection))
+            self.assertNotIn(old_name, store.values)
+
+    def test_token_refresh_write_failure_keeps_whole_previous_bundle(self) -> None:
+        self.configure_test_home("refresh-failure-home")
+        store = MemorySyncSecretStore()
+        with self.secret_patches(store):
+            configure_sync(
+                server_url="https://sync.example.test",
+                account_id="account",
+                device_name="desktop",
+                account_data_key=b"k" * 32,
+                access_token="old-access",
+                refresh_token="old-refresh",
+            )
+            with connect() as connection:
+                before_slot = sync_module._active_credential_slot(connection)
+            store.fail_next_write = True
+            with (
+                patch.object(
+                    sync_module,
+                    "_http_json",
+                    return_value={
+                        "access_token": "new-access",
+                        "refresh_token": "new-refresh",
+                    },
+                ),
+                self.assertRaises(secret_store_module.SecretStorageError),
+            ):
+                sync_module.HttpSyncTransport("https://sync.example.test")._refresh()
+            with connect() as connection:
+                after_slot = sync_module._active_credential_slot(connection)
+            self.assertEqual(before_slot, after_slot)
+            self.assertEqual(
+                {
+                    "account_data_key": b"k" * 32,
+                    "access_token": "old-access",
+                    "refresh_token": "old-refresh",
+                },
+                sync_module._current_sync_credentials(),
+            )
+
+    def test_token_refresh_replaces_tokens_without_changing_data_key(self) -> None:
+        self.configure_test_home("refresh-success-home")
+        store = MemorySyncSecretStore()
+        with self.secret_patches(store):
+            configure_sync(
+                server_url="https://sync.example.test",
+                account_id="account",
+                device_name="desktop",
+                account_data_key=b"k" * 32,
+                access_token="old-access",
+                refresh_token="old-refresh",
+            )
+            with connect() as connection:
+                before_slot = sync_module._active_credential_slot(connection)
+            with patch.object(
+                sync_module,
+                "_http_json",
+                return_value={
+                    "access_token": "new-access",
+                    "refresh_token": "new-refresh",
+                },
+            ):
+                self.assertEqual(
+                    "new-access",
+                    sync_module.HttpSyncTransport("https://sync.example.test")._refresh(),
+                )
+            with connect() as connection:
+                after_slot = sync_module._active_credential_slot(connection)
+            self.assertNotEqual(before_slot, after_slot)
+            self.assertEqual(
+                {
+                    "account_data_key": b"k" * 32,
+                    "access_token": "new-access",
+                    "refresh_token": "new-refresh",
+                },
+                sync_module._current_sync_credentials(),
+            )
+
+    def test_token_refresh_does_not_cross_an_account_change_during_network_wait(self) -> None:
+        self.configure_test_home("refresh-race-home")
+        store = MemorySyncSecretStore()
+        with self.secret_patches(store):
+            configure_sync(
+                server_url="https://sync.example.test",
+                account_id="old-account",
+                device_name="desktop",
+                account_data_key=b"o" * 32,
+                access_token="old-access",
+                refresh_token="old-refresh",
+            )
+
+            def switch_account_during_refresh(*args, **kwargs):
+                configure_sync(
+                    server_url="https://sync.example.test",
+                    account_id="new-account",
+                    device_name="desktop",
+                    account_data_key=b"n" * 32,
+                    access_token="current-access",
+                    refresh_token="current-refresh",
+                )
+                return {
+                    "access_token": "stale-response-access",
+                    "refresh_token": "stale-response-refresh",
+                }
+
+            with (
+                patch.object(sync_module, "_http_json", side_effect=switch_account_during_refresh),
+                self.assertRaisesRegex(ValidationError, "令牌刷新期间同步账户已改变"),
+            ):
+                sync_module.HttpSyncTransport("https://sync.example.test")._refresh()
+
+            self.assertEqual("new-account", sync_status()["account_id"])
+            self.assertEqual(
+                {
+                    "account_data_key": b"n" * 32,
+                    "access_token": "current-access",
+                    "refresh_token": "current-refresh",
+                },
+                sync_module._current_sync_credentials(),
+            )
+
+    def test_unlink_removes_active_slot_and_legacy_credentials(self) -> None:
+        self.configure_test_home("unlink-home")
+        store = MemorySyncSecretStore()
+        with self.secret_patches(store):
+            configure_sync(
+                server_url="https://sync.example.test",
+                account_id="account",
+                device_name="desktop",
+                account_data_key=b"k" * 32,
+                access_token="access",
+                refresh_token="refresh",
+            )
+            store.values["sync.account_data_key"] = b"legacy" * 4
+            store.values["sync.access_token"] = "legacy-access"
+            store.values["sync.refresh_token"] = "legacy-refresh"
+            result = sync_module.unlink_sync()
+            self.assertFalse(result["enabled"])
+            with connect() as connection:
+                self.assertIsNone(sync_module._active_credential_slot(connection))
+                self.assertEqual([], sync_module._obsolete_credential_slots(connection))
+                self.assertEqual(
+                    0,
+                    connection.execute(
+                        "SELECT enabled FROM sync_configuration WHERE singleton=1"
+                    ).fetchone()[0],
+                )
+        self.assertFalse(any(name.startswith("sync.") for name in store.values))
+
+    def test_asset_download_locks_only_local_file_and_database_activation(self) -> None:
+        self.configure_test_home("asset-lock-home")
+        plaintext = b"downloaded asset"
+        digest = hashlib.sha256(plaintext).hexdigest()
+        with connect() as connection:
+            connection.execute(
+                """INSERT INTO managed_assets(
+                       id,sha256,media_type,extension,byte_count,relative_path,unresolved,created_at
+                   ) VALUES(?,?,?,?,?,NULL,1,?)""",
+                (
+                    "asset_lock_test",
+                    digest,
+                    "application/octet-stream",
+                    ".bin",
+                    len(plaintext),
+                    "2026-07-31T00:00:00Z",
+                ),
+            )
+
+        lock_active = False
+
+        class TrackingLock:
+            def __enter__(self):
+                nonlocal lock_active
+                self_outer.assertFalse(lock_active)
+                lock_active = True
+
+            def __exit__(self, exc_type, exc, traceback):
+                nonlocal lock_active
+                self_outer.assertTrue(lock_active)
+                lock_active = False
+
+        class Cipher:
+            key_version = 1
+
+            @staticmethod
+            def blob_id(asset_id: str) -> str:
+                return f"blob-{asset_id}"
+
+            @staticmethod
+            def open_blob_chunk(blob_id: str, index: int, count: int, value: bytes) -> bytes:
+                return value
+
+        class Transport:
+            @staticmethod
+            def download_blob_chunk(blob_id: str, index: int):
+                self_outer.assertFalse(lock_active, "network wait must stay outside the data lock")
+                return plaintext
+
+        self_outer = self
+        real_replace = os.replace
+
+        def checked_replace(source, target) -> None:
+            self.assertTrue(lock_active)
+            real_replace(source, target)
+
+        def checked_restore(connection, asset_id: str, relative_path: str) -> None:
+            self.assertTrue(lock_active)
+
+        with (
+            patch.object(sync_module, "process_data_lock", side_effect=lambda: TrackingLock()),
+            patch.object(sync_module.os, "replace", side_effect=checked_replace),
+            patch.object(sync_module, "_restore_asset_references", side_effect=checked_restore),
+        ):
+            downloaded, errors = sync_module._sync_download_assets(Transport(), Cipher())
+
+        self.assertEqual(1, downloaded)
+        self.assertEqual([], errors)
+        self.assertFalse(lock_active)
+        with connect() as connection:
+            row = connection.execute(
+                "SELECT relative_path,unresolved FROM managed_assets WHERE id='asset_lock_test'"
+            ).fetchone()
+        self.assertEqual(f"assets/{digest}.bin", row["relative_path"])
+        self.assertEqual(0, row["unresolved"])
+
+    def test_preference_conflict_commits_database_and_mirror_under_one_lock(self) -> None:
+        self.configure_test_home("conflict-lock-home")
+        with connect() as connection:
+            device_id = connection.execute(
+                "SELECT value FROM app_metadata WHERE key='device_id'"
+            ).fetchone()[0]
+            local = make_revision(
+                "preferences",
+                {"kind": "settings", "content": "{\"source\":\"local\"}"},
+                entity_id="preferences_conflict_test",
+                author_device_id=device_id,
+            )
+            remote = make_revision(
+                "preferences",
+                {"kind": "settings", "content": "{\"source\":\"remote\"}"},
+                entity_id="preferences_conflict_test",
+                author_device_id=device_id,
+            )
+            conflict_id = sync_module._record_conflict(
+                connection,
+                base=None,
+                local=local,
+                remote=remote,
+                paths=["content"],
+            )
+
+        lock_active = False
+        mirror_observed = False
+        self_outer = self
+
+        class TrackingLock:
+            def __enter__(self):
+                nonlocal lock_active
+                self_outer.assertFalse(lock_active)
+                lock_active = True
+
+            def __exit__(self, exc_type, exc, traceback):
+                nonlocal lock_active
+                self_outer.assertTrue(lock_active)
+                lock_active = False
+
+        def checked_write_preferences(revisions) -> None:
+            nonlocal mirror_observed
+            self.assertTrue(lock_active)
+            self.assertEqual(1, len(revisions))
+            with connect() as connection:
+                status = connection.execute(
+                    "SELECT status FROM sync_conflicts WHERE id=?",
+                    (conflict_id,),
+                ).fetchone()[0]
+            self.assertEqual("resolved", status)
+            mirror_observed = True
+
+        with (
+            patch.object(sync_module, "process_data_lock", side_effect=lambda: TrackingLock()),
+            patch("mealcircuit.portable._write_preferences", side_effect=checked_write_preferences),
+        ):
+            result = sync_module.resolve_conflict(conflict_id, "local")
+
+        self.assertEqual("resolved", result["status"])
+        self.assertTrue(mirror_observed)
+        self.assertFalse(lock_active)
+
+    def test_sync_pull_keeps_network_outside_and_page_commit_inside_data_lock(self) -> None:
+        self.configure_test_home("pull-lock-home")
+        with connect() as connection:
+            connection.execute(
+                """UPDATE sync_configuration SET enabled=1,server_url=?,account_id=?,device_name=?
+                   WHERE singleton=1""",
+                ("https://sync.example.test", "account", "desktop"),
+            )
+
+        lock_active = False
+        mirror_observed = False
+        self_outer = self
+
+        class TrackingLock:
+            def __enter__(self):
+                nonlocal lock_active
+                self_outer.assertFalse(lock_active)
+                lock_active = True
+
+            def __exit__(self, exc_type, exc, traceback):
+                nonlocal lock_active
+                self_outer.assertTrue(lock_active)
+                lock_active = False
+
+        class Transport:
+            @staticmethod
+            def capabilities() -> dict:
+                self_outer.assertFalse(lock_active)
+                return {
+                    "protocol": "mealcircuit.sync",
+                    "min_version": 1,
+                    "max_version": 1,
+                    "max_batch": 100,
+                    "max_pull": 500,
+                    "e2ee_required": True,
+                }
+
+            @staticmethod
+            def pull(cursor: int, limit: int = 500, snapshot_offset: int = 0) -> dict:
+                self_outer.assertFalse(lock_active, "network pull must stay outside the data lock")
+                return {"cursor": 5, "has_more": False, "changes": []}
+
+            @staticmethod
+            def ack(cursor: int) -> None:
+                self_outer.assertFalse(lock_active)
+                self_outer.assertEqual(5, cursor)
+
+        def checked_process_pull(connection, cipher, pulled):
+            self.assertTrue(lock_active)
+            return (
+                {"applied": 1, "merged": 0, "conflicts": 0, "unknown": 0},
+                [object()],
+                [],
+            )
+
+        def checked_write_preferences(revisions) -> None:
+            nonlocal mirror_observed
+            self.assertTrue(lock_active)
+            self.assertEqual(1, len(revisions))
+            with connect() as connection:
+                cursor = connection.execute(
+                    "SELECT cursor_value FROM sync_cursor WHERE scope='account'"
+                ).fetchone()[0]
+            self.assertEqual(5, cursor)
+            mirror_observed = True
+
+        with (
+            patch.object(sync_module, "process_data_lock", side_effect=lambda: TrackingLock()),
+            patch.object(sync_module, "_get_sync_secret", return_value=b"k" * 32),
+            patch.object(sync_module, "prepare_outbox", return_value=[]),
+            patch.object(sync_module, "_process_pull", side_effect=checked_process_pull),
+            patch.object(sync_module, "_queue_remote_daily_source_updates", return_value=[]),
+            patch.object(sync_module, "_sync_upload_assets", return_value=(0, [])),
+            patch.object(sync_module, "_sync_download_assets", return_value=(0, [])),
+            patch("mealcircuit.portable._write_preferences", side_effect=checked_write_preferences),
+        ):
+            result = sync_now(Transport())
+
+        self.assertEqual(5, result["cursor"])
+        self.assertEqual(1, result["applied"])
+        self.assertTrue(mirror_observed)
+        self.assertFalse(lock_active)
+
+    def test_persistent_write_failure_does_not_mask_stale_system_secret(self) -> None:
+        class FakeKeyringError(Exception):
+            pass
+
+        class FailingKeyring:
+            def __init__(self) -> None:
+                self.values = {"credential": "stale-system-value"}
+
+            def get_keyring(self):
+                return SimpleNamespace(priority=1)
+
+            def get_password(self, service: str, name: str):
+                return self.values.get(name)
+
+            def set_password(self, service: str, name: str, value: str) -> None:
+                raise FakeKeyringError("credential manager unavailable")
+
+            def delete_password(self, service: str, name: str) -> None:
+                raise FakeKeyringError("credential manager unavailable")
+
+        backend = FailingKeyring()
+        with patch.object(
+            secret_store_module,
+            "_keyring",
+            return_value=(backend, FakeKeyringError),
+        ):
+            with self.assertRaisesRegex(
+                secret_store_module.SecretStorageError,
+                "Windows 凭据存储写入失败",
+            ):
+                set_secret("credential", "fresh-session-value")
+            self.assertEqual("stale-system-value", get_secret("credential"))
+            self.assertFalse(delete_secret("credential"))
+            self.assertIsNone(get_secret("credential"))
+
+    def test_key_rotation_does_not_commit_when_credential_write_fails(self) -> None:
+        self.configure_test_home("rotation-home")
+        store = MemorySyncSecretStore()
+        with self.secret_patches(store):
+            configure_sync(
+                server_url="https://sync.example.test",
+                account_id="account",
+                device_name="desktop",
+                account_data_key=b"o" * 32,
+                access_token="access",
+                refresh_token="refresh",
+            )
+            with connect() as connection:
+                before = connection.execute(
+                    "SELECT key_version FROM sync_configuration WHERE singleton=1"
+                ).fetchone()[0]
+                before_slot = sync_module._active_credential_slot(connection)
+            store.fail_next_write = True
+            with self.assertRaises(secret_store_module.SecretStorageError):
+                sync_module._finalize_local_rotation(
+                    int(before) + 1,
+                    {"account_data_key": b"n" * 32},
+                    {},
+                )
+            with connect() as connection:
+                after = connection.execute(
+                    "SELECT key_version FROM sync_configuration WHERE singleton=1"
+                ).fetchone()[0]
+                after_slot = sync_module._active_credential_slot(connection)
+            self.assertEqual(before, after)
+            self.assertEqual(before_slot, after_slot)
+            self.assertEqual(b"o" * 32, sync_module._get_sync_secret("sync.account_data_key", binary=True))
+
+    def test_key_rotation_activates_key_and_database_epoch_together(self) -> None:
+        self.configure_test_home("rotation-success-home")
+        store = MemorySyncSecretStore()
+        with self.secret_patches(store):
+            configure_sync(
+                server_url="https://sync.example.test",
+                account_id="account",
+                device_name="desktop",
+                account_data_key=b"o" * 32,
+                access_token="access",
+                refresh_token="refresh",
+            )
+            with connect() as connection:
+                before_slot = sync_module._active_credential_slot(connection)
+            sync_module._finalize_local_rotation(
+                2,
+                {"account_data_key": b"n" * 32},
+                {},
+            )
+            with connect() as connection:
+                self.assertEqual(
+                    2,
+                    connection.execute(
+                        "SELECT key_version FROM sync_configuration WHERE singleton=1"
+                    ).fetchone()[0],
+                )
+                after_slot = sync_module._active_credential_slot(connection)
+            self.assertNotEqual(before_slot, after_slot)
+            self.assertEqual(
+                {
+                    "account_data_key": b"n" * 32,
+                    "access_token": "access",
+                    "refresh_token": "refresh",
+                },
+                sync_module._current_sync_credentials(),
+            )
+
+    def test_key_rotation_finalize_rejects_stale_account_generation(self) -> None:
+        self.configure_test_home("rotation-race-home")
+        store = MemorySyncSecretStore()
+        with self.secret_patches(store):
+            configure_sync(
+                server_url="https://sync.example.test",
+                account_id="old-account",
+                device_name="desktop",
+                account_data_key=b"o" * 32,
+                access_token="old-access",
+                refresh_token="old-refresh",
+            )
+            with connect() as connection:
+                old_slot = sync_module._active_credential_slot(connection)
+            configure_sync(
+                server_url="https://sync.example.test",
+                account_id="new-account",
+                device_name="desktop",
+                account_data_key=b"c" * 32,
+                access_token="current-access",
+                refresh_token="current-refresh",
+            )
+            with self.assertRaisesRegex(ValidationError, "密钥轮换期间同步账户已改变"):
+                sync_module._finalize_local_rotation(
+                    2,
+                    {"account_data_key": b"r" * 32},
+                    {},
+                    expected_account_id="old-account",
+                    expected_key_version=1,
+                    expected_slot=old_slot,
+                )
+            self.assertEqual("new-account", sync_status()["account_id"])
+            self.assertEqual(1, sync_status()["key_version"])
+            self.assertEqual(
+                {
+                    "account_data_key": b"c" * 32,
+                    "access_token": "current-access",
+                    "refresh_token": "current-refresh",
+                },
+                sync_module._current_sync_credentials(),
+            )
+
+    def test_working_system_secret_backend_preserves_normal_round_trip(self) -> None:
+        class FakeKeyringError(Exception):
+            pass
+
+        class MemoryKeyring:
+            def __init__(self) -> None:
+                self.values: dict[str, str] = {}
+
+            def get_keyring(self):
+                return SimpleNamespace(priority=1)
+
+            def get_password(self, service: str, name: str):
+                return self.values.get(name)
+
+            def set_password(self, service: str, name: str, value: str) -> None:
+                self.values[name] = value
+
+            def delete_password(self, service: str, name: str) -> None:
+                self.values.pop(name)
+
+        backend = MemoryKeyring()
+        with patch.object(
+            secret_store_module,
+            "_keyring",
+            return_value=(backend, FakeKeyringError),
+        ):
+            self.assertEqual("system", set_secret("credential", "system-value"))
+            self.assertEqual("system-value", get_secret("credential"))
+            self.assertTrue(delete_secret("credential"))
+            self.assertIsNone(get_secret("credential"))
+
+    @unittest.skipIf(TestClient is None, "install sync extras to run encrypted asset tests")
+    def test_sync_asset_download_rejects_unsafe_legacy_database_metadata(self) -> None:
+        home = self.root / "home"
+        configure_home(home)
+        init_db()
+        plaintext = b"asset payload"
+        digest = hashlib.sha256(plaintext).hexdigest()
+        asset_id = "asset_test"
+        with connect() as connection:
+            connection.execute(
+                """INSERT INTO managed_assets(
+                       id,sha256,media_type,extension,byte_count,relative_path,unresolved,created_at
+                   ) VALUES(?,?,?,?,?,NULL,1,?)""",
+                (
+                    asset_id,
+                    digest,
+                    "application/octet-stream",
+                    r"\..\..\..\escaped.bin",
+                    len(plaintext),
+                    "2026-07-31T00:00:00Z",
+                ),
+            )
+        cipher = AccountCipher("account_test", b"k" * 32)
+        blob_id = cipher.blob_id(asset_id)
+        encrypted = cipher.seal_blob_chunk(blob_id, 0, 1, plaintext)
+        self_outer = self
+
+        class Transport:
+            def download_blob_chunk(self, requested_blob_id: str, index: int):
+                self_outer.assertEqual(blob_id, requested_blob_id)
+                self_outer.assertEqual(0, index)
+                return encrypted
+
+        downloaded, errors = sync_module._sync_download_assets(Transport(), cipher)
+        self.assertEqual(0, downloaded)
+        self.assertTrue(errors)
+        self.assertFalse((self.root / "escaped.bin").exists())
+
+    @unittest.skipIf(TestClient is None, "install sync extras to run encrypted asset tests")
+    def test_sync_asset_download_keeps_valid_asset_inside_private_home(self) -> None:
+        home = self.root / "home"
+        configure_home(home)
+        init_db()
+        plaintext = b"valid asset payload"
+        digest = hashlib.sha256(plaintext).hexdigest()
+        asset_id = "asset_valid"
+        with connect() as connection:
+            connection.execute(
+                """INSERT INTO managed_assets(
+                       id,sha256,media_type,extension,byte_count,relative_path,unresolved,created_at
+                   ) VALUES(?,?,?,?,?,NULL,1,?)""",
+                (
+                    asset_id,
+                    digest,
+                    "application/octet-stream",
+                    ".bin",
+                    len(plaintext),
+                    "2026-07-31T00:00:00Z",
+                ),
+            )
+        cipher = AccountCipher("account_test", b"k" * 32)
+        blob_id = cipher.blob_id(asset_id)
+        encrypted = cipher.seal_blob_chunk(blob_id, 0, 1, plaintext)
+
+        class Transport:
+            def download_blob_chunk(self, requested_blob_id: str, index: int):
+                return encrypted
+
+        downloaded, errors = sync_module._sync_download_assets(Transport(), cipher)
+        self.assertEqual(1, downloaded)
+        self.assertEqual([], errors)
+        target = home / "assets" / f"{digest}.bin"
+        self.assertEqual(plaintext, target.read_bytes())
 
 
 @unittest.skipIf(TestClient is None, "install sync and server extras to run E2EE integration tests")
@@ -722,7 +1808,10 @@ class SyncIntegrationTest(unittest.TestCase):
         replacement_headers = {"Authorization": f"Bearer {replacement['access_token']}"}
         envelope = self.client.get("/v1/key-envelopes/recovery", headers=replacement_headers).json()["envelope"]
         recovered = recover_account_data_key(self.account["account_id"], rotated["recovery_key"], envelope)
-        self.assertEqual(recovered, get_secret("sync.account_data_key", binary=True))
+        self.assertEqual(
+            recovered,
+            sync_module._get_sync_secret("sync.account_data_key", binary=True),
+        )
         home_c = self.root / "home-c"
         configure_home(home_c)
         configure_sync(

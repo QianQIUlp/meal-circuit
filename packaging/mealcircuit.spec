@@ -7,6 +7,33 @@ import sys
 root = Path(SPECPATH).parent
 target_arch = os.environ.get("MEALCIRCUIT_TARGET_ARCH") if sys.platform == "darwin" else None
 use_upx = sys.platform == "win32"
+windows_icon = str(root / "packaging" / "windows" / "MealCircuit.ico") if sys.platform == "win32" else None
+keyring_hiddenimports = ["keyring.backends.fail"]
+platform_excludes = []
+if sys.platform == "win32":
+    keyring_hiddenimports.append("keyring.backends.Windows")
+    platform_excludes.extend(
+        [
+            "webview.platforms.android",
+            "webview.platforms.cocoa",
+            "webview.platforms.gtk",
+            "webview.platforms.qt",
+            "keyring.backends.macOS",
+            "keyring.backends.SecretService",
+            "keyring.backends.libsecret",
+            "keyring.backends.kwallet",
+        ]
+    )
+elif sys.platform == "darwin":
+    keyring_hiddenimports.append("keyring.backends.macOS")
+else:
+    keyring_hiddenimports.extend(
+        [
+            "keyring.backends.SecretService",
+            "keyring.backends.kwallet",
+            "keyring.backends.chainer",
+        ]
+    )
 datas = [
     (str(root / "mealcircuit" / "static"), "mealcircuit/static"),
     (str(root / "rules"), "rules"),
@@ -21,20 +48,21 @@ a = Analysis(
     datas=datas,
     hiddenimports=[
         "webview",
-        "keyring.backends.Windows",
-        "keyring.backends.macOS",
-        "keyring.backends.SecretService",
-        "keyring.backends.kwallet",
-        "keyring.backends.chainer",
-        "keyring.backends.fail",
+        *keyring_hiddenimports,
     ],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    excludes=platform_excludes,
     noarchive=False,
     optimize=1,
 )
+if sys.platform == "win32":
+    a.datas = [
+        item
+        for item in a.datas
+        if not str(item[0]).replace("\\", "/").endswith("webview/lib/pywebview-android.jar")
+    ]
 pyz = PYZ(a.pure)
 exe = EXE(
     pyz,
@@ -48,6 +76,7 @@ exe = EXE(
     upx=use_upx,
     console=False,
     target_arch=target_arch,
+    icon=windows_icon,
 )
 coll = COLLECT(
     exe,

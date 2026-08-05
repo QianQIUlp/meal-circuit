@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sqlite3
@@ -7,12 +8,22 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import zipfile
 from contextlib import closing
 from datetime import date, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
-from mealcircuit import adaptive, agent_intelligence, agent_workspace, personalization, portability, server, service
+from mealcircuit import (
+    adaptive,
+    agent_intelligence,
+    agent_workspace,
+    personalization,
+    planning,
+    portability,
+    server,
+    service,
+)
 from mealcircuit.configuration import initialize_private_home, load_resolved_settings
 from mealcircuit.db import CURRENT_SCHEMA_VERSION, connect, init_db, row_dict
 from mealcircuit.validation import ValidationError
@@ -699,6 +710,123 @@ class AdaptiveDomainTest(unittest.TestCase):
         self.assertEqual(["2026-07-09"], dates)
         self.assertEqual(1, inventory_count)
 
+    def test_portable_bundle_rejects_windows_paths_and_compressed_bombs(self):
+        safe_media = self.home / "uploads" / "nested" / "safe.jpg"
+        safe_media.parent.mkdir(parents=True, exist_ok=True)
+        safe_media.write_bytes(b"safe media")
+        bundle = self.home / "exports" / "valid.zip"
+        portability.export_bundle(bundle)
+        self.assertEqual("ok", portability.preview_import(bundle)["database_integrity"])
+
+        with zipfile.ZipFile(bundle) as archive:
+            files = {
+                info.filename: archive.read(info)
+                for info in archive.infolist()
+                if info.filename != portability.MANIFEST_NAME
+            }
+            manifest = json.loads(archive.read(portability.MANIFEST_NAME))
+
+        def write_bundle_entries(target: Path, additions: list[tuple[str, bytes]]) -> None:
+            updated = json.loads(json.dumps(manifest))
+            for extra_name, data in additions:
+                updated["entries"].append(
+                    {
+                        "path": extra_name,
+                        "size": len(data),
+                        "sha256": hashlib.sha256(data).hexdigest(),
+                    }
+                )
+            with zipfile.ZipFile(target, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+                archive.writestr(portability.MANIFEST_NAME, json.dumps(updated))
+                for name, value in files.items():
+                    archive.writestr(name, value)
+                for extra_name, data in additions:
+                    archive.writestr(extra_name, data)
+
+        def write_bundle(target: Path, extra_name: str, data: bytes) -> None:
+            write_bundle_entries(target, [(extra_name, data)])
+
+        windows_escape = self.home / "exports" / "windows-escape.zip"
+        write_bundle(
+            windows_escape,
+            r"media/uploads/C:\Users\Public\MealCircuit-owned.txt",
+            b"must not escape",
+        )
+        with self.assertRaises(ValidationError):
+            portability.preview_import(windows_escape)
+
+        unsafe_windows_names = {
+            "ads": "media/uploads/photo.jpg:payload",
+            "less-than": "media/uploads/photo<.jpg",
+            "greater-than": "media/uploads/photo>.jpg",
+            "quote": 'media/uploads/photo".jpg',
+            "pipe": "media/uploads/photo|.jpg",
+            "question": "media/uploads/photo?.jpg",
+            "asterisk": "media/uploads/photo*.jpg",
+            "control": "media/uploads/control\x1fname.jpg",
+            "trailing-dot": "media/uploads./photo.jpg",
+            "trailing-space": "media/uploads/photo.jpg ",
+            "reserved-extension": "media/uploads/CON.txt",
+            "reserved-middle": "media/NUL/photo.jpg",
+            "reserved-casefold": "media/uploads/cOm1.log",
+        }
+        for label, unsafe_name in unsafe_windows_names.items():
+            with self.subTest(windows_name=label):
+                target = self.home / "exports" / f"windows-{label}.zip"
+                write_bundle(target, unsafe_name, b"unsafe Windows name")
+                with self.assertRaises(ValidationError):
+                    portability.preview_import(target)
+
+        reserved_names = [
+            "CON",
+            "PRN",
+            "AUX",
+            "NUL",
+            *(f"COM{index}" for index in range(1, 10)),
+            *(f"LPT{index}" for index in range(1, 10)),
+            *(f"COM{index}" for index in "¹²³"),
+            *(f"LPT{index}" for index in "¹²³"),
+        ]
+        for reserved_name in reserved_names:
+            with self.subTest(reserved_name=reserved_name):
+                target = self.home / "exports" / f"reserved-{reserved_name}.zip"
+                write_bundle(
+                    target,
+                    f"media/uploads/{reserved_name}.log",
+                    b"reserved device name",
+                )
+                with self.assertRaises(ValidationError):
+                    portability.preview_import(target)
+
+        case_alias = self.home / "exports" / "windows-case-alias.zip"
+        write_bundle(case_alias, "DATA/MEALCIRCUIT.DB", files["data/mealcircuit.db"])
+        with self.assertRaises(ValidationError):
+            portability.preview_import(case_alias)
+
+        dot_alias = self.home / "exports" / "windows-dot-alias.zip"
+        write_bundle_entries(
+            dot_alias,
+            [
+                ("media/uploads/alias/item.bin", b"first"),
+                ("media/uploads/alias/./item.bin", b"second"),
+            ],
+        )
+        with self.assertRaises(ValidationError):
+            portability.preview_import(dot_alias)
+
+        compressed_bomb = self.home / "exports" / "compressed-bomb.zip"
+        write_bundle(compressed_bomb, "media/uploads/compressed.bin", b"0" * (4 * 1024 * 1024))
+        with self.assertRaises(ValidationError):
+            portability.preview_import(compressed_bomb)
+
+        for constant in ("MAX_BUNDLE_FILES", "MAX_BUNDLE_BYTES", "MAX_BUNDLE_ENTRY_BYTES"):
+            with self.subTest(constant=constant), patch.object(portability, constant, 1):
+                with self.assertRaises(ValidationError):
+                    portability.preview_import(bundle)
+
+        with self.assertRaises(ValidationError):
+            portability._require_child(self.home.parent / "escaped.bin", self.home)
+
     def test_closed_loop_cli_surfaces_plan_inventory_setup_and_export(self):
         self._complete_standard_profile()
         plan = self._publish_plan("2026-07-09")
@@ -842,6 +970,128 @@ class AdaptiveDomainTest(unittest.TestCase):
         self.assertEqual(3, strategies[0]["evidence_summary_json"]["support_count"])
         self.assertEqual(4, strategies[0]["evidence_summary_json"]["opportunity_count"])
 
+    def test_food_exclusions_scan_nested_actionable_plan_text(self):
+        def safe_result() -> dict:
+            return {
+                "core_advice": ["Keep the plan simple."],
+                "priority_food_decisions": ["Use the listed foods."],
+                "tomorrow_menu": {
+                    "meals": [{
+                        "name": "breakfast",
+                        "foods": ["rice"],
+                        "portion_guidance": "one bowl",
+                        "substitutions": ["tofu"],
+                        "portion_contracts": [{"item": "rice", "increase_if": "hungry"}],
+                        "adjustment_logic": {"if_hungry": "add rice"},
+                        "recipe_card": {
+                            "title": "rice bowl",
+                            "ingredients": [{"name": "rice"}],
+                            "seasonings": [{"name": "salt"}],
+                            "steps": [{"instruction": "cook rice"}],
+                            "failure_rescue": ["add water"],
+                            "gut_fallback": "serve plain rice",
+                        },
+                        "eat_out_guidance": {"fallback": "order rice"},
+                    }],
+                    "conditional_snack": {"options": ["apple"]},
+                    "training_adjustment": "add rice after training",
+                    "gut_adjustment": "serve rice soft",
+                    "shopping_list": [{"name": "rice", "selection_guide": "plain rice"}],
+                    "online_options": [{"search_keywords": ["plain rice"], "pairs_with": ["tofu"]}],
+                    "reuse_plan": {
+                        "items": [{
+                            "ingredient": "rice",
+                            "later_uses": [{"use": "rice soup"}],
+                        }],
+                    },
+                },
+            }
+
+        paths = (
+            ("core_advice", 0),
+            ("priority_food_decisions", 0),
+            ("tomorrow_menu", "meals", 0, "substitutions", 0),
+            ("tomorrow_menu", "meals", 0, "portion_guidance"),
+            ("tomorrow_menu", "meals", 0, "portion_contracts", 0, "item"),
+            ("tomorrow_menu", "meals", 0, "adjustment_logic", "if_hungry"),
+            ("tomorrow_menu", "meals", 0, "recipe_card", "title"),
+            ("tomorrow_menu", "meals", 0, "recipe_card", "seasonings", 0, "name"),
+            ("tomorrow_menu", "meals", 0, "recipe_card", "steps", 0, "instruction"),
+            ("tomorrow_menu", "meals", 0, "recipe_card", "failure_rescue", 0),
+            ("tomorrow_menu", "meals", 0, "recipe_card", "gut_fallback"),
+            ("tomorrow_menu", "meals", 0, "eat_out_guidance", "fallback"),
+            ("tomorrow_menu", "conditional_snack", "options", 0),
+            ("tomorrow_menu", "training_adjustment"),
+            ("tomorrow_menu", "gut_adjustment"),
+            ("tomorrow_menu", "shopping_list", 0, "selection_guide"),
+            ("tomorrow_menu", "online_options", 0, "search_keywords", 0),
+            ("tomorrow_menu", "reuse_plan", "items", 0, "later_uses", 0, "use"),
+        )
+        contexts = {
+            "profile": {
+                "generation_policy": {"allowed": True, "safety_mode": "standard"},
+                "active_profile": {"profile_json": {"constraints": {"food_exclusions": ["peanut"]}}},
+            },
+            "confirmed_rule": {
+                "generation_policy": {"allowed": True, "safety_mode": "standard"},
+                "confirmed_rules": [{
+                    "id": "exclude-peanut",
+                    "kind": "constraint",
+                    "statement": "Exclude peanut",
+                    "effect_json": {"action": "exclude_food", "value": "peanut"},
+                }],
+            },
+        }
+
+        for context_name, context in contexts.items():
+            for path in paths:
+                candidate = safe_result()
+                target = candidate
+                for part in path[:-1]:
+                    target = target[part]
+                target[path[-1]] = "PEA-NUT"
+                with self.subTest(context=context_name, path=path):
+                    with self.assertRaisesRegex(ValidationError, "排除食品|违反确认规则"):
+                        planning.validate_and_enrich_daily_result(candidate, context)
+
+        safe = planning.validate_and_enrich_daily_result(safe_result(), contexts["profile"])
+        self.assertEqual(2, safe["result_schema_version"])
+        egg_context = {
+            "generation_policy": {"allowed": True, "safety_mode": "standard"},
+            "active_profile": {
+                "profile_json": {"constraints": {"food_exclusions": ["egg"]}}
+            },
+        }
+        safe_veggie = safe_result()
+        safe_veggie["core_advice"] = ["Add mixed veggies."]
+        planning.validate_and_enrich_daily_result(safe_veggie, egg_context)
+        unsafe_eggs = safe_result()
+        unsafe_eggs["core_advice"] = ["Add eggs."]
+        with self.assertRaisesRegex(ValidationError, "排除食品"):
+            planning.validate_and_enrich_daily_result(unsafe_eggs, egg_context)
+
+    def test_rescue_validation_scans_complete_nested_result(self):
+        plan_item = {"plan_item_id": "plan-item"}
+        unsafe = {
+            "reason": "The planned ingredient is unavailable.",
+            "steps": ["Add PEA-NUT and serve."],
+            "replacement_foods": ["rice"],
+            "safety_notes": ["Keep the serving small."],
+        }
+        constraints = (
+            [{"id": "profile", "kind": "food_exclusions", "value": ["peanut"]}],
+            [{"id": "rule", "kind": "exclude_food", "value": "peanut"}],
+        )
+        for active_constraints in constraints:
+            with self.subTest(kind=active_constraints[0]["kind"]):
+                with self.assertRaisesRegex(ValidationError, "排除食品|违反确认规则"):
+                    planning.validate_rescue_result(dict(unsafe), plan_item, active_constraints)
+
+        safe = planning.validate_rescue_result(
+            {**unsafe, "steps": ["Add rice and serve."]}, plan_item, constraints[0]
+        )
+        self.assertEqual(2, safe["result_schema_version"])
+
     def test_inventory_questions_experiment_and_calibration_are_versioned(self):
         self._complete_standard_profile()
         item = adaptive.create_inventory_item("北豆腐", "半盒", expires_on="2026-07-12")
@@ -876,6 +1126,11 @@ class AdaptiveDomainTest(unittest.TestCase):
         rescue = adaptive.create_rescue_session(
             plan["plan_date"], dinner["plan_item_id"], "ingredient_missing", "鸡肉没有解冻"
         )
+        with self.assertRaisesRegex(ValidationError, "排除食品"):
+            adaptive.complete_rescue_session(rescue["id"], {
+                "reason": "改用现成主食。", "steps": ["加入花生后完成"],
+                "replacement_foods": ["豆腐"], "portion_change": "保持原份量", "safety_notes": [],
+            })
         completed = adaptive.complete_rescue_session(rescue["id"], {
             "reason": "改用可直接加热的豆腐。", "steps": ["豆腐沥水", "按原调味完成"],
             "replacement_foods": ["豆腐"], "portion_change": "保持原份量", "safety_notes": [],

@@ -469,7 +469,7 @@ class AgentWorkspaceTest(unittest.TestCase):
         self.assertEqual("active", projection["claims"][0]["status"])
         self.assertNotIn("food_exclusion", projection["claims"][0]["effect"])
 
-    def test_model_hypothesis_is_not_real_evidence_but_explicit_intake_can_activate(self):
+    def test_model_hypothesis_cannot_self_declare_explicit_user_evidence(self):
         hypothesis = {
             "claim_type": "soft_need_hypothesis",
             "statement": "晚餐需要更强的饱腹感",
@@ -515,7 +515,54 @@ class AgentWorkspaceTest(unittest.TestCase):
         ][0]["status"])
         agent_workspace.accept_agent_run(revised_draft["run_id"])
         updated = [item for item in agent_workspace.list_claims() if item["statement"] == hypothesis["statement"]][0]
-        self.assertEqual("active", updated["status"])
+        self.assertEqual("pending_confirmation", updated["status"])
+        self.assertFalse(any(
+            evidence["explicit"]
+            for evidence in updated["evidence"]
+            if evidence["evidence_type"] == "agent_hypothesis"
+        ))
+
+    def test_model_cannot_downgrade_or_activate_medication_nutrition_claim(self):
+        statement = "Medication requires cutting carbohydrates to zero every day."
+        signals = agent_intelligence.detect_intent_signals({
+            "source_id": "english-medication",
+            "source_type": "intake",
+            "text": statement,
+            "explicit_user": True,
+        }, self.review_date)
+        self.assertEqual(["high"], [signal["risk_level"] for signal in signals])
+        self.assertEqual(["requires_confirmation"], [signal["lifetime"] for signal in signals])
+        intake = agent_workspace.record_intake(self.review_date, statement)
+        candidate = {
+            "claim_type": "stable_preference",
+            "statement": statement,
+            "scope": {"meal": "all"},
+            "planning_effect": {"portion": "remove all carbohydrates"},
+            "evidence_ids": [intake["id"]],
+            "evidence_summary": "The model says the intake is explicit.",
+            "risk_level": "low",
+            "explicit_user_statement": True,
+            "valid_until": None,
+        }
+        draft = agent_workspace.run_agent_draft(
+            self.review_date,
+            ScriptedProvider(self.review_date, plan=self._provider().plan, soft_assumptions=[candidate]),
+        )
+        agent_workspace.accept_agent_run(draft["run_id"])
+
+        learned = next(
+            item for item in agent_workspace.list_claims()
+            if item["statement"] == statement and item["claim_type"] == "stable_preference"
+        )
+        self.assertEqual("high", learned["risk_level"])
+        self.assertEqual("pending_confirmation", learned["status"])
+        self.assertEqual({}, learned["effect_json"])
+        self.assertFalse(any(evidence["explicit"] for evidence in learned["evidence"]))
+        active_ids = {
+            item["id"]
+            for item in agent_workspace.build_agent_context(self.review_date)["person"]["active_user_model"]
+        }
+        self.assertNotIn(learned["id"], active_ids)
 
     def test_high_impact_claim_never_auto_activates_or_changes_planning(self):
         claim = agent_workspace.upsert_claim(

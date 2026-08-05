@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import functools
 import hashlib
 import html
 import io
@@ -24,7 +25,15 @@ from pathlib import Path
 from . import adaptive, agent_workspace, ai, checkins, personalization, portability, service, sync
 from .configuration import initialize_private_home
 from .db import connect, init_db
-from .storage import exports_root, managed_asset_root, port_value, upload_root
+from .portable import ImportRollbackError
+from .secret_store import SecretStorageError
+from .storage import (
+    exports_root,
+    managed_asset_root,
+    port_value,
+    resolve_managed_media_path,
+    upload_root,
+)
 from .validation import ValidationError, nutrition_number
 
 
@@ -32,6 +41,16 @@ LOOPBACK_NAMES = {"localhost", "127.0.0.1", "::1"}
 STATIC_ROOT = Path(__file__).with_name("static")
 _PENDING_RECOVERY: dict[str, dict] = {}
 _PENDING_RECOVERY_LOCK = threading.Lock()
+_LOCAL_HTTP_REQUEST_LOCK = threading.RLock()
+
+
+def serialized_local_request(handler):
+    @functools.wraps(handler)
+    def wrapped(self, *args, **kwargs):
+        with _LOCAL_HTTP_REQUEST_LOCK:
+            return handler(self, *args, **kwargs)
+
+    return wrapped
 
 
 def is_loopback_host(host_name: str | None) -> bool:
@@ -59,10 +78,13 @@ def parse_host_endpoint(host_header: str, default_port: int) -> tuple[str, int]:
 
 
 def origin_matches_host(host_name: str, host_port: int, origin: str | None, fetch_site: str | None) -> bool:
+    normalized_fetch_site = (fetch_site or "").lower()
+    if normalized_fetch_site and normalized_fetch_site not in {"same-origin", "same-site", "none"}:
+        return False
     if not origin:
         return True
     if origin == "null":
-        return is_loopback_host(host_name) and (fetch_site or "").lower() in {"same-origin", "none"}
+        return is_loopback_host(host_name) and normalized_fetch_site in {"same-origin", "none"}
     try:
         parsed = urllib.parse.urlsplit(origin)
         origin_name = parsed.hostname
@@ -79,6 +101,78 @@ def origin_matches_host(host_name: str, host_port: int, origin: str | None, fetc
 
 def esc(value: object) -> str:
     return html.escape("" if value is None else str(value))
+
+
+IMAGE_MEDIA_TYPES = {
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+}
+
+
+def _media_url(value: object) -> str:
+    filename = Path(str(value or "")).name
+    return "/media/" + urllib.parse.quote(filename, safe="")
+
+
+def _safe_local_href(value: object, fallback: str = "/setup") -> str:
+    href = str(value or "").strip()
+    try:
+        parsed = urllib.parse.urlsplit(href)
+    except ValueError:
+        return fallback
+    if (
+        not href.startswith("/")
+        or href.startswith("//")
+        or parsed.scheme
+        or parsed.netloc
+        or any(ord(character) < 32 for character in href)
+    ):
+        return fallback
+    return href
+
+
+def _verified_image_media_type(path: Path, data: bytes) -> str:
+    suffix_type = IMAGE_MEDIA_TYPES.get(path.suffix.lower())
+    detected_type = None
+    if data.startswith(b"\xff\xd8\xff"):
+        detected_type = "image/jpeg"
+    elif data.startswith(b"\x89PNG\r\n\x1a\n"):
+        detected_type = "image/png"
+    elif data.startswith((b"GIF87a", b"GIF89a")):
+        detected_type = "image/gif"
+    elif data.startswith(b"RIFF") and data[8:12] == b"WEBP":
+        detected_type = "image/webp"
+    if suffix_type is None or detected_type != suffix_type:
+        raise ValidationError("媒体文件必须是内容与扩展名一致的 JPEG、PNG、GIF 或 WebP 图片")
+    return detected_type
+
+
+def _read_managed_media(filename: str) -> tuple[bytes, str]:
+    if not filename or filename in {".", ".."} or "/" in filename or "\\" in filename:
+        raise FileNotFoundError(filename)
+    target = None
+    for root in (upload_root(), managed_asset_root()):
+        try:
+            target = resolve_managed_media_path(root / filename)
+            break
+        except (FileNotFoundError, ValidationError, OSError):
+            continue
+    if target is None:
+        raise FileNotFoundError(filename)
+    try:
+        size = target.stat().st_size
+    except OSError as exc:
+        raise FileNotFoundError(filename) from exc
+    if size <= 0 or size > service.MAX_UPLOAD_BYTES:
+        raise ValidationError("媒体文件为空或超过 10MB 上限")
+    with target.open("rb") as stream:
+        data = stream.read(service.MAX_UPLOAD_BYTES + 1)
+    if len(data) != size or len(data) > service.MAX_UPLOAD_BYTES:
+        raise ValidationError("媒体文件读取异常或超过 10MB 上限")
+    return data, _verified_image_media_type(target, data)
 
 
 def icon(name: str) -> str:
@@ -478,8 +572,6 @@ def render_today_workspace(work_date: str) -> str:
 
     state = agent_workspace.get_workspace_state(work_date)
     draft = state.get("draft") or {}
-    if draft.get("status") in {None, "stale", "failed", "interrupted"}:
-        agent_workspace.schedule_auto_draft(work_date)
     status = draft.get("status") or (state.get("latest_run") or {}).get("status") or "collecting"
     goal = (current.get("goals") or [{}])[0].get("goal_json") or {}
     goal_label = goal.get("custom_label") or GOAL_LABELS.get(goal.get("type"), goal.get("type") or "你的目标")
@@ -848,8 +940,8 @@ def render_plan_page(
                 photo_task = None
             if photo_task and photo_task.get("image_path"):
                 feedback_photos.append(
-                    '<figure class="feedback-photo"><img src="/media/'
-                    f'{esc(Path(photo_task["image_path"]).name)}" alt="{esc(meal.get("name") or "这一餐")}的实际照片">'
+                    '<figure class="feedback-photo"><img src="'
+                    f'{esc(_media_url(photo_task["image_path"]))}" alt="{esc(meal.get("name") or "这一餐")}的实际照片">'
                     f'<figcaption>实际照片 {index}</figcaption></figure>'
                 )
         feedback_photo_html = (
@@ -879,7 +971,7 @@ def render_plan_page(
         )
         cards.append(f'''<article class="plan-card"><div class="section-header"><div><span class="subtle-label">{esc(slot_label)}</span><h2>{esc(meal.get('name') or '这一餐')}</h2></div>{f'<span class="status completed">{esc(FEEDBACK_LABELS.get(current_status,current_status))}</span>' if feedback else ''}</div>
         {purpose_html}{f'<p><strong>方式：</strong>{esc(MEAL_MODE_LABELS.get(meal.get("mode"), meal.get("mode") or ""))}</p>' if meal.get('mode') else ''}{f'<p><strong>份量：</strong>{esc(meal.get("portion_guidance"))}</p>' if meal.get('portion_guidance') else ''}{f'<h3>具体吃多少</h3><ul class="portion-list">{portion_contract_html}</ul>' if portion_contract_html else ''}{eat_out_html}{f'<p class="muted">{esc(execution_html)}</p>' if execution_html else ''}{f'<h3>{"可选食物" if meal.get("mode")=="eat_out" else "食材"}</h3><ul>{detail}</ul>' if detail else ''}{f'<h3>执行步骤</h3><ol>{step_html}</ol>' if step_html else ''}
-        {feedback_photo_html}<details class="feedback-box"{' open' if not feedback or draft else ''}><summary>{'修改这次记录' if feedback else '吃得怎么样？'}</summary><form method="post" enctype="multipart/form-data" action="/plans/{esc(plan_date)}/{esc(meal['plan_item_id'])}/feedback" data-plan-feedback><input type="hidden" name="expected_version" value="{version}">{photo_task_fields}<div data-feedback-error-slot>{inline_error}</div><label>实际情况<select name="status" required><option value="">请选择</option>{status_options}</select></label><label>份量感觉<select name="satiety"><option value="">未记录</option>{satiety_options}</select></label><fieldset><legend>如果有变化，原因是什么？</legend><div class="option-grid">{reason_checks}</div></fieldset><label>实际怎么吃的（可选）<textarea name="actual_text" maxlength="2000">{esc(actual_text)}</textarea></label><label for="feedback-photo-{esc(meal['plan_item_id'])}">{'继续添加实际照片（可选）' if feedback_photo_html else '实际照片（可选）'}</label><input id="feedback-photo-{esc(meal['plan_item_id'])}" type="file" name="photo" accept="image/jpeg,image/png,image/gif,image/webp" multiple><p class="muted small">可以一次选择多张，也可以之后继续添加；照片会和这顿的实际情况一起保存。</p><button type="submit">记下来</button></form></details>
+        {feedback_photo_html}<details class="feedback-box"{' open' if not feedback or draft else ''}><summary>{'修改这次记录' if feedback else '吃得怎么样？'}</summary><form method="post" enctype="multipart/form-data" action="/plans/{esc(plan_date)}/{esc(meal['plan_item_id'])}/feedback" data-plan-feedback><input type="hidden" name="expected_version" value="{esc(version)}">{photo_task_fields}<div data-feedback-error-slot>{inline_error}</div><label>实际情况<select name="status" required><option value="">请选择</option>{status_options}</select></label><label>份量感觉<select name="satiety"><option value="">未记录</option>{satiety_options}</select></label><fieldset><legend>如果有变化，原因是什么？</legend><div class="option-grid">{reason_checks}</div></fieldset><label>实际怎么吃的（可选）<textarea name="actual_text" maxlength="2000">{esc(actual_text)}</textarea></label><label for="feedback-photo-{esc(meal['plan_item_id'])}">{'继续添加实际照片（可选）' if feedback_photo_html else '实际照片（可选）'}</label><input id="feedback-photo-{esc(meal['plan_item_id'])}" type="file" name="photo" accept="image/jpeg,image/png,image/gif,image/webp" multiple><p class="muted small">可以一次选择多张，也可以之后继续添加；照片会和这顿的实际情况一起保存。</p><button type="submit">记下来</button></form></details>
         {f'<form class="rescue-form" method="post" action="/rescue/start"><input type="hidden" name="plan_date" value="{esc(plan_date)}"><input type="hidden" name="plan_item_id" value="{esc(meal["plan_item_id"])}"><label>临时有变化<select name="issue_code">{"".join(f"<option value={key!r}>{label}</option>" for key,label in RESCUE_LABELS.items())}</select></label><input name="input_text" aria-label="补充当前情况" placeholder="可以补充手边的食材或时间"><button class="secondary" type="submit">帮我调整这一餐</button></form>' if plan.get('scope_current') else ''}</article>''')
     stale = '' if plan.get('scope_current') else '<div class="quiet-note panel" role="note"><strong>这是过去的安排</strong><p>仍可以补记实际情况，但不会再按它调整今天。</p></div>'
     return (
@@ -957,23 +1049,35 @@ def render_questions_page(question_date: str) -> str:
     for item in pending:
         schema = item.get("question_schema_json") or {}
         if schema.get("kind") == "action":
-            control = f'<a class="button" href="{esc(schema.get("href","/setup"))}">完成此操作</a>'
+            control = f'<a class="button" href="{esc(_safe_local_href(schema.get("href"), "/setup"))}">完成此操作</a>'
         elif schema.get("kind") == "plan_feedback":
-            statuses = "".join(f'<option value="{key}">{FEEDBACK_LABELS.get(key,key)}</option>' for key in schema.get("statuses", []))
-            reasons = "".join(f'<label class="choice-row compact"><input type="checkbox" name="reason_codes" value="{key}"><span>{REASON_LABELS.get(key,key)}</span></label>' for key in schema.get("reason_codes", []))
+            statuses = "".join(
+                f'<option value="{esc(key)}">{esc(FEEDBACK_LABELS.get(str(key), str(key)))}</option>'
+                for key in schema.get("statuses", [])
+            )
+            reasons = "".join(
+                f'<label class="choice-row compact"><input type="checkbox" name="reason_codes" value="{esc(key)}"><span>{esc(REASON_LABELS.get(str(key), str(key)))}</span></label>'
+                for key in schema.get("reason_codes", [])
+            )
             control = f'<label>执行状态<select name="feedback_status" required><option value="">请选择</option>{statuses}</select></label><fieldset><legend>偏离原因</legend><div class="option-grid">{reasons}</div></fieldset><label>补充<textarea name="actual_text"></textarea></label><button>保存答案</button>'
         elif schema.get("kind") == "meal_mode_overrides":
             labels = {"inherit": "沿用个人默认", "home_cook": "在家下厨", "quick_assembly": "快速组装", "eat_out": "外食"}
             current = item.get("answer_json") or {}
             selects = "".join(
                 f'<label>{meal_name}<select name="{key}_mode">'
-                + "".join(f'<option value="{mode}"{_selected(current.get(key, "inherit"), mode)}>{labels[mode]}</option>' for mode in schema.get("options", []))
+                + "".join(
+                    f'<option value="{esc(mode)}"{_selected(current.get(key, "inherit"), mode)}>{esc(labels.get(str(mode), str(mode)))}</option>'
+                    for mode in schema.get("options", [])
+                )
                 + '</select></label>'
                 for key, meal_name in (("breakfast", "早餐"), ("lunch", "午餐"), ("dinner", "晚餐"))
             )
             control = f'<div class="row">{selects}</div><button>{"更新" if item.get("status") == "answered" else "保存"}明日逐餐安排</button>'
         else:
-            options = "".join(f'<label class="choice-row"><input type="radio" name="answer" value="{esc(value)}" required><span>{esc(choice_labels.get(value,value))}</span></label>' for value in schema.get("options", []))
+            options = "".join(
+                f'<label class="choice-row"><input type="radio" name="answer" value="{esc(value)}" required><span>{esc(choice_labels.get(str(value), str(value)))}</span></label>'
+                for value in schema.get("options", [])
+            )
             control = f'<div class="option-list">{options}</div><button>保存答案</button>'
         skip_form = '' if item.get("status") == "answered" else f'<form method="post" action="/questions/{esc(item["id"])}/skip"><input type="hidden" name="version" value="{esc(item["version"])}"><button class="link-button" type="submit">暂时跳过</button></form>'
         cards.append(f'''<article class="panel question-card"><h2>{esc(item.get('prompt') or item['reason'])}</h2><p>{esc(item['reason'])}</p><p class="muted">这会影响：{esc(item['expected_impact'])}</p><form method="post" action="/questions/{esc(item['id'])}/answer"><input type="hidden" name="version" value="{esc(item['version'])}">{control}</form>{skip_form}</article>''')
@@ -1125,9 +1229,8 @@ def render_me_page() -> str:
         '<a class="me-card" href="/inventory"><h2 data-i18n="me.inventory">库存与常用食物</h2><p data-i18n="me.inventory.help">家里有什么、哪些食材需要优先吃。</p></a>'
         '</div>'
         f'{progress}'
-        '<section class="panel interface-settings"><h2 data-i18n="settings.appearance">外观与语言</h2><p class="muted" data-i18n="settings.appearance.help">这些偏好保存在当前设备上。</p><div class="settings-list">'
+        '<section class="panel interface-settings"><h2 data-i18n="settings.appearance">外观</h2><p class="muted" data-i18n="settings.appearance.help">主题偏好保存在当前设备上。</p><div class="settings-list">'
         '<label class="settings-row"><span data-i18n="settings.theme">主题</span><select data-theme-select><option value="system" data-i18n="settings.theme.system">跟随系统</option><option value="light" data-i18n="settings.theme.light">浅色</option><option value="dark" data-i18n="settings.theme.dark">深色</option></select></label>'
-        '<label class="settings-row"><span data-i18n="settings.language">语言</span><select data-language-select><option value="en" data-i18n="settings.language.en">English</option><option value="zh-CN" data-i18n="settings.language.zh">简体中文</option></select></label>'
         '</div></section>'
         '<details class="panel advanced-settings" id="advanced"><summary data-i18n="settings.advanced">高级设置</summary><div class="settings-links">'
         '<a href="/ai"><strong data-i18n="settings.ai">智能规划设置</strong><span data-i18n="settings.ai.help">连接模型和调整生成方式</span></a>'
@@ -1140,7 +1243,7 @@ def render_me_page() -> str:
 
 def render_data_page(message: str = "") -> str:
     message_html = f'<div class="quiet-success panel" role="status">{esc(message)}</div>' if message else ""
-    return f'''<section class="section-header"><div><h1>备份、恢复与设备迁移</h1><p class="muted">可以下载完整备份，也可以把以前的备份恢复到这台设备。智能规划密钥不会包含在备份中。</p></div><a class="button secondary" href="/me#advanced">返回设置</a></section>{message_html}<div class="grid"><section class="panel"><h2>下载备份</h2><p>包含记录、计划、设置和本地照片。</p><a class="button" href="/data/export">生成并下载</a></section><section class="panel"><h2>从备份恢复</h2><p>恢复前会先检查文件，并自动保存当前数据的备份副本。</p><form method="post" enctype="multipart/form-data" action="/data/import"><label>MealCircuit备份文件<input type="file" name="bundle" accept="application/zip,.zip" required></label><label class="choice-row"><input type="checkbox" name="confirm_restore" value="yes" required><span>我确认用这个备份替换当前数据</span></label><button class="danger" type="submit">检查并恢复</button></form></section></div>'''
+    return f'''<section class="section-header"><div><h1>备份、恢复与设备迁移</h1><p class="muted">可以下载完整备份，也可以把以前的备份恢复到这台设备。智能规划密钥不会包含在备份中。</p></div><a class="button secondary" href="/me#advanced">返回设置</a></section>{message_html}<div class="grid"><section class="panel"><h2>下载备份</h2><p>包含记录、计划、设置和本地照片。</p><form method="post" action="/data/export"><button class="button" type="submit">生成并下载</button></form></section><section class="panel"><h2>从备份恢复</h2><p>恢复前会先检查文件，并自动保存当前数据的备份副本。</p><form method="post" enctype="multipart/form-data" action="/data/import"><label>MealCircuit备份文件<input type="file" name="bundle" accept="application/zip,.zip" required></label><label class="choice-row"><input type="checkbox" name="confirm_restore" value="yes" required><span>我确认用这个备份替换当前数据</span></label><button class="danger" type="submit">检查并恢复</button></form></section></div>'''
 
 
 def render_rescue_page(rescue_id: str) -> str:
@@ -1163,7 +1266,7 @@ def render_rescue_page(rescue_id: str) -> str:
     return f'''<section class="panel"><h1>只调整当前这一餐</h1><p>现在遇到的问题：{esc(RESCUE_LABELS.get(session['issue_code'],session['issue_code']))}</p><p class="muted">{esc(session.get('input_text') or '没有额外补充')}</p>{control}<p class="muted small">其他餐次不会被改动。</p><a class="button secondary" href="/plans/{esc(session['plan_date'])}">返回今天安排</a></section>'''
 
 
-def layout(title: str, body: str) -> bytes:
+def layout(title: str, body: str, script_nonce: str) -> bytes:
     today = service.configured_today()
     nav_items = (
         ("/", "今天", "dashboard", title in {"今天", "今日状态", "状态问答", "状态设置"}),
@@ -1207,7 +1310,8 @@ def layout(title: str, body: str) -> bytes:
     storage_label = "本地优先 · 同步已启用" if sync_enabled else "仅存于本机"
     topbar_i18n = ' data-i18n="page.me"' if page_titles.get(title, title) == "我的" else ""
     body_title_i18n = ' data-i18n-title="title.me"' if title == "我的" else ""
-    page = f"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{esc(title)} · MealCircuit</title><link rel="icon" href="/assets/ui/favicon.svg" type="image/svg+xml"><script src="/assets/ui/theme-init.js?v=20260716a"></script><link rel="stylesheet" href="/assets/ui/app.css?v=20260716a"><script src="/assets/ui/app.js?v=20260716a" defer></script></head><body{body_title_i18n}>
+    nonce_attribute = esc(script_nonce)
+    page = f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{esc(title)} · MealCircuit</title><link rel="icon" href="/assets/ui/favicon.svg" type="image/svg+xml"><script nonce="{nonce_attribute}" src="/assets/ui/theme-init.js?v=20260801a"></script><link rel="stylesheet" href="/assets/ui/app.css?v=20260801a"><script nonce="{nonce_attribute}" src="/assets/ui/app.js?v=20260801a" defer></script></head><body{body_title_i18n}>
     <a class="skip-link" href="#main-content" data-i18n="skip.main">跳到主要内容</a>
     <div class="app-shell"><aside class="app-sidebar" id="app-sidebar" aria-label="主导航"><a class="sidebar-brand" href="/">MealCircuit</a><nav class="sidebar-nav">{"".join(nav_sections)}</nav><div class="sidebar-footer"><button class="icon-button" type="button" data-nav-collapse aria-label="收起侧栏" title="收起侧栏" data-i18n-label="nav.collapse">{icon("collapse")}</button></div></aside>
     <button class="nav-scrim" type="button" data-nav-close aria-label="关闭导航" data-i18n-label="nav.close"></button>
@@ -1329,7 +1433,7 @@ def _trend_cell(module: dict | None, kind: str) -> str:
     level = module.get("hunger_level")
     if level is None:
         return '<span class="trend-cell" data-state="recorded" title="饥饿感已记录">记</span>'
-    return f'<span class="trend-cell" data-state="recorded" data-level="{level}" title="{esc(module["summary"])}">{level}</span>'
+    return f'<span class="trend-cell" data-state="recorded" data-level="{esc(level)}" title="{esc(module["summary"])}">{esc(level)}</span>'
 
 
 def render_checkin_hub(checkin_date: str) -> str:
@@ -1584,7 +1688,7 @@ def render_sync_settings() -> str:
                 f'<p class="muted">{esc("当前设备" if item.get("current") else "已撤销" if item.get("revoked") else "已授权")}</p>'
                 '</div>'
                 + (
-                    f'<form method="post" action="/sync/devices/{esc(item.get("id"))}/revoke" onsubmit="return confirm(\'立即撤销此设备？\')"><button class="danger" type="submit">撤销</button></form>'
+                    f'<form method="post" action="/sync/devices/{esc(item.get("id"))}/revoke" data-confirm="立即撤销此设备？"><button class="danger" type="submit">撤销</button></form>'
                     if not item.get("current") and not item.get("revoked") else ""
                 )
                 + '</div></article>'
@@ -1630,15 +1734,15 @@ def render_sync_settings() -> str:
 <div><dt>待上传</dt><dd>{esc(state["pending"])}</dd></div><div><dt>游标</dt><dd>{esc(state["cursor"])}</dd></div>
 <div><dt>冲突</dt><dd>{esc(state["conflicts"])}</dd></div><div><dt>照片策略</dt><dd>{esc(media_policy)}</dd></div></dl>{warning}
 <div class="actions"><form method="post" action="/sync/now"><button type="submit">立即同步</button></form>
-{on_demand_action}<form method="post" action="/sync/unlink" onsubmit="return confirm('取消本机同步关联？本地数据会完整保留。')"><button class="secondary" type="submit">取消本机同步</button></form></div>
+{on_demand_action}<form method="post" action="/sync/unlink" data-confirm="取消本机同步关联？本地数据会完整保留。"><button class="secondary" type="submit">取消本机同步</button></form></div>
 <form method="post" action="/sync/media-policy"><label for="sync-media-policy">照片同步策略</label>
 <select id="sync-media-policy" name="media_policy">{media_options}</select><div class="form-actions"><button class="secondary" type="submit">保存照片策略</button></div></form></section>
 <section class="card"><h2>冲突中心</h2><p class="muted">同字段并发值和删除对编辑不会按时间覆盖；两个版本会一直保留到你选择。</p>{conflict_cards}</section>
 <section class="card"><h2>设备</h2><p class="muted">撤销会立即使该设备的服务端令牌失效。</p>{device_cards}</section>
 <section class="card"><h2>更换恢复密钥</h2><p>会重新保护远端数据并退出其他设备。开始前需要先解决同步冲突和来自较新版本的数据。</p>
-<form method="post" action="/sync/rotate/prepare" onsubmit="return confirm('开始安全轮换？确认后其他设备必须重新加入。')"><button class="danger" type="submit">开始安全轮换</button></form></section>
+<form method="post" action="/sync/rotate/prepare" data-confirm="开始安全轮换？确认后其他设备必须重新加入。"><button class="danger" type="submit">开始安全轮换</button></form></section>
 <section class="card error"><h2>删除远端同步账户</h2><p>永久删除服务端账户、密文与附件；本机数据保留并自动转为仅本地模式。</p>
-<form method="post" action="/sync/delete-account" onsubmit="return confirm('永久删除远端同步账户？此操作无法撤销。')">
+<form method="post" action="/sync/delete-account" data-confirm="永久删除远端同步账户？此操作无法撤销。">
 <label for="sync-delete-password">账户密码</label><input id="sync-delete-password" name="password" type="password" autocomplete="current-password" required>
 <div class="form-actions"><button class="danger" type="submit">永久删除远端账户</button></div></form></section>'''
     return '''<section class="card"><div class="section-header"><div><h1>同步与设备</h1><p class="muted">不登录也能一直离线使用；需要多设备时再连接自己的同步服务。</p></div><a class="button secondary" href="/me#advanced">返回设置</a></div>
@@ -1705,7 +1809,7 @@ def food_form(item: dict | None = None) -> str:
     <fieldset class="form-section"><legend>营养数据</legend><div class="row"><div><label for="food-energy">能量 kcal</label><input id="food-energy" type="number" min="0" step="any" name="energy_kcal" value="{val('energy_kcal')}"></div><div><label for="food-protein">蛋白质 g</label><input id="food-protein" type="number" min="0" step="any" name="protein_g" value="{val('protein_g')}"></div><div><label for="food-carbs">碳水 g</label><input id="food-carbs" type="number" min="0" step="any" name="carbs_g" value="{val('carbs_g')}"></div><div><label for="food-fat">脂肪 g</label><input id="food-fat" type="number" min="0" step="any" name="fat_g" value="{val('fat_g')}"></div><div><label for="food-fiber">膳食纤维 g</label><input id="food-fiber" type="number" min="0" step="any" name="fiber_g" value="{val('fiber_g')}"></div><div><label for="food-sodium">钠 mg</label><input id="food-sodium" type="number" min="0" step="any" name="sodium_mg" value="{val('sodium_mg')}"></div></div></fieldset>
     <fieldset class="form-section"><legend>菜单规则</legend><div class="row"><div><label for="food-category">食品类别</label><select id="food-category" name="category">{categories}</select></div><div><label for="food-priority">菜单优先级</label><select id="food-priority" name="menu_priority">{priorities}</select></div></div>
     <label for="food-default-portion">默认份量</label><input id="food-default-portion" name="default_portion" placeholder="例如：50–100g / 1包40g" value="{val('default_portion')}"><label for="food-usage-rule">菜单使用条件</label><textarea id="food-usage-rule" name="usage_rule">{val('usage_rule')}</textarea></fieldset>
-    <fieldset class="form-section"><legend>来源与备注</legend><label for="food-source">来源链接</label><input id="food-source" type="url" name="source_url" value="{val('source_url')}"><label for="food-photo-path">包装照片路径</label><input id="food-photo-path" name="package_photo_path" placeholder="可记录本机路径" value="{val('package_photo_path')}"><label for="food-notes">备注</label><textarea id="food-notes" name="notes">{val('notes')}</textarea></fieldset>
+    <fieldset class="form-section"><legend>来源与备注</legend><label for="food-source">来源链接</label><input id="food-source" type="url" name="source_url" value="{val('source_url')}"><label for="food-photo-path">受管包装照片路径（兼容字段）</label><input id="food-photo-path" name="package_photo_path" placeholder="仅接受 MealCircuit 已导入的受管相对路径" value="{val('package_photo_path')}"><label for="food-notes">备注</label><textarea id="food-notes" name="notes">{val('notes')}</textarea></fieldset>
     <div class="actions form-actions"><button type="submit">保存</button><a class="button secondary" href="/foods">取消</a></div></form>"""
 
 
@@ -1894,14 +1998,22 @@ class Handler(BaseHTTPRequestHandler):
     server_version = "MealCircuit/0.1"
 
     def log_message(self, fmt: str, *args) -> None:
-        sys.stderr.write(f"[{self.log_date_time_string()}] {fmt % args}\n")
+        stream = sys.stderr
+        if stream is None:
+            return
+        try:
+            stream.write(f"[{self.log_date_time_string()}] {fmt % args}\n")
+        except (AttributeError, OSError):
+            return
 
     def send_html(self, title: str, body: str, status: int = 200) -> None:
-        payload = layout(title, body)
+        script_nonce = secrets.token_urlsafe(24)
+        payload = layout(title, body, script_nonce)
         self.send_response(status)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(payload)))
-        self.send_security_headers()
+        self.send_no_store_headers()
+        self.send_security_headers(script_nonce)
         self.end_headers()
         self.wfile.write(payload)
 
@@ -1911,6 +2023,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(payload)))
         self.send_header("Content-Disposition", 'inline; filename="agent-context.json"')
+        self.send_no_store_headers()
         self.send_security_headers()
         self.end_headers()
         self.wfile.write(payload)
@@ -1935,42 +2048,42 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(payload)
 
     def redirect(self, location: str) -> None:
+        safe_location = _safe_local_href(location, "/")
         self.send_response(303)
-        self.send_header("Location", location)
+        self.send_header("Location", safe_location)
+        self.send_header("Content-Length", "0")
+        self.send_no_store_headers()
         self.send_security_headers()
         self.end_headers()
 
-    def send_security_headers(self) -> None:
+    def send_no_store_headers(self) -> None:
+        self.send_header("Cache-Control", "no-store, max-age=0")
+        self.send_header("Pragma", "no-cache")
+
+    def send_security_headers(self, script_nonce: str | None = None) -> None:
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("X-Frame-Options", "DENY")
+        script_policy = f"'nonce-{script_nonce}'" if script_nonce else "'none'"
         self.send_header(
             "Content-Security-Policy",
             "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; "
-            "script-src 'self'; form-action 'self'; frame-ancestors 'none'",
+            f"script-src {script_policy}; base-uri 'none'; object-src 'none'; "
+            "form-action 'self'; frame-ancestors 'none'",
         )
 
     def validate_origin(self) -> None:
         host_header = self.headers.get("Host", "")
-        bound_port = int(self.server.server_address[1])
         origin = self.headers.get("Origin")
         fetch_site = self.headers.get("Sec-Fetch-Site")
         try:
-            host_name, host_port = parse_host_endpoint(host_header, bound_port)
+            host_name, host_port = self.validate_host()
         except ValidationError:
             self.log_message(
                 "Rejected POST origin Host=%r Origin=%r Sec-Fetch-Site=%r",
                 host_header, origin, fetch_site,
             )
             raise
-        bound_host = str(self.server.server_address[0])
-        allow_remote = bool(getattr(self.server, "allow_remote", False))
-        if not allow_remote and not (is_loopback_host(host_name) or host_name == bound_host.lower().rstrip(".")):
-            self.log_message(
-                "Rejected POST origin Host=%r Origin=%r Sec-Fetch-Site=%r",
-                host_header, origin, fetch_site,
-            )
-            raise ValidationError("Host 请求头不在允许范围")
         if not origin_matches_host(host_name, host_port, origin, fetch_site):
             self.log_message(
                 "Rejected POST origin Host=%r Origin=%r Sec-Fetch-Site=%r",
@@ -1978,25 +2091,63 @@ class Handler(BaseHTTPRequestHandler):
             )
             raise ValidationError("拒绝跨来源写入请求")
 
+    def validate_host(self) -> tuple[str, int]:
+        host_header = self.headers.get("Host", "")
+        bound_host = str(self.server.server_address[0]).lower().rstrip(".")
+        bound_port = int(self.server.server_address[1])
+        host_name, host_port = parse_host_endpoint(host_header, bound_port)
+        allow_remote = bool(getattr(self.server, "allow_remote", False))
+        if host_port != bound_port:
+            raise ValidationError("Host 请求头不在允许范围")
+        if not allow_remote and not (is_loopback_host(host_name) or host_name == bound_host):
+            raise ValidationError("Host 请求头不在允许范围")
+        return host_name, host_port
+
     def read_urlencoded(self) -> dict[str, str]:
         values = self.read_urlencoded_values()
         return {key: items[-1] for key, items in values.items()}
 
+    def read_request_body(self, max_bytes: int, too_large_message: str) -> bytes:
+        if self.headers.get_all("Transfer-Encoding"):
+            raise ValidationError("不支持 Transfer-Encoding 请求正文")
+        length_headers = self.headers.get_all("Content-Length") or []
+        if not length_headers:
+            length = 0
+        elif len(length_headers) != 1:
+            raise ValidationError("Content-Length 必须且只能提供一个值")
+        else:
+            digits = length_headers[0].strip()
+            if not re.fullmatch(r"[0-9]+", digits):
+                raise ValidationError("Content-Length 必须是非负十进制整数")
+            normalized = digits.lstrip("0") or "0"
+            maximum = str(max_bytes)
+            if len(normalized) > len(maximum) or (
+                len(normalized) == len(maximum) and normalized > maximum
+            ):
+                raise ValidationError(too_large_message)
+            length = int(normalized)
+        remaining = length
+        chunks: list[bytes] = []
+        while remaining:
+            chunk = self.rfile.read(min(remaining, 64 * 1024))
+            if not chunk:
+                raise ValidationError("请求正文短于 Content-Length 声明")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        return b"".join(chunks)
+
     def read_urlencoded_values(self) -> dict[str, list[str]]:
-        length = int(self.headers.get("Content-Length", "0"))
-        if length > 2 * 1024 * 1024:
-            raise ValidationError("表单过大")
-        raw = self.rfile.read(length).decode("utf-8")
+        raw = self.read_request_body(2 * 1024 * 1024, "表单过大").decode("utf-8")
         return urllib.parse.parse_qs(raw, keep_blank_values=True)
 
     def read_multipart_values(self, max_bytes: int | None = None) -> tuple[dict[str, list[str]], dict[str, list[tuple[str, bytes]]]]:
         content_type = self.headers.get("Content-Type", "")
         if not content_type.startswith("multipart/form-data"):
             raise ValidationError("上传必须使用 multipart/form-data")
-        length = int(self.headers.get("Content-Length", "0"))
-        if length > (max_bytes or service.MAX_UPLOAD_BYTES + 1024 * 1024):
-            raise ValidationError("上传内容过大")
-        raw = self.rfile.read(length)
+        raw = self.read_request_body(
+            max_bytes or service.MAX_UPLOAD_BYTES + 1024 * 1024,
+            "上传内容过大",
+        )
         message = BytesParser(policy=default).parsebytes(
             f"Content-Type: {content_type}\r\nMIME-Version: 1.0\r\n\r\n".encode() + raw
         )
@@ -2080,10 +2231,16 @@ class Handler(BaseHTTPRequestHandler):
             }
         raise ValidationError("未知的初始化步骤")
 
+    @serialized_local_request
     def do_GET(self) -> None:
         parsed = urllib.parse.urlparse(self.path)
         path, query = parsed.path.rstrip("/") or "/", urllib.parse.parse_qs(parsed.query)
         try:
+            try:
+                self.validate_host()
+            except ValidationError:
+                self.log_message("Rejected GET Host=%r", self.headers.get("Host", ""))
+                raise
             if path.startswith("/assets/ui/"):
                 self.send_static(path.removeprefix("/assets/ui/"))
             elif path == "/setup":
@@ -2144,16 +2301,12 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/data":
                 self.send_html("备份与迁移", render_data_page())
             elif path == "/data/export":
-                exported = portability.export_bundle()
-                target = Path(exported["path"])
-                data = target.read_bytes()
-                self.send_response(200)
-                self.send_header("Content-Type", "application/zip")
-                self.send_header("Content-Disposition", f'attachment; filename="{target.name}"')
-                self.send_header("Content-Length", str(len(data)))
+                self.send_response(405)
+                self.send_header("Allow", "POST")
+                self.send_header("Content-Length", "0")
+                self.send_no_store_headers()
                 self.send_security_headers()
                 self.end_headers()
-                self.wfile.write(data)
             elif path.startswith("/rescue/"):
                 self.send_html("执行计划", render_rescue_page(path.split("/")[2]))
             elif path == "/daily":
@@ -2198,7 +2351,10 @@ class Handler(BaseHTTPRequestHandler):
             elif path.startswith("/tasks/"):
                 task_id = path.split("/")[2]
                 task = service.get_task(task_id)
-                media = f'<img class="photo" src="/media/{Path(task["image_path"]).name}" alt="上传的食物照片">' if task.get("image_path") else ""
+                media = (
+                    f'<img class="photo" src="{esc(_media_url(task["image_path"]))}" alt="上传的食物照片">'
+                    if task.get("image_path") else ""
+                )
                 if task["result_json"]:
                     result = render_provenance_warning(task.get("result_provenance_json")) + render_result(task["type"], task["result_json"])
                 else:
@@ -2223,7 +2379,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_html("新增食品", f'<div class="section-header"><div><h1>新增食品 / 原料</h1><p class="muted">按包装标签或可靠来源保存，未知数据保持为空。</p></div></div>{food_form()}')
             elif path.startswith("/foods/"):
                 food = service.get_food(path.split("/")[2])
-                self.send_html("编辑食品", f'<div class="section-header"><div><h1>编辑食品 / 原料</h1><p class="muted">修改会保留历史版本。</p></div></div>{food_form(food)}<section class="panel error"><h2>危险操作</h2><p>删除后不会再用于菜单，但历史仍会保留。</p><form method="post" action="/foods/{esc(food["id"])}/delete" onsubmit="return confirm(\'确认删除？历史仍会保留。\')"><button class="danger">删除食品</button></form></section>')
+                self.send_html("编辑食品", f'<div class="section-header"><div><h1>编辑食品 / 原料</h1><p class="muted">修改会保留历史版本。</p></div></div>{food_form(food)}<section class="panel error"><h2>危险操作</h2><p>删除后不会再用于菜单，但历史仍会保留。</p><form method="post" action="/foods/{esc(food["id"])}/delete" data-confirm="确认删除？历史仍会保留。"><button class="danger">删除食品</button></form></section>')
             elif path == "/overview":
                 info = service.overview()
                 memories = "".join(f'<li><strong>{esc(m["kind"])}</strong> {esc(m["content"])} <span class="muted">{esc(m["evidence"])}</span></li>' for m in info["memories"]) or '<li class="muted">暂无长期记忆</li>'
@@ -2247,26 +2403,13 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 self.send_html("每日复盘", body)
             elif path.startswith("/media/"):
-                filename = Path(path).name
-                candidates = [
-                    (upload_root() / filename).resolve(),
-                    (managed_asset_root() / filename).resolve(),
-                ]
-                target = next(
-                    (
-                        item
-                        for item in candidates
-                        if item.is_file()
-                        and item.parent in {upload_root().resolve(), managed_asset_root().resolve()}
-                    ),
-                    None,
-                )
-                if target is None:
-                    raise FileNotFoundError(filename)
-                data = target.read_bytes()
+                encoded_filename = path.removeprefix("/media/")
+                filename = urllib.parse.unquote(encoded_filename)
+                data, media_type = _read_managed_media(filename)
                 self.send_response(200)
-                self.send_header("Content-Type", mimetypes.guess_type(target.name)[0] or "application/octet-stream")
+                self.send_header("Content-Type", media_type)
                 self.send_header("Content-Length", str(len(data)))
+                self.send_no_store_headers()
                 self.send_security_headers()
                 self.end_headers()
                 self.wfile.write(data)
@@ -2295,6 +2438,7 @@ class Handler(BaseHTTPRequestHandler):
             "package_photo_path": form.get("package_photo_path") or None, "notes": form.get("notes", ""),
         }
 
+    @serialized_local_request
     def do_POST(self) -> None:
         path = urllib.parse.urlparse(self.path).path.rstrip("/") or "/"
         try:
@@ -2561,6 +2705,18 @@ class Handler(BaseHTTPRequestHandler):
                 form = self.read_urlencoded()
                 rescue = adaptive.create_rescue_session(form.get("plan_date", ""), form.get("plan_item_id", ""), form.get("issue_code", ""), form.get("input_text", ""))
                 self.redirect(f'/rescue/{rescue["id"]}')
+            elif path == "/data/export":
+                exported = portability.export_bundle()
+                target = Path(exported["path"])
+                data = target.read_bytes()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/zip")
+                self.send_header("Content-Disposition", f'attachment; filename="{target.name}"')
+                self.send_header("Content-Length", str(len(data)))
+                self.send_no_store_headers()
+                self.send_security_headers()
+                self.end_headers()
+                self.wfile.write(data)
             elif path == "/data/import":
                 fields, files = self.read_multipart(max_bytes=256 * 1024 * 1024)
                 if fields.get("confirm_restore") != "yes" or "bundle" not in files:
@@ -2820,7 +2976,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_html("未找到", '<section class="card"><h1>404</h1></section>', 404)
         except KeyError:
             self.send_html("未找到", '<section class="card"><h1>404</h1><p>记录不存在。</p></section>', 404)
-        except (ValidationError, ValueError) as exc:
+        except (ValidationError, ValueError, SecretStorageError, ImportRollbackError) as exc:
             self.render_error(exc)
 
 

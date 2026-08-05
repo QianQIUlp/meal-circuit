@@ -11,7 +11,7 @@ from .configuration import configuration_status, initialize_private_home
 from .db import init_db
 from .migration import apply_migration, migration_preview
 from .portable import ENCRYPTED_MAGIC, apply_import, export_data, preview_import
-from .storage import app_home
+from .storage import app_home, process_data_lock
 from .sync import (
     abort_account_key_rotation,
     delete_sync_account,
@@ -179,10 +179,17 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("sync-rotate-key", help="重新加密全部远端数据并撤销其他设备")
     sub.add_parser("sync-rotate-abort", help="中止本设备未完成的密钥轮换")
     sub.add_parser("sync-delete-account", help="永久删除远端同步账户；本地数据保留")
-    ai_secure = sub.add_parser("ai-configure-secure", help="交互式保存本设备模型配置和 API Key")
+    ai_secure = sub.add_parser(
+        "ai-configure-secure",
+        help="已禁用的旧版持久化配置入口；请改用 Web 设置或当前进程环境变量",
+    )
     ai_secure.add_argument("--provider", choices=["openai", "anthropic", "deepseek"], required=True)
     ai_secure.add_argument("--model", required=True)
-    sub.add_parser("ai-clear-secure", help="清除系统安全存储中的模型配置和 API Key")
+    sub.add_parser(
+        "ai-clear-legacy-credentials",
+        aliases=["ai-clear-secure"],
+        help="清理旧版本可能写入系统凭据存储的模型配置和 API Key",
+    )
     listing = sub.add_parser("list", help="列出任务")
     listing.add_argument("--status", choices=["pending", "completed"])
     sub.add_parser("pending", help="统一列出照片、原材料和每日复盘待办")
@@ -518,11 +525,10 @@ def main() -> None:
             emit(delete_sync_account(getpass.getpass("同步账户密码：")))
             return
         if args.command == "ai-configure-secure":
-            api_key = getpass.getpass("API Key（不会回显）：")
-            emit(ai.store_secure_config(args.provider, args.model, api_key))
+            emit(ai.store_secure_config(args.provider, args.model, ""))
             return
-        if args.command == "ai-clear-secure":
-            emit(ai.clear_secure_config())
+        if args.command in {"ai-clear-legacy-credentials", "ai-clear-secure"}:
+            emit(ai.clear_legacy_credentials())
             return
         init_db()
         if args.command == "list":
@@ -570,35 +576,38 @@ def main() -> None:
         elif args.command == "agent-accept":
             emit(agent_workspace.accept_draft(args.date), args.output)
         elif args.command == "agent-run":
-            if args.agent_run_command == "begin":
-                value = _prepare_agent_stage_workspace(
-                    agent_workspace.begin_agent_run(args.date, force=args.force)
-                )
-                emit(value, _agent_output_path(value["run_id"], args.output))
-            elif args.agent_run_command == "next":
-                value = _prepare_agent_stage_workspace(agent_workspace.next_agent_stage(args.run_id))
-                emit(value, _agent_output_path(args.run_id, args.output))
-            elif args.agent_run_command == "submit":
-                value = _prepare_agent_stage_workspace(agent_workspace.submit_agent_stage(
-                    args.run_id, args.stage,
-                    _load_agent_stage_result(args.run_id, args.stage, args.file),
-                ))
-                emit(value, _agent_output_path(args.run_id, args.output))
-            elif args.agent_run_command == "status":
-                emit(
-                    agent_workspace.agent_run_status(args.run_id),
-                    _agent_output_path(args.run_id, args.output),
-                )
-            elif args.agent_run_command == "finalize":
-                emit(
-                    agent_workspace.finalize_agent_run(args.run_id),
-                    _agent_output_path(args.run_id, args.output),
-                )
-            else:
-                emit(
-                    agent_workspace.accept_agent_run(args.run_id),
-                    _agent_output_path(args.run_id, args.output),
-                )
+            with process_data_lock():
+                if args.agent_run_command == "begin":
+                    value = _prepare_agent_stage_workspace(
+                        agent_workspace.begin_agent_run(args.date, force=args.force)
+                    )
+                    emit(value, _agent_output_path(value["run_id"], args.output))
+                elif args.agent_run_command == "next":
+                    value = _prepare_agent_stage_workspace(
+                        agent_workspace.next_agent_stage(args.run_id)
+                    )
+                    emit(value, _agent_output_path(args.run_id, args.output))
+                elif args.agent_run_command == "submit":
+                    value = _prepare_agent_stage_workspace(agent_workspace.submit_agent_stage(
+                        args.run_id, args.stage,
+                        _load_agent_stage_result(args.run_id, args.stage, args.file),
+                    ))
+                    emit(value, _agent_output_path(args.run_id, args.output))
+                elif args.agent_run_command == "status":
+                    emit(
+                        agent_workspace.agent_run_status(args.run_id),
+                        _agent_output_path(args.run_id, args.output),
+                    )
+                elif args.agent_run_command == "finalize":
+                    emit(
+                        agent_workspace.finalize_agent_run(args.run_id),
+                        _agent_output_path(args.run_id, args.output),
+                    )
+                else:
+                    emit(
+                        agent_workspace.accept_agent_run(args.run_id),
+                        _agent_output_path(args.run_id, args.output),
+                    )
         elif args.command == "user-model":
             if args.user_model_command == "list":
                 emit(agent_workspace.list_claims(include_inactive=True))

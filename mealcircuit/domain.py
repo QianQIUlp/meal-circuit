@@ -30,6 +30,9 @@ ENTITY_KINDS = {
 # New IDs are full UUIDv4 values. The reader remains deliberately tolerant of
 # shorter legacy IDs because migration must not rewrite historical identities.
 ID_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,95}$")
+ASSET_SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+ASSET_EXTENSION_PATTERN = re.compile(r"^\.[a-z0-9]{1,15}$")
+MAX_ASSET_BYTE_COUNT = 10 * 1024 * 1024
 
 
 def utc_now() -> str:
@@ -154,6 +157,31 @@ def validate_payload(entity_kind: str, payload: dict[str, Any]) -> None:
     missing = [key for key in required[entity_kind] if key not in payload]
     if missing:
         raise ValidationError(f"{entity_kind} payload 缺少字段：{', '.join(missing)}")
+    if entity_kind == "asset":
+        digest = payload["sha256"]
+        media_type = payload["media_type"]
+        extension = payload["extension"]
+        byte_count = payload["byte_count"]
+        if not isinstance(digest, str) or not ASSET_SHA256_PATTERN.fullmatch(digest):
+            raise ValidationError("asset.sha256 必须是 64 位小写十六进制摘要")
+        if (
+            not isinstance(media_type, str)
+            or not 3 <= len(media_type) <= 255
+            or "/" not in media_type
+            or any(ord(character) <= 32 or ord(character) == 127 for character in media_type)
+        ):
+            raise ValidationError("asset.media_type 格式无效")
+        if not isinstance(extension, str) or not ASSET_EXTENSION_PATTERN.fullmatch(extension):
+            raise ValidationError("asset.extension 必须是安全的小写文件后缀")
+        if (
+            not isinstance(byte_count, int)
+            or isinstance(byte_count, bool)
+            or not 0 <= byte_count <= MAX_ASSET_BYTE_COUNT
+        ):
+            raise ValidationError("asset.byte_count 无效")
+        archive_path = payload.get("archive_path")
+        if archive_path is not None and archive_path != f"assets/{digest}{extension}":
+            raise ValidationError("asset.archive_path 与摘要和后缀不匹配")
     nested_required = {
         "task": ("id", "type", "status", "created_at"),
         "food_item": ("id", "name", "basis", "created_at", "updated_at"),

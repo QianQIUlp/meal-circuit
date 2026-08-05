@@ -38,7 +38,12 @@ from .meal_modes import (
     meal_environment_for_modes,
     meal_rotation,
 )
-from .storage import resolve_data_path, store_data_path, upload_root
+from .storage import (
+    process_data_lock,
+    resolve_managed_media_path,
+    store_data_path,
+    upload_root,
+)
 from .validation import VALIDATOR_VERSION, ValidationError, validate_daily_review_result, validate_result
 from .review_lifecycle import revision_policy
 
@@ -227,24 +232,25 @@ def _read_upload(stream: BinaryIO) -> tuple[bytes, str]:
 
 
 def create_photo_task(stream: BinaryIO, note: str = "") -> dict:
-    init_db()
     data, ext = _read_upload(stream)
-    task_id = new_id("task")
-    absolute = upload_root() / f"{task_id}{ext}"
-    stored_path = store_data_path(absolute)
-    absolute.parent.mkdir(parents=True, exist_ok=True)
-    absolute.write_bytes(data)
-    try:
-        with connect() as conn:
-            conn.execute(
-                "INSERT INTO tasks(id,type,status,original_input,image_path,created_at) VALUES(?,?,?,?,?,?)",
-                (task_id, "photo", "pending", note.strip(), stored_path, now()),
-            )
-            capture_entity(conn, "task", task_id)
-            capture_task_input(conn, task_id)
-    except Exception:
-        absolute.unlink(missing_ok=True)
-        raise
+    with process_data_lock():
+        init_db()
+        task_id = new_id("task")
+        absolute = upload_root() / f"{task_id}{ext}"
+        stored_path = store_data_path(absolute)
+        absolute.parent.mkdir(parents=True, exist_ok=True)
+        absolute.write_bytes(data)
+        try:
+            with connect() as conn:
+                conn.execute(
+                    "INSERT INTO tasks(id,type,status,original_input,image_path,created_at) VALUES(?,?,?,?,?,?)",
+                    (task_id, "photo", "pending", note.strip(), stored_path, now()),
+                )
+                capture_entity(conn, "task", task_id)
+                capture_task_input(conn, task_id)
+        except Exception:
+            absolute.unlink(missing_ok=True)
+            raise
     return get_task(task_id)
 
 
@@ -2349,7 +2355,13 @@ def task_context(task_id: str, days: int = 14) -> dict:
     else:
         matches = all_foods
     if task.get("image_path"):
-        task["image_path"] = str(resolve_data_path(task["image_path"]))
+        try:
+            task["image_path"] = store_data_path(
+                resolve_managed_media_path(task["image_path"])
+            )
+        except ValidationError:
+            task["image_path"] = None
+            task["image_unresolved"] = True
     adaptations = active_adaptations(anchor.isoformat())
     inventory = list_inventory()
     source_manifest = {

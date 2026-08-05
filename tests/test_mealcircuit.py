@@ -5,6 +5,8 @@ import io
 import http.client
 import json
 import os
+import re
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -15,13 +17,17 @@ import urllib.parse
 from contextlib import redirect_stderr
 from datetime import date, timedelta
 from pathlib import Path
+from unittest.mock import patch
 
-from mealcircuit import adaptive, agent_workspace, ai, checkins, personalization, service
+from mealcircuit import adaptive, agent_workspace, ai, checkins, personalization, portability, service
 from mealcircuit import storage
+from mealcircuit import server as web_server
 from mealcircuit.configuration import configuration_status, initialize_private_home
 from mealcircuit.db import connect, init_db
 from mealcircuit.menu_semantics import compare_signatures, semantic_signature
 from mealcircuit.migration import apply_migration, migration_preview
+from mealcircuit.portable import ImportRollbackError
+from mealcircuit.secret_store import SecretStorageError
 from mealcircuit.server import Handler, ThreadingHTTPServer, origin_matches_host, parse_host_endpoint
 from mealcircuit.storage import db_path, resolve_data_path, upload_root
 from mealcircuit.validation import ValidationError, validate_daily_review_result
@@ -707,6 +713,9 @@ class MealCircuitTest(unittest.TestCase):
             ai.AIConfig("openai", "test-openai-model", "test-key"),
             transport=transport,
         )
+        context = service.task_context(task["id"])
+        self.assertEqual(task["image_path"], context["task"]["image_path"])
+        self.assertFalse(Path(context["task"]["image_path"]).is_absolute())
         completed = service.generate_task_result(task["id"], provider)
         self.assertEqual(completed["status"], "completed")
         content = payloads[0]["input"][0]["content"]
@@ -1395,7 +1404,10 @@ class MealCircuitTest(unittest.TestCase):
         output = io.StringIO()
         try:
             with redirect_stderr(output):
-                self.assertEqual(storage.db_path(), Path(legacy).resolve())
+                self.assertEqual(
+                    storage.db_path(),
+                    Path(os.path.abspath(legacy)),
+                )
             self.assertIn("已弃用", output.getvalue())
         finally:
             os.environ["MEALCIRCUIT_HOME"] = current_home
@@ -1534,6 +1546,21 @@ class WebAppTest(unittest.TestCase):
             return response.status, dict(response.headers), response.read()
         finally:
             conn.close()
+
+    def raw_request(self, request: bytes) -> tuple[int, bytes]:
+        with socket.create_connection(("127.0.0.1", self.port), timeout=5) as client:
+            client.settimeout(5)
+            client.sendall(request)
+            client.shutdown(socket.SHUT_WR)
+            chunks = []
+            while True:
+                chunk = client.recv(64 * 1024)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+        response = b"".join(chunks)
+        status_line = response.split(b"\r\n", 1)[0]
+        return int(status_line.split()[1]), response
 
     def rejected_post(self, path, body=None, headers=None):
         transient = (ConnectionAbortedError, ConnectionResetError, http.client.RemoteDisconnected)
@@ -1781,6 +1808,7 @@ class WebAppTest(unittest.TestCase):
             self.assertEqual(headers["Location"], destination)
         status, home_headers, home = self.request("GET", "/")
         decoded_home = home.decode("utf-8")
+        self.assertIn('<html lang="zh-CN">', decoded_home)
         for label in ("今天感觉怎么样？", "今天有什么变化？", "今天的状态", "今天", "计划", "我的", "记一笔"):
             self.assertIn(label, decoded_home)
         self.assertIn('class="app-sidebar"', decoded_home)
@@ -1793,7 +1821,11 @@ class WebAppTest(unittest.TestCase):
         self.assertEqual(1, decoded_home.count("<h1"))
         for hidden_copy in ("建议生成", "洞察", "学习确认", "Three-stage planning", "AgentContextV2", "查看原有今日总览"):
             self.assertNotIn(hidden_copy, decoded_home)
-        self.assertIn("script-src 'self'", home_headers["Content-Security-Policy"])
+        self.assertRegex(
+            home_headers["Content-Security-Policy"],
+            r"script-src 'nonce-[^']+'",
+        )
+        self.assertNotIn("script-src 'self'", home_headers["Content-Security-Policy"])
         status, headers, css = self.request("GET", "/assets/ui/app.css")
         self.assertEqual(status, 200)
         self.assertTrue(headers["Content-Type"].startswith("text/css"))
@@ -1802,14 +1834,17 @@ class WebAppTest(unittest.TestCase):
         status, headers, favicon = self.request("GET", "/assets/ui/favicon.svg")
         self.assertEqual(status, 200)
         self.assertIn("image/svg+xml", headers["Content-Type"])
-        self.assertIn(b"#a9d2bf", favicon)
+        self.assertIn(b"#173d35", favicon)
+        self.assertIn(b"#ef8f5b", favicon)
+        site_favicon = (Path(__file__).resolve().parents[1] / "site" / "favicon.svg").read_bytes()
+        self.assertEqual(site_favicon, favicon)
         status, headers, theme_script = self.request("GET", "/assets/ui/theme-init.js")
         self.assertEqual(status, 200)
         javascript_type = headers["Content-Type"].split(";", 1)[0]
         self.assertIn(javascript_type, {"text/javascript", "application/javascript"})
         self.assertIn(b"mealcircuit.theme", theme_script)
-        self.assertIn(b"mealcircuit.language", theme_script)
-        self.assertIn(b'language = "en"', theme_script)
+        self.assertNotIn(b"mealcircuit.language", theme_script)
+        self.assertIn(b'lang = "zh-CN"', theme_script)
         self.assertIn(b'themePreference', theme_script)
         status, _, _ = self.request("GET", "/assets/ui/%2e%2e/server.py")
         self.assertEqual(status, 404)
@@ -1818,14 +1853,17 @@ class WebAppTest(unittest.TestCase):
         self.assertIn(b"sidebarScrollTop", app_script)
         self.assertIn(b'aria-current="page"', app_script)
         self.assertIn(b'prefers-color-scheme: light', app_script)
-        self.assertIn(b'mealcircuit.language', app_script)
+        self.assertNotIn(b'mealcircuit.language', app_script)
+        self.assertNotIn(b'"nav.today": "Today"', app_script)
+        self.assertIn(b'"nav.today": "\xe4\xbb\x8a\xe5\xa4\xa9"', app_script)
         status, _, me_page = self.request("GET", "/me")
         decoded_me = me_page.decode("utf-8")
         self.assertEqual(status, 200)
         self.assertIn('data-theme-select', decoded_me)
         self.assertIn('<option value="system"', decoded_me)
-        self.assertIn('data-language-select', decoded_me)
-        self.assertIn('<option value="en"', decoded_me)
+        self.assertNotIn('data-language-select', decoded_me)
+        self.assertNotIn('<option value="en"', decoded_me)
+        self.assertIn('>外观</h2>', decoded_me)
         body = "materials=" + urllib.parse.quote("鸡胸肉 300g")
         status, headers, _ = self.request("POST", "/tasks/material", body.encode(), {"Content-Type": "application/x-www-form-urlencoded"})
         self.assertEqual(status, 303)
@@ -1893,7 +1931,7 @@ class WebAppTest(unittest.TestCase):
             self.assertEqual(303, status, old_path)
             self.assertEqual(destination, headers["Location"])
 
-        status, export_headers, bundle = self.request("GET", "/data/export")
+        status, export_headers, bundle = self.request("POST", "/data/export")
         self.assertEqual(200, status)
         self.assertEqual("application/zip", export_headers["Content-Type"])
         self.assertIn("attachment;", export_headers["Content-Disposition"])
@@ -2444,6 +2482,7 @@ class WebAppTest(unittest.TestCase):
         self.assertTrue(origin_matches_host("example.test", port, f"http://example.test:{port}", "same-origin"))
         self.assertFalse(origin_matches_host("127.0.0.1", port, f"http://localhost:{port + 1}", "same-site"))
         self.assertFalse(origin_matches_host("example.test", port, f"http://other.test:{port}", "cross-site"))
+        self.assertFalse(origin_matches_host("127.0.0.1", port, None, "cross-site"))
         self.assertTrue(origin_matches_host("127.0.0.1", port, "null", "same-origin"))
         self.assertTrue(origin_matches_host("localhost", port, "null", "none"))
         self.assertFalse(origin_matches_host("127.0.0.1", port, "null", "cross-site"))
@@ -2507,6 +2546,7 @@ class WebAppTest(unittest.TestCase):
         cases = (
             {"Host": f"127.0.0.1:{self.port}", "Origin": f"http://localhost:{self.port + 1}"},
             {"Host": f"127.0.0.1:{self.port}", "Origin": "null", "Sec-Fetch-Site": "cross-site"},
+            {"Host": f"127.0.0.1:{self.port}", "Sec-Fetch-Site": "cross-site"},
             {"Host": f"evil.invalid:{self.port}", "Origin": f"http://evil.invalid:{self.port}"},
         )
         output = io.StringIO()
@@ -2524,6 +2564,266 @@ class WebAppTest(unittest.TestCase):
         self.assertIn("Rejected POST origin", output.getvalue())
         self.assertIn("Sec-Fetch-Site", output.getvalue())
 
+    def test_get_host_policy_rejects_dns_rebinding_and_wrong_port(self):
+        for host in (
+            f"127.0.0.1:{self.port}",
+            f"localhost:{self.port}",
+            f"[::1]:{self.port}",
+        ):
+            status, _, _ = self.request("GET", "/setup", headers={"Host": host})
+            self.assertEqual(200, status, host)
+
+        for host in (
+            f"attacker.invalid:{self.port}",
+            f"127.0.0.1:{self.port + 1}",
+        ):
+            status, _, response = self.request("GET", "/setup", headers={"Host": host})
+            self.assertEqual(400, status, host)
+            self.assertIn("Host 请求头不在允许范围", response.decode("utf-8"))
+
+        before = set(storage.exports_root().glob("*.zip"))
+        status, headers, _ = self.request(
+            "GET",
+            "/data/export",
+            headers={"Host": f"127.0.0.1:{self.port}"},
+        )
+        self.assertEqual(405, status)
+        self.assertEqual("POST", headers["Allow"])
+        self.assertEqual(before, set(storage.exports_root().glob("*.zip")))
+
+        status, _, _ = self.request(
+            "POST",
+            "/data/export",
+            headers={
+                "Host": f"127.0.0.1:{self.port}",
+                "Sec-Fetch-Site": "cross-site",
+            },
+        )
+        self.assertEqual(400, status)
+        self.assertEqual(before, set(storage.exports_root().glob("*.zip")))
+
+    def test_sensitive_windows_failures_render_an_actionable_error_page(self):
+        for error in (
+            SecretStorageError("Windows 凭据存储写入失败"),
+            ImportRollbackError("自动回滚失败；请保留回滚日志"),
+        ):
+            with self.subTest(type=type(error).__name__), patch.object(
+                portability,
+                "export_bundle",
+                side_effect=error,
+            ):
+                status, _, response = self.request("POST", "/data/export")
+                self.assertEqual(400, status)
+                page = response.decode("utf-8")
+                self.assertIn("操作失败", page)
+                self.assertIn(str(error), page)
+
+    def test_destructive_actions_use_csp_safe_confirmation_handler(self):
+        food = service.create_food({
+            "name": "确认测试食品",
+            "brand": "",
+            "basis": "100g",
+            "energy_kcal": 100,
+            "protein_g": 10,
+            "carbs_g": 10,
+            "fat_g": 2,
+            "fiber_g": None,
+            "sodium_mg": None,
+            "serving_unit": "",
+            "category": "other",
+            "menu_priority": "normal",
+            "default_portion": "",
+            "usage_rule": "",
+            "source_key": None,
+            "source_url": "",
+            "package_photo_path": None,
+            "notes": "",
+        })
+        status, headers, page = self.request("GET", f'/foods/{food["id"]}')
+        decoded = page.decode("utf-8")
+        self.assertEqual(200, status)
+        csp = headers["Content-Security-Policy"]
+        nonce_match = re.search(r"script-src 'nonce-([^']+)'", csp)
+        self.assertIsNotNone(nonce_match)
+        nonce = nonce_match.group(1)
+        self.assertNotIn("script-src 'self'", csp)
+        self.assertIn("base-uri 'none'", csp)
+        self.assertIn("object-src 'none'", csp)
+        self.assertEqual("no-store, max-age=0", headers["Cache-Control"])
+        self.assertEqual(2, decoded.count(f'nonce="{nonce}"'))
+        self.assertIn('data-confirm="确认删除？历史仍会保留。"', decoded)
+        self.assertNotIn("onsubmit=", decoded)
+
+        status, _, app_script = self.request("GET", "/assets/ui/app.js")
+        self.assertEqual(200, status)
+        self.assertIn(b'form[data-confirm]', app_script)
+        self.assertIn(b"window.confirm", app_script)
+
+    def test_get_workspace_has_no_auto_draft_side_effect_but_intake_post_does(self):
+        work_date = date.today().isoformat()
+        with patch.object(agent_workspace, "schedule_auto_draft") as schedule:
+            status, _, _ = self.request("GET", "/")
+            self.assertEqual(200, status)
+            schedule.assert_not_called()
+
+            body = urllib.parse.urlencode({
+                "record_date": work_date,
+                "text": "今天临时晚下班。",
+            }).encode("utf-8")
+            status, _, _ = self.request(
+                "POST",
+                "/agent/intake",
+                body,
+                {"Content-Type": "application/x-www-form-urlencoded"},
+            )
+            self.assertEqual(303, status)
+            self.assertGreaterEqual(schedule.call_count, 1)
+            self.assertEqual({(work_date,)}, {call.args for call in schedule.call_args_list})
+
+    def test_recovered_values_cannot_break_out_of_html_attributes(self):
+        payload = '\"><meta http-equiv="refresh" content="0"><script>alert(1)</script>'
+        task = service.create_photo_task(io.BytesIO(b"\x89PNG\r\n\x1a\nrestored"))
+        with connect() as conn:
+            conn.execute(
+                "UPDATE tasks SET image_path=? WHERE id=?",
+                (f"uploads/{payload}", task["id"]),
+            )
+
+        status, _, raw = self.request("GET", f'/tasks/{task["id"]}')
+        page = raw.decode("utf-8")
+        self.assertEqual(200, status)
+        self.assertNotIn('<meta http-equiv="refresh"', page)
+        self.assertNotIn("<script>alert(1)</script>", page)
+        self.assertIn(
+            "/media/" + urllib.parse.quote(Path(f"uploads/{payload}").name, safe=""),
+            page,
+        )
+
+        question = {
+            "id": "question-restored",
+            "question_schema_json": {
+                "kind": "plan_feedback",
+                "statuses": [payload],
+                "reason_codes": [payload],
+            },
+            "status": "pending",
+            "prompt": "恢复的问题",
+            "reason": "恢复原因",
+            "expected_impact": "测试转义",
+            "version": payload,
+        }
+        action = {
+            **question,
+            "id": "question-action",
+            "question_schema_json": {"kind": "action", "href": "javascript:alert(1)"},
+            "version": 1,
+        }
+        with (
+            patch.object(adaptive, "schedule_questions", return_value=[question, action]),
+            patch.object(adaptive, "question_events_for_date", return_value=[]),
+        ):
+            status, _, raw = self.request("GET", f"/questions/{date.today().isoformat()}")
+        page = raw.decode("utf-8")
+        self.assertEqual(200, status)
+        self.assertNotIn("<script>alert(1)</script>", page)
+        self.assertIn("&lt;script&gt;alert(1)&lt;/script&gt;", page)
+        self.assertIn('href="/setup"', page)
+        self.assertNotIn('href="javascript:', page)
+
+    def test_feedback_version_from_recovered_database_is_attribute_escaped(self):
+        review_date = date.today().isoformat()
+        service.add_daily_record(review_date, "今天按计划记录实际饮食。")
+        service.complete_daily_review(review_date, daily_review_result(review_date))
+        plan_date = (date.today() + timedelta(days=1)).isoformat()
+        plan = adaptive.get_plan_for_date(plan_date)
+        item_id = plan["menu"]["meals"][0]["plan_item_id"]
+        feedback = adaptive.save_plan_feedback(plan_date, item_id, "followed")
+        payload = '\"><script>alert(2)</script>'
+        with connect() as conn:
+            conn.execute(
+                "UPDATE plan_execution_feedback SET version=? WHERE id=?",
+                (payload, feedback["id"]),
+            )
+
+        status, _, raw = self.request("GET", f"/plans/{plan_date}")
+        page = raw.decode("utf-8")
+        self.assertEqual(200, status)
+        self.assertNotIn("<script>alert(2)</script>", page)
+        self.assertIn("&quot;&gt;&lt;script&gt;alert(2)&lt;/script&gt;", page)
+
+    def test_media_endpoint_only_serves_bounded_verified_managed_images(self):
+        media_root = upload_root()
+        media_root.mkdir(parents=True, exist_ok=True)
+        (media_root / "valid.png").write_bytes(b"\x89PNG\r\n\x1a\nverified")
+        (media_root / "payload.html").write_bytes(b"<script>alert(1)</script>")
+        (media_root / "spoof.png").write_bytes(b"GIF89aspoofed")
+        (media_root / "too-large.png").write_bytes(b"\x89PNG\r\n\x1a\n" + b"x" * 32)
+
+        status, headers, data = self.request("GET", "/media/valid.png")
+        self.assertEqual(200, status)
+        self.assertEqual("image/png", headers["Content-Type"])
+        self.assertEqual("no-store, max-age=0", headers["Cache-Control"])
+        self.assertEqual(b"\x89PNG\r\n\x1a\nverified", data)
+
+        for path in ("/media/payload.html", "/media/spoof.png"):
+            status, _, raw = self.request("GET", path)
+            self.assertEqual(400, status, path)
+            self.assertNotIn(b"<script>alert(1)</script>", raw)
+
+        with patch.object(service, "MAX_UPLOAD_BYTES", 16):
+            status, _, _ = self.request("GET", "/media/too-large.png")
+        self.assertEqual(400, status)
+
+        status, _, _ = self.request("GET", "/media/%2e%2e%2fsettings.json")
+        self.assertEqual(404, status)
+
+    def test_import_serializes_other_local_http_requests(self):
+        entered_restore = threading.Event()
+        release_restore = threading.Event()
+        get_completed = threading.Event()
+        original_restore = portability.restore_bundle
+        results = {}
+
+        def controlled_restore(*_args, **_kwargs):
+            entered_restore.set()
+            if not release_restore.wait(5):
+                raise AssertionError("test did not release restore")
+            return {"pre_restore_backup": None}
+
+        body, headers = self.multipart_form(
+            [("confirm_restore", "yes")],
+            [("bundle", "synthetic.zip", "application/zip", b"synthetic")],
+        )
+
+        def import_request():
+            results["import"] = self.request("POST", "/data/import", body, headers)
+
+        def concurrent_get():
+            results["get"] = self.request("GET", "/setup")
+            get_completed.set()
+
+        portability.restore_bundle = controlled_restore
+        import_thread = threading.Thread(target=import_request)
+        get_thread = threading.Thread(target=concurrent_get)
+        try:
+            import_thread.start()
+            self.assertTrue(entered_restore.wait(2))
+            get_thread.start()
+            self.assertFalse(
+                get_completed.wait(0.25),
+                "GET completed while restore was still replacing local state",
+            )
+        finally:
+            release_restore.set()
+            import_thread.join(timeout=5)
+            get_thread.join(timeout=5)
+            portability.restore_bundle = original_restore
+
+        self.assertFalse(import_thread.is_alive())
+        self.assertFalse(get_thread.is_alive())
+        self.assertEqual(200, results["import"][0])
+        self.assertEqual(200, results["get"][0])
+
     def test_cross_origin_post_is_rejected(self):
         body = urllib.parse.urlencode({"materials": "synthetic"}).encode()
         status, _, response = self.request(
@@ -2537,6 +2837,29 @@ class WebAppTest(unittest.TestCase):
         )
         self.assertEqual(status, 400)
         self.assertIn("拒绝跨来源写入请求", response.decode("utf-8"))
+
+    def test_request_body_rejects_invalid_duplicate_and_short_content_length(self):
+        prefix = (
+            f"POST /tasks/material HTTP/1.1\r\n"
+            f"Host: 127.0.0.1:{self.port}\r\n"
+            "Content-Type: application/x-www-form-urlencoded\r\n"
+            "Connection: close\r\n"
+        ).encode("ascii")
+        cases = (
+            (b"Content-Length: -1\r\n", b""),
+            (b"Content-Length: nope\r\n", b""),
+            (b"Content-Length: +1\r\n", b"x"),
+            (b"Content-Length: 1, 1\r\n", b"x"),
+            (b"Content-Length: 0\r\nContent-Length: 0\r\n", b""),
+            (b"Content-Length: 999999999999999999999999999999\r\n", b""),
+            (b"Content-Length: 10\r\n", b"x=1"),
+            (b"Transfer-Encoding: chunked\r\n", b"3\r\nx=1\r\n0\r\n\r\n"),
+        )
+        for header, body in cases:
+            with self.subTest(header=header):
+                status, response = self.raw_request(prefix + header + b"\r\n" + body)
+                self.assertEqual(400, status)
+                self.assertIn("操作失败".encode("utf-8"), response)
 
     def test_non_loopback_requires_explicit_flag(self):
         result = subprocess.run(

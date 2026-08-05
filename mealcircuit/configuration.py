@@ -13,7 +13,10 @@ from .storage import (
     app_home,
     core_rules_path,
     db_path,
+    ensure_secure_app_home,
+    ensure_secure_directory,
     private_doctrine_path,
+    process_data_locked,
     profile_path,
     settings_path,
 )
@@ -210,9 +213,9 @@ def load_doctrine() -> dict:
     return {"path": None, "mode": "composed", "sources": sources, "content": content}
 
 
+@process_data_locked()
 def initialize_private_home() -> dict:
-    home = app_home()
-    home.mkdir(parents=True, exist_ok=True)
+    home = ensure_secure_app_home()
     created: list[str] = []
     skipped: list[str] = []
     templates = {
@@ -223,13 +226,13 @@ def initialize_private_home() -> dict:
         if target.exists():
             skipped.append(str(target))
             continue
-        target.parent.mkdir(parents=True, exist_ok=True)
+        ensure_secure_directory(target.parent)
         shutil.copyfile(source, target)
         created.append(str(target))
     for directory in ("uploads", "food-labels", "assets", "exports", "backups", "archive/tmp-imports"):
         target = home / directory
         existed = target.exists()
-        target.mkdir(parents=True, exist_ok=True)
+        ensure_secure_directory(target)
         (skipped if existed else created).append(str(target))
     return {"home": str(home), "created": created, "skipped": skipped}
 

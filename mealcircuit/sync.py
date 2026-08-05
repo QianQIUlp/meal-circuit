@@ -11,19 +11,311 @@ from dataclasses import dataclass
 from typing import Callable, Protocol
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 from urllib.parse import urlsplit
 
 from .crypto import decrypt, derive_key, encrypt, format_recovery_key, opaque_remote_id, parse_recovery_key, random_key
 from .db import connect, init_db
-from .domain import DomainRevision, make_revision, new_id, three_way_merge, utc_now, validate_revision
+from .domain import (
+    DomainRevision,
+    make_revision,
+    new_id,
+    three_way_merge,
+    utc_now,
+    validate_payload,
+    validate_revision,
+)
 from .secret_store import delete_secret, get_secret, set_secret
-from .storage import app_home, managed_asset_root, resolve_data_path
+from .storage import (
+    app_home,
+    managed_asset_root,
+    process_data_lock,
+    resolve_managed_media_path,
+)
 from .validation import ValidationError
 
 
 SYNC_PROTOCOL_VERSION = 1
 BLOB_CHUNK_BYTES = 4 * 1024 * 1024
+MAX_SYNC_JSON_RESPONSE_BYTES = 64 * 1024 * 1024
+MAX_SYNC_ERROR_RESPONSE_BYTES = 64 * 1024
+MAX_SYNC_BINARY_RESPONSE_BYTES = BLOB_CHUNK_BYTES + 28
+_SYNC_HTTP_READ_CHUNK_BYTES = 64 * 1024
+
+_SYNC_ACTIVE_CREDENTIAL_SLOT = "sync_active_credential_slot_v1"
+_SYNC_OBSOLETE_CREDENTIAL_SLOTS = "sync_obsolete_credential_slots_v1"
+_SYNC_CREDENTIAL_PREFIX = "sync.credentials."
+_CREDENTIAL_SLOT_UNSET = object()
+_SYNC_LEGACY_CREDENTIALS = (
+    "sync.account_data_key",
+    "sync.access_token",
+    "sync.refresh_token",
+)
+
+
+def _credential_secret_name(slot: str) -> str:
+    if not slot.startswith("credential_") or len(slot) != 47:
+        raise ValidationError("同步凭据激活指针已损坏")
+    suffix = slot.removeprefix("credential_")
+    if any(character not in "0123456789abcdef-" for character in suffix):
+        raise ValidationError("同步凭据激活指针已损坏")
+    return f"{_SYNC_CREDENTIAL_PREFIX}{slot}"
+
+
+def _metadata_value(connection: sqlite3.Connection, key: str) -> str | None:
+    row = connection.execute("SELECT value FROM app_metadata WHERE key=?", (key,)).fetchone()
+    return str(row[0]) if row is not None else None
+
+
+def _active_credential_slot(connection: sqlite3.Connection | None = None) -> str | None:
+    if connection is None:
+        with connect() as active_connection:
+            return _active_credential_slot(active_connection)
+    slot = _metadata_value(connection, _SYNC_ACTIVE_CREDENTIAL_SLOT)
+    if slot is not None:
+        _credential_secret_name(slot)
+    return slot
+
+
+def _obsolete_credential_slots(connection: sqlite3.Connection) -> list[str]:
+    raw = _metadata_value(connection, _SYNC_OBSOLETE_CREDENTIAL_SLOTS)
+    if raw is None:
+        return []
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValidationError("同步凭据清理记录已损坏") from exc
+    if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+        raise ValidationError("同步凭据清理记录已损坏")
+    result: list[str] = []
+    for slot in value:
+        _credential_secret_name(slot)
+        if slot not in result:
+            result.append(slot)
+    return result
+
+
+def _store_obsolete_credential_slots(
+    connection: sqlite3.Connection,
+    slots: list[str],
+) -> None:
+    clean: list[str] = []
+    for slot in slots:
+        _credential_secret_name(slot)
+        if slot not in clean:
+            clean.append(slot)
+    if clean:
+        connection.execute(
+            """INSERT INTO app_metadata(key,value) VALUES(?,?)
+               ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
+            (_SYNC_OBSOLETE_CREDENTIAL_SLOTS, json.dumps(clean, separators=(",", ":"))),
+        )
+    else:
+        connection.execute(
+            "DELETE FROM app_metadata WHERE key=?",
+            (_SYNC_OBSOLETE_CREDENTIAL_SLOTS,),
+        )
+
+
+def _credential_bundle(
+    account_data_key: bytes,
+    access_token: str,
+    refresh_token: str,
+) -> str:
+    return json.dumps(
+        {
+            "version": 1,
+            "account_data_key": _b64(account_data_key),
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _read_credential_slot(slot: str) -> dict | None:
+    raw = get_secret(_credential_secret_name(slot))
+    if not isinstance(raw, str):
+        return None
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(value, dict) or value.get("version") != 1:
+        return None
+    access_token = value.get("access_token")
+    refresh_token = value.get("refresh_token")
+    if not isinstance(access_token, str) or not isinstance(refresh_token, str):
+        return None
+    try:
+        account_data_key = _unb64(value.get("account_data_key"), "account_data_key")
+    except ValidationError:
+        return None
+    return {
+        "account_data_key": account_data_key,
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+    }
+
+
+def _current_sync_credentials() -> dict:
+    slot = _active_credential_slot()
+    if slot is not None:
+        bundle = _read_credential_slot(slot)
+        if bundle is None:
+            raise ValidationError("活动同步凭据缺失或损坏；请重新登录同步")
+        return bundle
+    account_data_key = get_secret("sync.account_data_key", binary=True)
+    access_token = get_secret("sync.access_token")
+    refresh_token = get_secret("sync.refresh_token")
+    if (
+        not isinstance(account_data_key, bytes)
+        or not isinstance(access_token, str)
+        or not isinstance(refresh_token, str)
+    ):
+        raise ValidationError("当前同步凭据不完整；请重新登录同步")
+    return {
+        "account_data_key": account_data_key,
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+    }
+
+
+def _get_sync_secret(name: str, *, binary: bool = False) -> bytes | str | None:
+    if name not in _SYNC_LEGACY_CREDENTIALS:
+        raise ValueError(f"not a sync credential: {name}")
+    slot = _active_credential_slot()
+    if slot is None:
+        return get_secret(name, binary=binary)
+    bundle = _read_credential_slot(slot)
+    if bundle is None:
+        return None
+    field = name.removeprefix("sync.")
+    value = bundle[field]
+    if binary:
+        return value if isinstance(value, bytes) else None
+    return value if isinstance(value, str) else None
+
+
+def _stage_sync_credentials(
+    account_data_key: bytes,
+    access_token: str,
+    refresh_token: str,
+) -> tuple[str, str]:
+    slot = new_id("credential")
+    _register_credential_slot_for_cleanup(slot)
+    try:
+        backend = set_secret(
+            _credential_secret_name(slot),
+            _credential_bundle(account_data_key, access_token, refresh_token),
+        )
+    except BaseException:
+        try:
+            _discard_unactivated_credential_slot(slot)
+        except Exception:
+            # The pre-write cleanup registration remains durable if the
+            # credential backend also fails while discarding the slot.
+            pass
+        raise
+    return slot, backend
+
+
+def _activate_credential_slot(connection: sqlite3.Connection, slot: str) -> str | None:
+    _credential_secret_name(slot)
+    previous = _active_credential_slot(connection)
+    obsolete = [item for item in _obsolete_credential_slots(connection) if item != slot]
+    if previous is not None and previous != slot and previous not in obsolete:
+        obsolete.append(previous)
+    connection.execute(
+        """INSERT INTO app_metadata(key,value) VALUES(?,?)
+           ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
+        (_SYNC_ACTIVE_CREDENTIAL_SLOT, slot),
+    )
+    _store_obsolete_credential_slots(connection, obsolete)
+    return previous
+
+
+def _register_credential_slot_for_cleanup(slot: str) -> None:
+    _credential_secret_name(slot)
+    with connect() as connection:
+        obsolete = _obsolete_credential_slots(connection)
+        if slot not in obsolete:
+            obsolete.append(slot)
+        _store_obsolete_credential_slots(connection, obsolete)
+
+
+def _forget_credential_slot_cleanup(slot: str) -> None:
+    _credential_secret_name(slot)
+    with connect() as connection:
+        obsolete = [item for item in _obsolete_credential_slots(connection) if item != slot]
+        _store_obsolete_credential_slots(connection, obsolete)
+
+
+def _record_obsolete_credential_slot(slot: str) -> None:
+    try:
+        _register_credential_slot_for_cleanup(slot)
+    except (OSError, sqlite3.Error, ValidationError):
+        # The slot is inactive, so a bookkeeping failure cannot expose it to
+        # synchronization. A future configure operation uses a fresh slot.
+        pass
+
+
+def _discard_unactivated_credential_slot(slot: str) -> None:
+    if delete_secret(_credential_secret_name(slot)):
+        try:
+            _forget_credential_slot_cleanup(slot)
+        except (OSError, sqlite3.Error, ValidationError):
+            pass
+    else:
+        _record_obsolete_credential_slot(slot)
+
+
+def _cleanup_obsolete_credential_slots() -> list[str]:
+    with connect() as connection:
+        attempted = _obsolete_credential_slots(connection)
+    failed = [
+        slot
+        for slot in attempted
+        if not delete_secret(_credential_secret_name(slot))
+    ]
+    with connect() as connection:
+        current = _obsolete_credential_slots(connection)
+        remaining = [slot for slot in current if slot not in attempted]
+        remaining.extend(slot for slot in failed if slot not in remaining)
+        _store_obsolete_credential_slots(connection, remaining)
+    return [_credential_secret_name(slot) for slot in failed]
+
+
+def _cleanup_legacy_sync_credentials() -> list[str]:
+    return [name for name in _SYNC_LEGACY_CREDENTIALS if not delete_secret(name)]
+
+
+def _replace_sync_tokens(
+    access_token: str,
+    refresh_token: str,
+    *,
+    expected_slot: str | None,
+    expected_refresh_token: str,
+) -> None:
+    with process_data_lock():
+        current_slot = _active_credential_slot()
+        current = _current_sync_credentials()
+        if current_slot != expected_slot or current["refresh_token"] != expected_refresh_token:
+            raise ValidationError("令牌刷新期间同步账户已改变；未覆盖当前凭据")
+        slot, _ = _stage_sync_credentials(
+            current["account_data_key"],
+            access_token,
+            refresh_token,
+        )
+        try:
+            with connect() as connection:
+                _activate_credential_slot(connection, slot)
+        except Exception:
+            _discard_unactivated_credential_slot(slot)
+            raise
+        _cleanup_obsolete_credential_slots()
+        _cleanup_legacy_sync_credentials()
 
 
 def _validate_capabilities(value: object) -> dict:
@@ -244,21 +536,31 @@ def configure_sync(
     url = validate_server_url(server_url, allow_insecure_localhost=allow_insecure_localhost)
     if not account_id.strip() or not device_name.strip() or key_version <= 0:
         raise ValidationError("account_id 和 device_name 不能为空")
-    key_backend = set_secret("sync.account_data_key", account_data_key)
-    set_secret("sync.access_token", access_token)
-    set_secret("sync.refresh_token", refresh_token)
-    timestamp = utc_now()
-    with connect() as connection:
-        connection.execute(
-            """UPDATE sync_configuration SET enabled=1,server_url=?,account_id=?,device_name=?,
-               remote_device_id=?,key_version=?,updated_at=? WHERE singleton=1""",
-            (url, account_id.strip(), device_name.strip(), remote_device_id, key_version, timestamp),
+    with process_data_lock():
+        credential_slot, key_backend = _stage_sync_credentials(
+            account_data_key,
+            access_token,
+            refresh_token,
         )
-        from .domain_store import enqueue_all_heads, refresh_configuration_entities, seed_current_entities
+        timestamp = utc_now()
+        try:
+            with connect() as connection:
+                connection.execute(
+                    """UPDATE sync_configuration SET enabled=1,server_url=?,account_id=?,device_name=?,
+                       remote_device_id=?,key_version=?,updated_at=? WHERE singleton=1""",
+                    (url, account_id.strip(), device_name.strip(), remote_device_id, key_version, timestamp),
+                )
+                from .domain_store import enqueue_all_heads, refresh_configuration_entities, seed_current_entities
 
-        seed_current_entities(connection)
-        refresh_configuration_entities(connection)
-        enqueue_all_heads(connection)
+                seed_current_entities(connection)
+                refresh_configuration_entities(connection)
+                enqueue_all_heads(connection)
+                _activate_credential_slot(connection, credential_slot)
+        except Exception:
+            _discard_unactivated_credential_slot(credential_slot)
+            raise
+        _cleanup_obsolete_credential_slots()
+        _cleanup_legacy_sync_credentials()
     return {"enabled": True, "server_url": url, "account_id": account_id, "key_backend": key_backend}
 
 
@@ -282,8 +584,8 @@ def sync_status() -> dict:
             "SELECT cursor_value FROM sync_cursor WHERE scope='account'"
         ).fetchone()
     row["cursor"] = row["cursor"][0] if row["cursor"] else 0
-    row["account_data_key_available"] = get_secret("sync.account_data_key", binary=True) is not None
-    row["access_token_available"] = get_secret("sync.access_token") is not None
+    row["account_data_key_available"] = _get_sync_secret("sync.account_data_key", binary=True) is not None
+    row["access_token_available"] = _get_sync_secret("sync.access_token") is not None
     return row
 
 
@@ -343,17 +645,32 @@ def delete_sync_account(password: str) -> dict:
 def unlink_sync() -> dict:
     init_db()
     timestamp = utc_now()
-    with connect() as connection:
-        connection.execute(
-            """UPDATE sync_configuration SET enabled=0,server_url=NULL,account_id=NULL,
-               remote_device_id=NULL,device_name='',updated_at=? WHERE singleton=1""",
-            (timestamp,),
+    with process_data_lock():
+        with connect() as connection:
+            active_slot = _active_credential_slot(connection)
+            obsolete = _obsolete_credential_slots(connection)
+            if active_slot is not None and active_slot not in obsolete:
+                obsolete.append(active_slot)
+            _store_obsolete_credential_slots(connection, obsolete)
+            connection.execute(
+                "DELETE FROM app_metadata WHERE key=?",
+                (_SYNC_ACTIVE_CREDENTIAL_SLOT,),
+            )
+            connection.execute(
+                """UPDATE sync_configuration SET enabled=0,server_url=NULL,account_id=NULL,
+                   remote_device_id=NULL,device_name='',updated_at=? WHERE singleton=1""",
+                (timestamp,),
+            )
+            connection.execute("DELETE FROM sync_outbox")
+            connection.execute("DELETE FROM sync_shadow")
+            connection.execute("DELETE FROM sync_cursor")
+        cleanup_failed = _cleanup_obsolete_credential_slots()
+        cleanup_failed.extend(_cleanup_legacy_sync_credentials())
+    if cleanup_failed:
+        raise ValidationError(
+            "本机同步已禁用，但系统安全存储拒绝删除部分凭据："
+            + ", ".join(cleanup_failed)
         )
-        connection.execute("DELETE FROM sync_outbox")
-        connection.execute("DELETE FROM sync_shadow")
-        connection.execute("DELETE FROM sync_cursor")
-    for name in ("sync.account_data_key", "sync.access_token", "sync.refresh_token"):
-        delete_secret(name)
     return {"enabled": False, "local_data_preserved": True}
 
 
@@ -381,7 +698,7 @@ def prepare_outbox(limit: int = 100) -> list[dict]:
         ).fetchone()
         if not config or not config["enabled"]:
             return []
-        account_data_key = get_secret("sync.account_data_key", binary=True)
+        account_data_key = _get_sync_secret("sync.account_data_key", binary=True)
         if not isinstance(account_data_key, bytes):
             raise ValidationError("当前会话没有 Account Data Key；请重新解锁同步")
         cipher = AccountCipher(config["account_id"], account_data_key, config["key_version"])
@@ -449,6 +766,56 @@ class SyncHttpError(Exception):
         self.detail = detail
 
 
+class _NoSyncRedirectHandler(HTTPRedirectHandler):
+    def redirect_request(self, request, fp, code, message, headers, new_url):
+        return None
+
+
+def urlopen(request: Request, *, timeout: float):
+    """Open one sync request without following redirects or forwarding credentials."""
+    return build_opener(_NoSyncRedirectHandler()).open(request, timeout=timeout)
+
+
+def _response_content_length(response, label: str) -> int | None:
+    headers = getattr(response, "headers", None)
+    if headers is None:
+        return None
+    get_all = getattr(headers, "get_all", None)
+    values = get_all("Content-Length") if callable(get_all) else None
+    if values is None:
+        value = headers.get("Content-Length")
+        values = [] if value is None else [value]
+    if not values:
+        return None
+    if len(values) != 1:
+        raise ValidationError(f"同步服务{label}响应 Content-Length 无效")
+    raw = str(values[0]).strip()
+    if not raw or not raw.isascii() or not raw.isdecimal():
+        raise ValidationError(f"同步服务{label}响应 Content-Length 无效")
+    return int(raw)
+
+
+def _read_limited_response(response, limit: int, label: str) -> bytes:
+    declared = _response_content_length(response, label)
+    if declared is not None and declared > limit:
+        raise ValidationError(f"同步服务{label}响应超过大小限制")
+    chunks: list[bytes] = []
+    total = 0
+    while total <= limit:
+        block = response.read(min(_SYNC_HTTP_READ_CHUNK_BYTES, limit + 1 - total))
+        if not block:
+            break
+        if not isinstance(block, bytes):
+            raise ValidationError(f"同步服务{label}响应格式无效")
+        chunks.append(block)
+        total += len(block)
+    if total > limit:
+        raise ValidationError(f"同步服务{label}响应超过大小限制")
+    if declared is not None and total != declared:
+        raise ValidationError(f"同步服务{label}响应长度与 Content-Length 不一致")
+    return b"".join(chunks)
+
+
 def _http_json(
     url: str,
     *,
@@ -466,10 +833,22 @@ def _http_json(
     request = Request(url, data=data, headers=headers, method=method)
     try:
         with urlopen(request, timeout=timeout) as response:
-            raw = response.read()
+            raw = _read_limited_response(
+                response,
+                MAX_SYNC_JSON_RESPONSE_BYTES,
+                " JSON",
+            )
     except HTTPError as exc:
         try:
-            value = json.loads(exc.read().decode("utf-8"))
+            raw_error = _read_limited_response(
+                exc,
+                MAX_SYNC_ERROR_RESPONSE_BYTES,
+                "错误",
+            )
+        finally:
+            exc.close()
+        try:
+            value = json.loads(raw_error.decode("utf-8"))
             detail = str(value.get("detail") or f"HTTP {exc.code}")
         except (UnicodeDecodeError, json.JSONDecodeError, AttributeError):
             detail = f"HTTP {exc.code}"
@@ -503,8 +882,20 @@ def _http_bytes(
     request = Request(url, data=body, headers=headers, method=method)
     try:
         with urlopen(request, timeout=timeout) as response:
-            return response.read()
+            return _read_limited_response(
+                response,
+                MAX_SYNC_BINARY_RESPONSE_BYTES,
+                "二进制",
+            )
     except HTTPError as exc:
+        try:
+            _read_limited_response(
+                exc,
+                MAX_SYNC_ERROR_RESPONSE_BYTES,
+                "错误",
+            )
+        finally:
+            exc.close()
         raise SyncHttpError(exc.code, f"HTTP {exc.code}") from None
     except (URLError, TimeoutError, OSError) as exc:
         raise ValidationError(f"无法连接同步服务：{type(exc).__name__}") from None
@@ -519,7 +910,9 @@ class HttpSyncTransport:
         self.server_url = validate_server_url(self.server_url, allow_insecure_localhost=True)
 
     def _refresh(self) -> str:
-        refresh_token = get_secret("sync.refresh_token")
+        with process_data_lock():
+            credential_slot = _active_credential_slot()
+            refresh_token = _get_sync_secret("sync.refresh_token")
         if not isinstance(refresh_token, str):
             raise ValidationError("当前会话没有 refresh token；请重新登录同步")
         try:
@@ -535,12 +928,16 @@ class HttpSyncTransport:
         refresh = result.get("refresh_token")
         if not isinstance(access, str) or not isinstance(refresh, str):
             raise ValidationError("同步服务刷新响应缺少令牌")
-        set_secret("sync.access_token", access)
-        set_secret("sync.refresh_token", refresh)
+        _replace_sync_tokens(
+            access,
+            refresh,
+            expected_slot=credential_slot,
+            expected_refresh_token=refresh_token,
+        )
         return access
 
     def _authorized(self, path: str, *, method: str = "GET", body: dict | None = None) -> dict:
-        access = get_secret("sync.access_token")
+        access = _get_sync_secret("sync.access_token")
         if not isinstance(access, str):
             raise ValidationError("当前会话没有 access token；请重新登录同步")
         try:
@@ -586,7 +983,7 @@ class HttpSyncTransport:
     def _authorized_bytes(
         self, path: str, *, method: str = "GET", body: bytes | None = None
     ) -> bytes:
-        access = get_secret("sync.access_token")
+        access = _get_sync_secret("sync.access_token")
         if not isinstance(access, str):
             raise ValidationError("当前会话没有 access token；请重新登录同步")
         try:
@@ -1545,7 +1942,7 @@ def _sync_upload_assets(transport: SyncTransport, cipher: AccountCipher) -> tupl
         ).fetchall()
     for row in rows:
         try:
-            path = resolve_data_path(row["relative_path"])
+            path = resolve_managed_media_path(row["relative_path"])
             if not path.is_file():
                 raise ValidationError("受管资产文件缺失")
             digest = hashlib.sha256(path.read_bytes()).hexdigest()
@@ -1606,6 +2003,15 @@ def _sync_download_assets(transport: SyncTransport, cipher: AccountCipher) -> tu
         ).fetchall()
     for row in rows:
         try:
+            validate_payload(
+                "asset",
+                {
+                    "sha256": row["sha256"],
+                    "media_type": row["media_type"],
+                    "extension": row["extension"],
+                    "byte_count": row["byte_count"],
+                },
+            )
             blob_id = cipher.blob_id(row["id"])
             chunk_count = max(1, math.ceil(row["byte_count"] / BLOB_CHUNK_BYTES))
             plaintext_parts: list[bytes] = []
@@ -1621,24 +2027,35 @@ def _sync_download_assets(transport: SyncTransport, cipher: AccountCipher) -> tu
             plaintext = b"".join(plaintext_parts)
             if len(plaintext) != row["byte_count"] or hashlib.sha256(plaintext).hexdigest() != row["sha256"]:
                 raise ValidationError("下载资产哈希或大小不一致")
-            target = managed_asset_root() / f"{row['sha256']}{row['extension']}"
-            target.parent.mkdir(parents=True, exist_ok=True)
-            temporary = target.with_suffix(target.suffix + ".tmp")
-            temporary.write_bytes(plaintext)
-            os.replace(temporary, target)
-            relative = target.relative_to(app_home()).as_posix()
-            with connect() as connection:
-                connection.execute(
-                    "UPDATE managed_assets SET relative_path=?,external_reference=NULL,unresolved=0 WHERE id=?",
-                    (relative, row["id"]),
-                )
-                connection.execute(
-                    """INSERT INTO sync_asset_state(asset_id,blob_id,uploaded,downloaded,updated_at)
-                       VALUES(?,?,0,1,?) ON CONFLICT(asset_id) DO UPDATE SET
-                       blob_id=excluded.blob_id,downloaded=1,updated_at=excluded.updated_at""",
-                    (row["id"], blob_id, utc_now()),
-                )
-                _restore_asset_references(connection, row["id"], relative)
+            with process_data_lock():
+                home = app_home().resolve()
+                root = managed_asset_root()
+                root.mkdir(parents=True, exist_ok=True)
+                root = root.resolve()
+                try:
+                    root.relative_to(home)
+                except ValueError as exc:
+                    raise ValidationError("受管资产目录逃逸 MealCircuit 私人目录") from exc
+                target = (root / f"{row['sha256']}{row['extension']}").resolve()
+                if target.parent != root:
+                    raise ValidationError("资产目标逃逸受管资产目录")
+                target.parent.mkdir(parents=True, exist_ok=True)
+                temporary = target.with_suffix(target.suffix + ".tmp")
+                temporary.write_bytes(plaintext)
+                os.replace(temporary, target)
+                relative = target.relative_to(home).as_posix()
+                with connect() as connection:
+                    connection.execute(
+                        "UPDATE managed_assets SET relative_path=?,external_reference=NULL,unresolved=0 WHERE id=?",
+                        (relative, row["id"]),
+                    )
+                    connection.execute(
+                        """INSERT INTO sync_asset_state(asset_id,blob_id,uploaded,downloaded,updated_at)
+                           VALUES(?,?,0,1,?) ON CONFLICT(asset_id) DO UPDATE SET
+                           blob_id=excluded.blob_id,downloaded=1,updated_at=excluded.updated_at""",
+                        (row["id"], blob_id, utc_now()),
+                    )
+                    _restore_asset_references(connection, row["id"], relative)
             downloaded += 1
         except ValidationError as exc:
             errors.append(f"{row['id']}: {exc}")
@@ -1655,7 +2072,7 @@ def sync_now(
         ).fetchone()
         if not config or not config["enabled"]:
             raise ValidationError("同步尚未启用")
-        account_data_key = get_secret("sync.account_data_key", binary=True)
+        account_data_key = _get_sync_secret("sync.account_data_key", binary=True)
         if not isinstance(account_data_key, bytes):
             raise ValidationError("当前会话没有 Account Data Key；请重新解锁同步")
         cipher = AccountCipher(config["account_id"], account_data_key, config["key_version"])
@@ -1685,7 +2102,6 @@ def sync_now(
         "requeued_reviews": [],
         "cursor": 0,
     }
-    mirror_updates: list[DomainRevision] = []
     remote_daily_source_updates: list[DomainRevision] = []
     for _ in range(1000):
         operations = prepare_outbox(batch_limit)
@@ -1710,17 +2126,21 @@ def sync_now(
     for _ in range(100):
         pulled = active_transport.pull(cursor, limit=pull_limit, snapshot_offset=snapshot_offset)
         full_resync = full_resync or bool(pulled.get("requires_full_resync"))
-        with connect() as connection:
-            counts, updates, daily_source_updates = _process_pull(connection, cipher, pulled)
-            next_cursor = int(pulled.get("cursor", cursor))
-            if next_cursor < cursor:
-                raise ValidationError("同步服务游标倒退")
-            connection.execute(
-                """INSERT INTO sync_cursor(scope,cursor_value,updated_at) VALUES('account',?,?)
-                   ON CONFLICT(scope) DO UPDATE SET cursor_value=excluded.cursor_value,updated_at=excluded.updated_at""",
-                (next_cursor, utc_now()),
-            )
-        mirror_updates.extend(updates)
+        with process_data_lock():
+            with connect() as connection:
+                counts, updates, daily_source_updates = _process_pull(connection, cipher, pulled)
+                next_cursor = int(pulled.get("cursor", cursor))
+                if next_cursor < cursor:
+                    raise ValidationError("同步服务游标倒退")
+                connection.execute(
+                    """INSERT INTO sync_cursor(scope,cursor_value,updated_at) VALUES('account',?,?)
+                       ON CONFLICT(scope) DO UPDATE SET cursor_value=excluded.cursor_value,updated_at=excluded.updated_at""",
+                    (next_cursor, utc_now()),
+                )
+            if updates:
+                from .portable import _write_preferences
+
+                _write_preferences(updates)
         remote_daily_source_updates.extend(daily_source_updates)
         summary["applied"] += counts["applied"]
         summary["merged"] += counts["merged"]
@@ -1742,10 +2162,6 @@ def sync_now(
     summary["assets_uploaded"] = uploaded
     summary["assets_downloaded"] = downloaded
     summary["asset_errors"] = upload_errors + download_errors
-    if mirror_updates:
-        from .portable import _write_preferences
-
-        _write_preferences(mirror_updates)
     summary["cursor"] = cursor
     summary["full_resync"] = full_resync
     return summary
@@ -1879,7 +2295,7 @@ def _upload_rotation_assets(
 ) -> dict[str, str]:
     uploaded: dict[str, str] = {}
     for row in assets:
-        path = resolve_data_path(row["relative_path"])
+        path = resolve_managed_media_path(row["relative_path"])
         if not path.is_file() or path.stat().st_size != row["byte_count"]:
             raise ValidationError(f"密钥轮换无法读取资产：{row['id']}")
         if hashlib.sha256(path.read_bytes()).hexdigest() != row["sha256"]:
@@ -1897,23 +2313,58 @@ def _upload_rotation_assets(
     return uploaded
 
 
-def _finalize_local_rotation(target: int, material: dict, asset_ids: dict[str, str]) -> None:
-    set_secret("sync.account_data_key", material["account_data_key"])
-    with connect() as connection:
-        connection.execute(
-            "UPDATE sync_configuration SET key_version=?,updated_at=? WHERE singleton=1",
-            (target, utc_now()),
+def _finalize_local_rotation(
+    target: int,
+    material: dict,
+    asset_ids: dict[str, str],
+    *,
+    expected_account_id: str | None = None,
+    expected_key_version: int | None = None,
+    expected_slot: str | None | object = _CREDENTIAL_SLOT_UNSET,
+) -> None:
+    with process_data_lock():
+        with connect() as connection:
+            config = connection.execute(
+                "SELECT account_id,key_version FROM sync_configuration WHERE singleton=1"
+            ).fetchone()
+            current_slot = _active_credential_slot(connection)
+        if expected_account_id is not None and config["account_id"] != expected_account_id:
+            raise ValidationError("密钥轮换期间同步账户已改变；未覆盖当前凭据")
+        if expected_key_version is not None and int(config["key_version"]) != expected_key_version:
+            raise ValidationError("密钥轮换期间本地密钥版本已改变；未覆盖当前凭据")
+        if expected_slot is not _CREDENTIAL_SLOT_UNSET and current_slot != expected_slot:
+            raise ValidationError("密钥轮换期间同步凭据已改变；未覆盖当前凭据")
+        current = _current_sync_credentials()
+        slot, _ = _stage_sync_credentials(
+            material["account_data_key"],
+            current["access_token"],
+            current["refresh_token"],
         )
-        connection.execute("DELETE FROM sync_outbox")
-        connection.execute("DELETE FROM sync_shadow")
-        connection.execute("DELETE FROM sync_cursor")
-        connection.execute("DELETE FROM sync_asset_state")
-        for asset_id, blob_id in asset_ids.items():
-            connection.execute(
-                """INSERT INTO sync_asset_state(asset_id,blob_id,uploaded,downloaded,updated_at)
-                   VALUES(?,?,1,1,?)""",
-                (asset_id, blob_id, utc_now()),
-            )
+        try:
+            with connect() as connection:
+                from .domain_store import enqueue_all_heads
+
+                connection.execute(
+                    "UPDATE sync_configuration SET key_version=?,updated_at=? WHERE singleton=1",
+                    (target, utc_now()),
+                )
+                connection.execute("DELETE FROM sync_outbox")
+                connection.execute("DELETE FROM sync_shadow")
+                connection.execute("DELETE FROM sync_cursor")
+                connection.execute("DELETE FROM sync_asset_state")
+                for asset_id, blob_id in asset_ids.items():
+                    connection.execute(
+                        """INSERT INTO sync_asset_state(asset_id,blob_id,uploaded,downloaded,updated_at)
+                           VALUES(?,?,1,1,?)""",
+                        (asset_id, blob_id, utc_now()),
+                    )
+                enqueue_all_heads(connection)
+                _activate_credential_slot(connection, slot)
+        except Exception:
+            _discard_unactivated_credential_slot(slot)
+            raise
+        _cleanup_obsolete_credential_slots()
+        _cleanup_legacy_sync_credentials()
 
 
 def prepare_account_key_rotation(transport: HttpSyncTransport | None = None) -> dict:
@@ -1950,7 +2401,9 @@ def confirm_account_key_rotation(
 ) -> dict:
     """Confirm the displayed recovery key, upload the new epoch, and commit it."""
     init_db()
-    status = sync_status()
+    with process_data_lock():
+        status = sync_status()
+        expected_slot = _active_credential_slot()
     if not status.get("enabled"):
         raise ValidationError("同步尚未启用")
     active_transport = transport or HttpSyncTransport(str(status["server_url"]))
@@ -1986,7 +2439,14 @@ def confirm_account_key_rotation(
             commit_result = active_transport.commit_key_rotation(body)
     else:
         commit_result = {"active_key_version": target, "already_committed": True}
-    _finalize_local_rotation(target, material, asset_ids)
+    _finalize_local_rotation(
+        target,
+        material,
+        asset_ids,
+        expected_account_id=str(status["account_id"]),
+        expected_key_version=int(status["key_version"]),
+        expected_slot=expected_slot,
+    )
     recovery_key = material["recovery_key"]
     _clear_rotation_material()
     post_sync = sync_now(active_transport)
@@ -2047,58 +2507,59 @@ def resolve_conflict(conflict_id: str, choice: str) -> dict:
         raise ValidationError("冲突选择只能是 local 或 remote")
     init_db()
     mirror: DomainRevision | None = None
-    with connect() as connection:
-        row = connection.execute(
-            "SELECT * FROM sync_conflicts WHERE id=? AND status='unresolved'", (conflict_id,)
-        ).fetchone()
-        if row is None:
-            raise KeyError(conflict_id)
-        local = validate_revision(json.loads(row["local_revision_json"]))
-        remote = validate_revision(json.loads(row["remote_revision_json"]))
-        selected = local if choice == "local" else remote
-        device_id = connection.execute(
-            "SELECT value FROM app_metadata WHERE key='device_id'"
-        ).fetchone()[0]
-        if local.entity_id != remote.entity_id and _logical_key(local) == _logical_key(remote):
-            remote_version = _shadow_version(connection, remote.entity_id)
-            resolved = _commit_logical_merge(
-                connection,
-                local=local,
-                remote=remote,
-                payload=selected.payload,
-                remote_server_version=remote_version,
-                deleted=selected.deleted,
-            )
-        else:
-            resolved = make_revision(
-                local.entity_kind,
-                selected.payload,
-                entity_id=local.entity_id,
-                parent_revision_ids=[local.revision_id, remote.revision_id],
-                author_device_id=device_id,
-                deleted=selected.deleted,
-            )
-            from .domain_store import materialize_revision
-
-            _store_revision(connection, resolved)
-            _set_head(connection, resolved)
-            materialize_revision(connection, resolved)
-            shadow = connection.execute(
-                "SELECT server_version FROM sync_shadow WHERE entity_id=?", (local.entity_id,)
+    with process_data_lock():
+        with connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM sync_conflicts WHERE id=? AND status='unresolved'", (conflict_id,)
             ).fetchone()
-            _queue_revision(connection, resolved, int(shadow[0]) if shadow else 0)
-        connection.execute(
-            "UPDATE sync_conflicts SET status='resolved',resolved_at=? WHERE id=?",
-            (utc_now(), conflict_id),
-        )
-        connection.execute(
-            "UPDATE entity_heads SET conflicted=0 WHERE entity_id IN (?,?)",
-            (local.entity_id, remote.entity_id),
-        )
-        if resolved.entity_kind == "preferences":
-            mirror = resolved
-    if mirror:
-        from .portable import _write_preferences
+            if row is None:
+                raise KeyError(conflict_id)
+            local = validate_revision(json.loads(row["local_revision_json"]))
+            remote = validate_revision(json.loads(row["remote_revision_json"]))
+            selected = local if choice == "local" else remote
+            device_id = connection.execute(
+                "SELECT value FROM app_metadata WHERE key='device_id'"
+            ).fetchone()[0]
+            if local.entity_id != remote.entity_id and _logical_key(local) == _logical_key(remote):
+                remote_version = _shadow_version(connection, remote.entity_id)
+                resolved = _commit_logical_merge(
+                    connection,
+                    local=local,
+                    remote=remote,
+                    payload=selected.payload,
+                    remote_server_version=remote_version,
+                    deleted=selected.deleted,
+                )
+            else:
+                resolved = make_revision(
+                    local.entity_kind,
+                    selected.payload,
+                    entity_id=local.entity_id,
+                    parent_revision_ids=[local.revision_id, remote.revision_id],
+                    author_device_id=device_id,
+                    deleted=selected.deleted,
+                )
+                from .domain_store import materialize_revision
 
-        _write_preferences([mirror])
+                _store_revision(connection, resolved)
+                _set_head(connection, resolved)
+                materialize_revision(connection, resolved)
+                shadow = connection.execute(
+                    "SELECT server_version FROM sync_shadow WHERE entity_id=?", (local.entity_id,)
+                ).fetchone()
+                _queue_revision(connection, resolved, int(shadow[0]) if shadow else 0)
+            connection.execute(
+                "UPDATE sync_conflicts SET status='resolved',resolved_at=? WHERE id=?",
+                (utc_now(), conflict_id),
+            )
+            connection.execute(
+                "UPDATE entity_heads SET conflicted=0 WHERE entity_id IN (?,?)",
+                (local.entity_id, remote.entity_id),
+            )
+            if resolved.entity_kind == "preferences":
+                mirror = resolved
+        if mirror:
+            from .portable import _write_preferences
+
+            _write_preferences([mirror])
     return {"id": conflict_id, "status": "resolved", "choice": choice, "revision_id": resolved.revision_id}

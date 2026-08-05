@@ -2,22 +2,38 @@ from __future__ import annotations
 
 import base64
 import json
-import mimetypes
 import os
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any, Callable
 
 from .meal_modes import legacy_home_meal_modes
-from .secret_store import backend_status, delete_secret, get_secret, set_secret
+from .secret_store import delete_secret, get_secret
+from .storage import resolve_managed_media_path
 from .validation import ValidationError
 
 
 SUPPORTED_PROVIDERS = {"openai", "anthropic", "deepseek"}
+LEGACY_AI_SECRET_NAMES = (
+    "ai.provider",
+    "ai.model",
+    "ai.key.openai",
+    "ai.key.anthropic",
+    "ai.key.deepseek",
+)
 DEFAULT_TIMEOUT_SECONDS = 120
 DEFAULT_MAX_OUTPUT_TOKENS = 8192
+MAX_PROVIDER_RESPONSE_BYTES = 8 * 1024 * 1024
+MAX_PROVIDER_ERROR_BYTES = 64 * 1024
+MAX_IMAGE_BYTES = 10 * 1024 * 1024
+IMAGE_MEDIA_TYPES = {
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+}
 
 
 @dataclass(frozen=True)
@@ -42,8 +58,8 @@ Transport = Callable[[str, dict[str, str], dict, int], dict]
 
 
 def ai_status() -> dict:
-    provider = _configured_value("MEALCIRCUIT_AI_PROVIDER", "ai.provider").lower()
-    model = _configured_value("MEALCIRCUIT_AI_MODEL", "ai.model")
+    provider = _configured_value("MEALCIRCUIT_AI_PROVIDER").lower()
+    model = _configured_value("MEALCIRCUIT_AI_MODEL")
     key_name = _key_name(provider) if provider in SUPPORTED_PROVIDERS else None
     return {
         "provider": provider or None,
@@ -51,10 +67,8 @@ def ai_status() -> dict:
         "provider_valid": provider in SUPPORTED_PROVIDERS,
         "model_configured": bool(model),
         "key_name": key_name,
-        "key_configured": bool(
-            key_name and (os.environ.get(key_name) or get_secret(f"ai.key.{provider}"))
-        ),
-        "secure_storage": backend_status(),
+        "key_configured": bool(key_name and os.environ.get(key_name)),
+        "secure_storage": "process",
         "timeout_seconds": _int_environment("MEALCIRCUIT_AI_TIMEOUT_SECONDS", DEFAULT_TIMEOUT_SECONDS),
         "max_output_tokens": _int_environment("MEALCIRCUIT_AI_MAX_OUTPUT_TOKENS", DEFAULT_MAX_OUTPUT_TOKENS),
         "stage_models": {
@@ -66,18 +80,18 @@ def ai_status() -> dict:
 
 
 def load_config() -> AIConfig:
-    provider = _configured_value("MEALCIRCUIT_AI_PROVIDER", "ai.provider").lower()
+    provider = _configured_value("MEALCIRCUIT_AI_PROVIDER").lower()
     if not provider:
         raise ValidationError("缺少 MEALCIRCUIT_AI_PROVIDER；可选 openai、anthropic 或 deepseek")
     if provider not in SUPPORTED_PROVIDERS:
         raise ValidationError("MEALCIRCUIT_AI_PROVIDER 只能是 openai、anthropic 或 deepseek")
-    model = _configured_value("MEALCIRCUIT_AI_MODEL", "ai.model")
+    model = _configured_value("MEALCIRCUIT_AI_MODEL")
     if not model:
         raise ValidationError("缺少 MEALCIRCUIT_AI_MODEL；请明确填写要使用的模型名")
     key_name = _key_name(provider)
-    api_key = (os.environ.get(key_name) or get_secret(f"ai.key.{provider}") or "").strip()
+    api_key = (os.environ.get(key_name) or "").strip()
     if not api_key:
-        raise ValidationError(f"缺少 {key_name}；请使用环境变量或系统安全存储")
+        raise ValidationError(f"缺少 {key_name}；请在当前进程环境中配置")
     return AIConfig(
         provider=provider,
         model=model,
@@ -172,28 +186,41 @@ def clear_runtime() -> dict:
 
 
 def store_secure_config(provider: str, model: str, api_key: str) -> dict:
-    clean_provider = str(provider or "").strip().lower()
-    clean_model = str(model or "").strip()
-    clean_key = str(api_key or "").strip()
-    if clean_provider not in SUPPORTED_PROVIDERS or not clean_model or not clean_key:
-        raise ValidationError("供应商、模型名和 API Key 都必须有效")
-    backends = {
-        set_secret("ai.provider", clean_provider),
-        set_secret("ai.model", clean_model),
-        set_secret(f"ai.key.{clean_provider}", clean_key),
+    raise ValidationError(
+        "持久化模型配置已禁用；请通过 Web 设置或环境变量只在当前进程中配置 provider、模型和 API Key"
+    )
+
+
+def clear_legacy_credentials() -> dict:
+    provider = str(get_secret("ai.provider") or "")
+    failed: list[str] = []
+    for name in LEGACY_AI_SECRET_NAMES:
+        try:
+            deleted = delete_secret(name)
+        except Exception:
+            deleted = False
+        if not deleted:
+            failed.append(name)
+    if failed:
+        raise ValidationError(
+            "旧版持久化模型凭据未能完全删除，请重试并检查系统凭据存储："
+            + "、".join(failed)
+        )
+    return {
+        "cleared": True,
+        "legacy_credentials": True,
+        "previous_provider": provider or None,
+        **ai_status(),
     }
-    return {"stored": True, "backend": "system" if backends == {"system"} else "session", **ai_status()}
 
 
 def clear_secure_config() -> dict:
-    provider = str(get_secret("ai.provider") or "")
-    for name in ("ai.provider", "ai.model", *(f"ai.key.{item}" for item in SUPPORTED_PROVIDERS)):
-        delete_secret(name)
-    return {"cleared": True, "previous_provider": provider or None, **ai_status()}
+    """Backward-compatible alias for deleting credentials written by older releases."""
+    return clear_legacy_credentials()
 
 
-def _configured_value(environment: str, secret: str) -> str:
-    return str(os.environ.get(environment) or get_secret(secret) or "").strip()
+def _configured_value(environment: str) -> str:
+    return str(os.environ.get(environment) or "").strip()
 
 
 def generate_json(context: dict, kind: str, client: "AIProvider | None" = None) -> dict:
@@ -598,14 +625,46 @@ def _daily_json_schema(nutrition: dict, home_cooking: bool, meal_modes: dict | N
     }
 
 
+class _RejectRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise ValidationError("模型 API 响应包含重定向，已拒绝继续请求")
+
+
+def _read_limited_response(stream, limit: int, label: str) -> bytes:
+    content_length = getattr(stream, "headers", {}).get("Content-Length")
+    if content_length:
+        try:
+            declared_length = int(content_length)
+        except (TypeError, ValueError):
+            declared_length = None
+        if declared_length is not None and declared_length > limit:
+            raise ValidationError(f"{label}超过 {limit} 字节上限")
+    raw = stream.read(limit + 1)
+    if len(raw) > limit:
+        raise ValidationError(f"{label}超过 {limit} 字节上限")
+    return raw
+
+
 def _post_json(url: str, headers: dict[str, str], payload: dict, timeout: int) -> dict:
     data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     request = urllib.request.Request(url, data=data, headers=headers, method="POST")
+    opener = urllib.request.build_opener(_RejectRedirectHandler())
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            raw = response.read().decode("utf-8")
+        with opener.open(request, timeout=timeout) as response:
+            raw = _read_limited_response(
+                response,
+                MAX_PROVIDER_RESPONSE_BYTES,
+                "模型 API 成功响应",
+            ).decode("utf-8")
     except urllib.error.HTTPError as exc:
-        details = exc.read().decode("utf-8", errors="replace")
+        try:
+            details = _read_limited_response(
+                exc,
+                MAX_PROVIDER_ERROR_BYTES,
+                "模型 API 错误响应",
+            ).decode("utf-8", errors="replace")
+        except ValidationError:
+            details = "错误响应正文超过安全上限"
         raise ValidationError(f"模型 API 请求失败：HTTP {exc.code} {details[:500]}") from exc
     except (urllib.error.URLError, TimeoutError) as exc:
         raise ValidationError(f"模型 API 请求失败：{exc}") from exc
@@ -718,36 +777,55 @@ def _user_prompt(request: GenerationRequest) -> str:
 
 
 def _image_data_url(path: str) -> str:
-    image_path = Path(path)
-    media_type = _media_type(image_path)
-    data = base64.b64encode(image_path.read_bytes()).decode("ascii")
-    return f"data:{media_type};base64,{data}"
+    data, media_type = _read_managed_image(path)
+    encoded = base64.b64encode(data).decode("ascii")
+    return f"data:{media_type};base64,{encoded}"
 
 
 def _anthropic_image_block(path: str) -> dict:
-    image_path = Path(path)
+    data, media_type = _read_managed_image(path)
     return {
         "type": "image",
         "source": {
             "type": "base64",
-            "media_type": _media_type(image_path),
-            "data": base64.b64encode(image_path.read_bytes()).decode("ascii"),
+            "media_type": media_type,
+            "data": base64.b64encode(data).decode("ascii"),
         },
     }
 
 
-def _media_type(path: Path) -> str:
-    guessed = mimetypes.guess_type(path.name)[0]
-    if guessed in {"image/jpeg", "image/png", "image/gif", "image/webp"}:
-        return guessed
-    suffix = path.suffix.lower()
-    return {
-        ".jpg": "image/jpeg",
-        ".jpeg": "image/jpeg",
-        ".png": "image/png",
-        ".gif": "image/gif",
-        ".webp": "image/webp",
-    }.get(suffix, "application/octet-stream")
+def _detected_image_media_type(data: bytes) -> str | None:
+    if data.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if data.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
+    if data.startswith(b"RIFF") and data[8:12] == b"WEBP":
+        return "image/webp"
+    return None
+
+
+def _read_managed_image(path: str) -> tuple[bytes, str]:
+    try:
+        image_path = resolve_managed_media_path(path)
+        size = image_path.stat().st_size
+    except (FileNotFoundError, OSError, ValidationError) as exc:
+        raise ValidationError("图片必须来自 MealCircuit 受管媒体目录") from exc
+    if size <= 0 or size > MAX_IMAGE_BYTES:
+        raise ValidationError("图片为空或超过 10MB 上限")
+    try:
+        with image_path.open("rb") as stream:
+            data = stream.read(MAX_IMAGE_BYTES + 1)
+    except OSError as exc:
+        raise ValidationError("无法读取受管图片") from exc
+    if len(data) != size or len(data) > MAX_IMAGE_BYTES:
+        raise ValidationError("图片读取异常或超过 10MB 上限")
+    suffix_type = IMAGE_MEDIA_TYPES.get(image_path.suffix.lower())
+    detected_type = _detected_image_media_type(data)
+    if suffix_type is None or detected_type != suffix_type:
+        raise ValidationError("图片必须是内容与扩展名一致的 JPEG、PNG、GIF 或 WebP")
+    return data, detected_type
 
 
 def _openai_text(response: dict) -> str:

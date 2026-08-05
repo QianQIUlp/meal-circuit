@@ -12,6 +12,7 @@ from . import ai, professional
 from .db import connect, init_db, row_dict
 from .domain import new_id, utc_now
 from .personalization import active_personalization, require_generation
+from .storage import background_data_operation
 from .validation import ValidationError
 
 
@@ -35,6 +36,19 @@ LOW_RISK_EFFECT_KEYS = {
     "ranking", "portion", "flavor", "complexity", "communication", "alternatives",
     "budget", "availability", "defaults",
 }
+_HIGH_IMPACT_CLAIM_MARKERS = (
+    "过敏", "禁忌", "不耐受", "疾病", "诊断", "药", "用药", "药物", "处方", "剂量",
+    "孕", "怀孕", "孕期", "哺乳", "未成年", "治疗", "医生", "临床", "热量",
+    "卡路里", "蛋白目标", "营养目标", "减重目标", "永远不吃", "完全不吃",
+    "永久不吃", "完全排除", "清零主食", "allerg", "anaphylaxis", "intoleran",
+    "disease", "diagnos", "medical", "health condition", "medicine", "medication",
+    "drug", "prescription", "dosage", "insulin", "diabetes", "hypertension", "renal",
+    "kidney", "liver", "pregnan", "breastfeed", "lactation", "minor", "clinician",
+    "doctor", "therapeutic", "eating disorder", "calorie", "kcal", "energy target",
+    "protein target", "protein goal", "nutrition", "nutritional", "macronutrient",
+    "macro target", "weight-loss target", "weight loss target", "zero carbohydrate",
+    "zero carb", "cut carbohydrates", "eliminate carbohydrates", "fasting",
+)
 CLAIM_TYPES = {
     "confirmed_fact", "stable_preference", "soft_need_hypothesis", "friction_hypothesis",
     "body_response_hypothesis", "causal_hypothesis", "interaction_preference", "temporary_state",
@@ -509,11 +523,12 @@ def _effective_confidence(claim: dict) -> float:
 
 
 def _risk_level(claim_type: str, statement: str, proposed: str) -> str:
-    high_tokens = (
-        "过敏", "禁忌", "疾病", "药", "孕", "哺乳", "未成年", "热量", "卡路里",
-        "蛋白目标", "减重目标", "治疗", "医生", "永远不吃", "完全排除",
-    )
-    if claim_type == "confirmed_fact" or proposed == "high" or any(token in statement for token in high_tokens):
+    normalized = str(statement or "").casefold()
+    if (
+        claim_type == "confirmed_fact"
+        or proposed == "high"
+        or any(marker.casefold() in normalized for marker in _HIGH_IMPACT_CLAIM_MARKERS)
+    ):
         return "high"
     return "low"
 
@@ -1710,8 +1725,6 @@ def _learn_candidates(
     run_id: str,
     *,
     allowed_evidence_ids: set[str] | None = None,
-    default_evidence_id: str | None = None,
-    explicit_default: bool = False,
 ) -> None:
     if not isinstance(candidates, list):
         return
@@ -1723,9 +1736,10 @@ def _learn_candidates(
             str(value) for value in item.get("evidence_ids") or []
             if str(value) in allowed_evidence_ids
         ]
-        if not evidence_ids and default_evidence_id:
-            evidence_ids = [default_evidence_id]
-        evidence_type = "agent_workspace_event" if evidence_ids else "agent_hypothesis"
+        # Model-selected evidence references are useful provenance, but they do not
+        # prove that the model's interpretation was explicitly stated by the user.
+        # Keep every model-generated candidate non-actionable until a deterministic
+        # signal or an explicit user confirmation supports it.
         evidence_ids = evidence_ids or [run_id]
         try:
             for evidence_id in evidence_ids:
@@ -1734,14 +1748,12 @@ def _learn_candidates(
                     statement=str(item.get("statement") or ""),
                     scope=item.get("scope") if isinstance(item.get("scope"), dict) else {},
                     effect=item.get("planning_effect") if isinstance(item.get("planning_effect"), dict) else {},
-                    evidence_type=evidence_type, evidence_id=evidence_id,
+                    evidence_type="agent_hypothesis", evidence_id=evidence_id,
                     excerpt=str(item.get("evidence_summary") or "")[:1000],
-                    explicit=(
-                        evidence_type == "agent_workspace_event"
-                        and (explicit_default or bool(item.get("explicit_user_statement")))
-                    ),
-                    proposed_risk=str(item.get("risk_level") or "low"),
+                    explicit=False,
+                    proposed_risk="low",
                     valid_until=item.get("valid_until"),
+                    source="agent_inference",
                 )
         except ValidationError:
             continue
@@ -3438,9 +3450,9 @@ def run_longitudinal_reflection(client: ai.AIProvider | None = None) -> dict:
             upsert_claim(
                 claim_type=str(item.get("claim_type") or "soft_need_hypothesis"),
                 statement=str(item.get("statement") or ""), scope=item.get("scope") or {},
-                effect=item.get("planning_effect") or {}, evidence_type="longitudinal_evidence",
+                effect=item.get("planning_effect") or {}, evidence_type="agent_hypothesis",
                 evidence_id=evidence_id, excerpt=str(item.get("evidence_summary") or ""),
-                explicit=False, proposed_risk=str(item.get("risk_level") or "low"),
+                explicit=False, proposed_risk="low",
                 valid_until=item.get("valid_until"), source="longitudinal_reflection",
             )
     timestamp = _now()
@@ -3465,7 +3477,8 @@ def schedule_reflection_if_due() -> dict:
 
     def worker() -> None:
         try:
-            run_longitudinal_reflection()
+            with background_data_operation():
+                run_longitudinal_reflection()
         except Exception:
             pass
 
@@ -3495,7 +3508,8 @@ def schedule_auto_draft(review_date: str, *, delay_seconds: float = 30.0, force:
 
     def worker() -> None:
         try:
-            run_agent_draft(review_date, force=force)
+            with background_data_operation():
+                run_agent_draft(review_date, force=force)
         except Exception:
             pass
         finally:
