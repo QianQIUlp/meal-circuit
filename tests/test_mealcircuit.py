@@ -1533,75 +1533,75 @@ class RenderContractTest(unittest.TestCase):
     def test_fact_only_task_results_render_without_advisory_fields(self):
         photo = {
             "analysis_mode": "fact_only",
-            "summary": "åªè®°å½•å¯è§äº‹å®ž",
+            "summary": "只记录可见事实",
             "candidates": [{
-                "name": "é¸¡è›‹",
-                "portion_range": "1â€“2 ä¸ª",
+                "name": "鸡蛋",
+                "portion_range": "1–2 个",
                 "nutrition": self.nutrition(),
                 "confidence": 0.8,
             }],
-            "unknowns": ["æ²¹é‡æœªçŸ¥"],
+            "unknowns": ["油量未知"],
         }
         material = {
             "analysis_mode": "fact_only",
-            "summary": "åªè®°å½•å¯è§äº‹å®ž",
-            "observed_items": ["é¸¡è›‹ 2 ä¸ª"],
+            "summary": "只记录可见事实",
+            "observed_items": ["鸡蛋 2 个"],
             "batch_nutrition": self.nutrition(),
             "per_serving_nutrition": self.nutrition(),
-            "gaps": ["å“ç‰ŒæœªçŸ¥"],
-            "risks": ["è°ƒå‘³é‡æœªçŸ¥"],
-            "unknowns": ["çƒ¹è°ƒæ²¹æœªçŸ¥"],
+            "gaps": ["品牌未知"],
+            "risks": ["调味量未知"],
+            "unknowns": ["烹调油未知"],
         }
         validate_result("photo", photo, fact_only=True)
         validate_result("material", material, fact_only=True)
         photo_page = web_server.render_result("photo", photo)
         material_page = web_server.render_result("material", material)
-        self.assertIn("åªè®°å½•å¯è§äº‹å®ž", photo_page)
-        self.assertIn("é¸¡è›‹", photo_page)
-        self.assertIn("æ²¹é‡æœªçŸ¥", photo_page)
-        self.assertNotIn("ç»¼åˆå»ºè®®", photo_page)
-        for text in ("é¸¡è›‹ 2 ä¸ª", "å“ç‰ŒæœªçŸ¥", "è°ƒå‘³é‡æœªçŸ¥", "çƒ¹è°ƒæ²¹æœªçŸ¥", "æ•´æ‰¹è¥å…»ä¼°ç®—", "å•ä»½è¥å…»ä¼°ç®—"):
+        self.assertIn("只记录可见事实", photo_page)
+        self.assertIn("鸡蛋", photo_page)
+        self.assertIn("油量未知", photo_page)
+        self.assertNotIn("综合建议", photo_page)
+        for text in ("鸡蛋 2 个", "品牌未知", "调味量未知", "烹调油未知", "整批营养估算", "单份营养估算"):
             self.assertIn(text, material_page)
-        self.assertNotIn("å¯åšç»„åˆ / èœå“æ–¹å‘", material_page)
-        self.assertNotIn("æœ€å°è°ƒæ•´", material_page)
+        self.assertNotIn("可做组合 / 菜品方向", material_page)
+        self.assertNotIn("最小调整", material_page)
 
     def test_historical_advisory_results_keep_advisory_fields_and_titles(self):
         photo = {
-            "summary": "å®Œæ•´åˆ†æžç»“æžœ",
+            "summary": "完整分析结果",
             "candidates": [{
-                "name": "ç±³é¥­",
-                "portion_range": "åŠç¢—",
+                "name": "米饭",
+                "portion_range": "半碗",
                 "nutrition": self.nutrition(),
                 "confidence": 0.9,
             }],
             "unknowns": [],
-            "advice": ["æŒ‰å½“å‰ä»½é‡è®°å½•"],
+            "advice": ["按当前份量记录"],
         }
         material = {
-            "summary": "å®Œæ•´åŽŸææ–™åˆ†æž",
-            "combinations": ["ç±³é¥­é…é¸¡è›‹"],
+            "summary": "完整原材料分析",
+            "combinations": ["米饭配鸡蛋"],
             "batch_nutrition": self.nutrition(),
             "per_serving_nutrition": self.nutrition(),
             "gaps": [],
             "risks": [],
-            "minimal_adjustments": ["è¡¥å……è”¬èœ"],
+            "minimal_adjustments": ["补充蔬菜"],
         }
         validate_result("photo", photo)
         validate_result("material", material)
         photo_page = web_server.render_result("photo", photo)
         material_page = web_server.render_result("material", material)
-        self.assertIn("ç»¼åˆå»ºè®®", photo_page)
-        self.assertIn("æŒ‰å½“å‰ä»½é‡è®°å½•", photo_page)
-        self.assertIn("å¯åšç»„åˆ / èœå“æ–¹å‘", material_page)
-        self.assertIn("æœ€å°è°ƒæ•´", material_page)
-        self.assertIn("è¡¥å……è”¬èœ", material_page)
+        self.assertIn("综合建议", photo_page)
+        self.assertIn("按当前份量记录", photo_page)
+        self.assertIn("可做组合 / 菜品方向", material_page)
+        self.assertIn("最小调整", material_page)
+        self.assertIn("补充蔬菜", material_page)
 
     def test_daily_review_render_allows_unknown_protein_target(self):
         result = daily_review_result(date.today().isoformat())
         result["tomorrow_menu"]["protein_target_g"] = None
         validate_daily_review_result(result)
         page = web_server.render_daily_review_result(result)
-        self.assertIn("è›‹ç™½ç›®æ ‡ æœªçŸ¥", page)
+        self.assertIn("蛋白目标 未知", page)
 
 
 class WebAppTest(unittest.TestCase):

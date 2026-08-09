@@ -1,5 +1,11 @@
 # 开发过程记忆
 
+## 2026-08-09：Web RenderContract UTF-8 index 修复
+
+- 改动：仅将 `RenderContractTest` 的 mojibake 字符串恢复为当前工作树中的正确 UTF-8 字节；未修改 `server.py`，也未将独立的 `AndroidBoundaryTest` 纳入 index。
+- 验证：Python 3.13.14、uv 0.8.22 的隔离 staged-tree 中，RenderContract 3 项、photo/material 3 项、AdaptiveDomain fact-only 1 项、`compileall` 和 `git diff --check` 均退出 0；测试文件 SHA-256 为 `ee476cca2795820e968649f343515cdbee4ba555f3cbab33afbfb3e4c24c291b`，RenderContract 片段 SHA-256 为 `d4862e9cba278e489c456b48a765d4c12b616420c5e10e0d1695f774f20b62a1`。
+- 限制：提交后需从最终 HEAD 隔离导出复核同一专项矩阵；AndroidBoundaryTest 仍作为原有未暂存改动保留。
+
 ## 2026-08-09：依赖规范锁与 canonical OpenAPI checkpoint
 
 - 改动：提交 `7e14d8e` 使用 uv 0.8.22 从 HEAD 机械生成规范锁并升级 `cryptography` 到 50.0.0；随后提交 canonical OpenAPI 生成器、环境污染专项回归和生成件。
