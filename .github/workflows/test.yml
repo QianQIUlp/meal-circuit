@@ -121,6 +121,15 @@ jobs:
       - run: sdkmanager "platforms;android-36" "build-tools;36.0.0"
       - run: ./gradlew --no-daemon -PmealcircuitVersion="${{ needs.contract.outputs.version }}" testDebugUnitTest assembleDebug lintDebug compileDebugAndroidTestKotlin
         working-directory: android
+      - name: Verify debug APK version
+        shell: bash
+        env:
+          EXPECTED_VERSION: ${{ needs.contract.outputs.version }}
+        run: |
+          IFS=. read -r major minor patch <<< "$EXPECTED_VERSION"
+          expected_code=$((major * 1000000 + minor * 10000 + patch))
+          "$ANDROID_HOME/build-tools/36.0.0/aapt" dump badging android/app/build/outputs/apk/debug/app-debug.apk \
+            | grep -F "versionCode='$expected_code' versionName='$EXPECTED_VERSION'"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: android-debug-apk

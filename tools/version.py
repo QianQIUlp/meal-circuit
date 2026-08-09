@@ -2,11 +2,16 @@ from __future__ import annotations
 
 import argparse
 import re
+import sys
 import tomllib
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+SEMVER = re.compile(r"^(?P<major>\d+)\.(?P<minor>\d+)\.(?P<patch>\d+)$")
+sys.path.insert(0, str(ROOT))
+
+from mealcircuit import __version__
 
 
 def project_version() -> str:
@@ -14,12 +19,26 @@ def project_version() -> str:
         return tomllib.load(handle)["project"]["version"]
 
 
+def android_version_code(version: str) -> int:
+    match = SEMVER.fullmatch(version)
+    if match is None:
+        raise ValueError(f"invalid project version: {version}")
+    code = (
+        int(match.group("major")) * 1_000_000
+        + int(match.group("minor")) * 10_000
+        + int(match.group("patch"))
+    )
+    if code > 2_147_483_647:
+        raise ValueError(f"Android versionCode exceeds Int.MAX_VALUE: {code}")
+    return code
+
+
 def check(tag: str | None = None, output: Path | None = None) -> str:
     version = project_version()
     if not re.fullmatch(r"\d+\.\d+\.\d+", version):
         raise SystemExit(f"invalid project version: {version}")
-    package_version = (ROOT / "mealcircuit" / "__init__.py").read_text(encoding="utf-8")
-    if f'__version__ = "{version}"' not in package_version:
+    android_version_code(version)
+    if __version__ != version:
         raise SystemExit("mealcircuit.__version__ does not match pyproject.toml")
     if tag and tag.startswith("v") and tag[1:] != version:
         raise SystemExit(f"Git tag {tag} does not match project version {version}")

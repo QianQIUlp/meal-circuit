@@ -333,6 +333,15 @@ jobs:
           MEALCIRCUIT_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
           MEALCIRCUIT_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: ./gradlew --no-daemon -PmealcircuitVersion="$VERSION" testDebugUnitTest lintRelease assembleRelease bundleRelease
+      - name: Verify release APK version
+        shell: bash
+        env:
+          EXPECTED_VERSION: ${{ needs.contract.outputs.version }}
+        run: |
+          IFS=. read -r major minor patch <<< "$EXPECTED_VERSION"
+          expected_code=$((major * 1000000 + minor * 10000 + patch))
+          "$ANDROID_HOME/build-tools/36.0.0/aapt" dump badging android/app/build/outputs/apk/release/app-release.apk \
+            | grep -F "versionCode='$expected_code' versionName='$EXPECTED_VERSION'"
       - name: Verify Android signatures when configured
         if: env.ANDROID_SIGNING_AVAILABLE == 'true'
         env:

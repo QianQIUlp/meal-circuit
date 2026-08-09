@@ -12,6 +12,15 @@ val releaseKeystore = System.getenv("MEALCIRCUIT_KEYSTORE_PATH")
 val releaseKeyAlias = System.getenv("MEALCIRCUIT_KEY_ALIAS")
 val releaseStorePassword = System.getenv("MEALCIRCUIT_KEYSTORE_PASSWORD")
 val releaseKeyPassword = System.getenv("MEALCIRCUIT_KEY_PASSWORD")
+val mealCircuitVersion = providers.gradleProperty("mealcircuitVersion").orNull
+    ?: error("mealcircuitVersion Gradle property is required")
+val mealCircuitVersionParts = Regex("^(\\d+)\\.(\\d+)\\.(\\d+)$").matchEntire(mealCircuitVersion)
+    ?: error("mealcircuitVersion must be SemVer MAJOR.MINOR.PATCH")
+val mealCircuitVersionCode = (
+    mealCircuitVersionParts.groupValues[1].toLong() * 1_000_000L
+        + mealCircuitVersionParts.groupValues[2].toLong() * 10_000L
+        + mealCircuitVersionParts.groupValues[3].toLong()
+).also { require(it <= Int.MAX_VALUE) { "mealcircuitVersion produces an invalid Android versionCode" } }.toInt()
 
 android {
     namespace = "org.mealcircuit.app"
@@ -22,8 +31,8 @@ android {
         applicationId = "org.mealcircuit.app"
         minSdk = 26
         targetSdk = 36
-        versionCode = 30000
-        versionName = "0.3.0"
+        versionCode = mealCircuitVersionCode
+        versionName = mealCircuitVersion
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables.useSupportLibrary = true
     }

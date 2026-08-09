@@ -17,6 +17,7 @@ import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.longOrNull
 import kotlinx.serialization.json.put
+import org.mealcircuit.app.BuildConfig
 import org.mealcircuit.app.data.DomainRepository
 import org.mealcircuit.app.data.ManagedAssetEntity
 import org.mealcircuit.app.data.SyncConflictEntity
@@ -444,7 +445,7 @@ class PortableData(
             put("format", "mealcircuit.portable")
             put("format_version", 1)
             put("domain_schema_version", 1)
-            put("application_version", "0.3.0")
+            put("application_version", BuildConfig.VERSION_NAME)
             put("created_at", Instant.now().toString())
             put("entity_heads", json.parseToJsonElement(json.encodeToString(heads)))
             put("content", buildJsonObject {

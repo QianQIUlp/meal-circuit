@@ -48,9 +48,10 @@ def check_android() -> None:
     if not match:
         raise SystemExit("Gradle distribution SHA-256 is missing")
     build = (ROOT / "android" / "app" / "build.gradle.kts").read_text()
-    if re.search(r'"[^"\n]*\+[^"\n]*"', build) or "SNAPSHOT" in build:
+    coordinates = re.findall(r'(?:implementation|ksp|testImplementation|androidTestImplementation)\("([^"]+)"\)', build)
+    if any("+" in coordinate or "SNAPSHOT" in coordinate for coordinate in coordinates):
         raise SystemExit("Android dependencies must not use dynamic or snapshot versions")
-    for coordinate in re.findall(r'(?:implementation|ksp|testImplementation|androidTestImplementation)\("([^"]+)"\)', build):
+    for coordinate in coordinates:
         if coordinate.startswith("androidx.compose."):
             continue
         if coordinate.count(":") < 2:
@@ -77,6 +78,41 @@ def check_uv_lock() -> set[str]:
     if missing:
         raise SystemExit(f"uv.lock is missing resolved packages: {sorted(missing)}")
     return {"jsonschema", "pip-audit", "setuptools", "uv"}
+
+
+def check_version_sources() -> None:
+    version_tool = ROOT / "tools" / "version.py"
+    if not version_tool.is_file():
+        raise SystemExit("tools/version.py must be tracked as the version contract")
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    version = project.get("project", {}).get("version")
+    if not isinstance(version, str) or not re.fullmatch(r"\d+\.\d+\.\d+", version):
+        raise SystemExit("pyproject.toml must contain the canonical SemVer project version")
+
+    gradle = (ROOT / "android" / "app" / "build.gradle.kts").read_text(encoding="utf-8")
+    if 'providers.gradleProperty("mealcircuitVersion").orElse' in gradle:
+        raise SystemExit("Android version must not have an independent default")
+    if "versionCode = 30000" in gradle or 'versionName = "0.3.0"' in gradle:
+        raise SystemExit("Android version must be derived from the contract output")
+
+    inno = (ROOT / "packaging" / "windows" / "MealCircuit.iss").read_text(encoding="utf-8")
+    if '#define MyAppVersion "0.3.0"' in inno or "#error MyAppVersion" not in inno:
+        raise SystemExit("Inno Setup must require the workflow-provided version")
+
+    setup_uv = re.findall(
+        r"astral-sh/setup-uv@[0-9a-f]{40}.*?\n\s+with:\n\s+version: \"([^\"]+)\"",
+        "\n".join(
+            path.read_text(encoding="utf-8")
+            for path in sorted((ROOT / ".github" / "workflows").glob("*.y*ml"))
+        ),
+        re.DOTALL,
+    )
+    if not setup_uv or any(item != "0.8.22" for item in setup_uv):
+        raise SystemExit(f"all setup-uv jobs must use 0.8.22, found: {setup_uv}")
+
+    for workflow in sorted((ROOT / ".github" / "workflows").glob("*.y*ml")):
+        if re.search(r"^\s*VERSION:\s*0\.3\.0\s*$", workflow.read_text(encoding="utf-8"), re.MULTILINE):
+            raise SystemExit(f"{workflow}: workflow version must come from the contract job")
 
 
 def check_release_tools() -> None:
@@ -219,6 +255,7 @@ def check_workflow_action_pins() -> None:
 
 def main() -> None:
     check_workflow_action_pins()
+    check_version_sources()
     direct = check_locks()
     direct.update(check_uv_lock())
     check_android()
