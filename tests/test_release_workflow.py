@@ -44,7 +44,8 @@ class ReleaseWorkflowPolicyTest(unittest.TestCase):
             check_release_workflow(unchecked)
 
     def test_windows_actions_must_use_immutable_pins(self):
-        invalid = self.workflow.replace(
+        prefix, windows = self.workflow.split("  windows:\n", 1)
+        invalid = prefix + "  windows:\n" + windows.replace(
             "actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4",
             "actions/checkout@v4",
             1,
@@ -54,7 +55,12 @@ class ReleaseWorkflowPolicyTest(unittest.TestCase):
             check_release_workflow(invalid)
 
     def test_windows_uv_security_pin_cannot_regress(self):
-        invalid = self.workflow.replace('version: "0.11.16"', 'version: "0.8.22"', 1)
+        prefix, windows = self.workflow.split("  windows:\n", 1)
+        invalid = prefix + "  windows:\n" + windows.replace(
+            'version: "0.8.22"',
+            'version: "0.11.16"',
+            1,
+        )
         self.assertNotEqual(self.workflow, invalid)
         with self.assertRaisesRegex(SystemExit, "Windows uv security pin"):
             check_release_workflow(invalid)
@@ -150,7 +156,7 @@ class ReleaseWorkflowPolicyTest(unittest.TestCase):
 
     def test_release_job_must_depend_on_every_platform(self):
         incomplete = self.workflow.replace(
-            "needs: [windows, macos-universal, linux, android]",
+            "needs: [contract, windows, macos-universal, linux, android]",
             "needs: [windows, macos-universal, linux]",
         )
         with self.assertRaisesRegex(SystemExit, "release build dependencies"):

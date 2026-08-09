@@ -104,6 +104,9 @@ def check_release_workflow(workflow: str) -> None:
     if not windows_match:
         raise SystemExit("Release workflow is missing the Windows job")
     windows_workflow = windows_match.group(0)
+    for action, ref in re.findall(r"uses: ([^@\s]+)@([^\s#]+)", windows_workflow):
+        if not re.fullmatch(r"[0-9a-f]{40}", ref):
+            raise SystemExit(f"Windows actions use immutable pins: {action}")
     required_windows_snippets = {
         "Windows actions use immutable pins": (
             "actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4",
@@ -117,7 +120,7 @@ def check_release_workflow(workflow: str) -> None:
             '          if ($process.ExitCode -ne 0) { throw "Packaged smoke test failed',
         ),
         "Windows uv security pin": (
-            'version: "0.11.16"',
+            'version: "0.8.22"',
         ),
         "Windows Inno Setup pin": (
             'https://github.com/jrsoftware/issrc/releases/download/is-6_7_3/innosetup-6.7.3.exe',
@@ -195,7 +198,7 @@ def check_release_workflow(workflow: str) -> None:
             "path: ${{ runner.temp }}/android-release/*",
         ),
         "release build dependencies": (
-            "needs: [windows, macos-universal, linux, android]",
+            "needs: [contract, windows, macos-universal, linux, android]",
         ),
     }
     for policy, snippets in required_snippets.items():
@@ -203,7 +206,19 @@ def check_release_workflow(workflow: str) -> None:
             raise SystemExit(f"Release workflow is missing required policy: {policy}")
 
 
+def check_workflow_action_pins() -> None:
+    pattern = re.compile(r"^\s*(?:-\s*)?uses:\s*([^@\s]+)@([^\s#]+)", re.MULTILINE)
+    for workflow in sorted((ROOT / ".github" / "workflows").glob("*.y*ml")):
+        text = workflow.read_text(encoding="utf-8")
+        for match in pattern.finditer(text):
+            if not re.fullmatch(r"[0-9a-f]{40}", match.group(2)):
+                raise SystemExit(
+                    f"{workflow}: action {match.group(1)} must use an immutable commit SHA"
+                )
+
+
 def main() -> None:
+    check_workflow_action_pins()
     direct = check_locks()
     direct.update(check_uv_lock())
     check_android()
