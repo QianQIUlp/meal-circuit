@@ -6,6 +6,9 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+POSTGRES_IMAGE = "postgres:18-alpine@sha256:9a8afca54e7861fd90fab5fdf4c42477a6b1cb7d293595148e674e0a3181de15"
+PYTHON_IMAGE = "python:3.13-slim@sha256:9662417aace5ae7b8e2609cce472b72a8958e134ba372808abe9cc1a0c0125e6"
+CADDY_IMAGE = "caddy:2.11.4-alpine@sha256:5f5c8640aae01df9654968d946d8f1a56c497f1dd5c5cda4cf95ab7c14d58648"
 LOCK_LINE = re.compile(r"^[A-Za-z0-9_.-]+==[^;\s]+(?:; .+)?$")
 EXPECTED = {
     "desktop.lock": {"cryptography", "keyring", "pyinstaller", "pywebview"},
@@ -113,6 +116,35 @@ def check_version_sources() -> None:
     for workflow in sorted((ROOT / ".github" / "workflows").glob("*.y*ml")):
         if re.search(r"^\s*VERSION:\s*0\.3\.0\s*$", workflow.read_text(encoding="utf-8"), re.MULTILINE):
             raise SystemExit(f"{workflow}: workflow version must come from the contract job")
+
+    for workflow in sorted((ROOT / ".github" / "workflows").glob("*.y*ml")):
+        text = workflow.read_text(encoding="utf-8")
+        if "actionlint" in text and (
+            "ACTIONLINT_VERSION: 1.7.12" not in text
+            or "ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8" not in text
+        ):
+            raise SystemExit(f"{workflow}: actionlint version and SHA must be immutable")
+
+
+def check_container_pins() -> None:
+    workflow = (ROOT / ".github" / "workflows" / "test.yml").read_text(encoding="utf-8")
+    if f"image: {POSTGRES_IMAGE}" not in workflow:
+        raise SystemExit("CI PostgreSQL service must use the approved immutable image digest")
+
+    compose = (ROOT / "sync_server" / "compose.yaml").read_text(encoding="utf-8")
+    for image in (POSTGRES_IMAGE, CADDY_IMAGE):
+        if f"image: {image}" not in compose:
+            raise SystemExit(f"sync_server/compose.yaml is missing immutable image pin: {image}")
+    dockerfile = (ROOT / "sync_server" / "Dockerfile").read_text(encoding="utf-8")
+    if f"FROM {PYTHON_IMAGE}" not in dockerfile:
+        raise SystemExit("sync_server/Dockerfile must use the approved immutable Python image digest")
+
+    for line in compose.splitlines():
+        if line.strip().startswith("image:") and "@sha256:" not in line:
+            raise SystemExit(f"compose image is not immutable: {line.strip()}")
+    for line in dockerfile.splitlines():
+        if line.strip().startswith("FROM ") and "@sha256:" not in line:
+            raise SystemExit(f"Dockerfile base image is not immutable: {line.strip()}")
 
 
 def check_release_tools() -> None:
@@ -256,6 +288,7 @@ def check_workflow_action_pins() -> None:
 def main() -> None:
     check_workflow_action_pins()
     check_version_sources()
+    check_container_pins()
     direct = check_locks()
     direct.update(check_uv_lock())
     check_android()

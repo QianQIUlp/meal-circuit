@@ -102,6 +102,8 @@ jobs:
           enable-cache: true
       - run: uv sync --locked --extra server --extra sync --group dev
       - run: uv run alembic -c sync_server/alembic.ini upgrade head
+      - run: uv run python -c "import os; assert os.environ.get('MEALCIRCUIT_SYNC_POSTGRES_TEST_URL'), 'PostgreSQL integration URL is required'"
+      - run: uv run python -m unittest tests.test_sync_postgres -v
       - run: uv run python -m unittest discover -s tests -v
       - run: uv run python tools/generate_openapi.py --check
       - run: uv run python tools/validate_protocol.py

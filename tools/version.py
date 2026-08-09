@@ -57,9 +57,13 @@ def main() -> None:
     parser.add_argument("--tag")
     parser.add_argument("--check", action="store_true")
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--print", dest="print_version", action="store_true")
     args = parser.parse_args()
+    if args.print_version:
+        print(project_version())
+        return
     if not args.check:
-        parser.error("--check is required")
+        parser.error("--check or --print is required")
     check(args.tag, args.output)
 
 

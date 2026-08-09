@@ -4,6 +4,20 @@
 
 > 本文件只记录开发历史，不是 Agent 的需求输入。当前行为以代码、测试、`AGENTS.md`、`README.md` 和 `docs/agent-workbench.md` 为准。
 
+## 2026-08-09：发布契约、Android 权威边界与 Portable 安全修复
+
+- 目标：完成发布 workflow 语法/语义门禁、单一版本来源、PostgreSQL recovery 初始化、Android 远端复盘权威边界和 Portable 临时路径加固；保留历史设备 AI Key，只有显式确认动作才会清理。
+- 改动：`release.yml` 与 `test.yml` 新增独立 contract job，固定 actionlint 1.7.12、`setup-uv 0.8.22`、Action SHA 及容器 digest；`pyproject.toml` 成为版本源，Android 以 SemVer 计算 `versionCode`，Windows/Inno Setup 和发行产物消费 contract output；PostgreSQL 集成测试先验证未配置 recovery 返回 409，再验证幂等 push；Android 删除本地模型客户端和 daily review 路径；Portable 临时目录复用 secure/reparse 校验并增加竞态测试。
+- 已验证：actionlint 解析两个 workflow，故意破坏缩进的回归测试失败；版本、发布策略、Android 权威边界、Portable 竞态、SQLite sync server、adaptive 模块、OpenAPI、协议、`release_check`、`dependency_check`、`compileall`、`uv lock --check` 通过；当前环境的 `cryptography` 为 `50.0.0`。
+- 未完成的环境验收：本机没有 Java/JAVA_HOME 或 Docker，Android Gradle/instrumentation 和真实 PostgreSQL 不能本地运行；完整 `unittest discover` 在 10 分钟上限内未完成，因此不能标记为全量 Python 测试通过。CI 的 PostgreSQL job 已改为强制配置 URL，并单独运行 `test_sync_postgres`，避免无声跳过。
+
+## 2026-08-09：发布阻塞、安全边界与渲染稳定性修复
+
+- 目标：执行发布前修复方案，消除已知的 `cryptography` 漏洞、OpenAPI 漂移、Web 空值崩溃和 Android 本地 Agent 越过 Python 七阶段工作流的问题；同时收紧 CI action 引用并让 tag 版本参与发布产物命名。
+- 改动：将 `cryptography` 升级到 `50.0.0`，刷新 `uv.lock` 和桌面依赖锁；重新生成冻结的 `protocol/sync-v1.openapi.json`；Web 事实型任务允许建议字段缺失，复盘页面对未知蛋白目标显示“未知”；Android 移除本地任务生成入口，继续只保存事实、校正和已发布计划；新增版本一致性检查、tag 版本注入 Android/release workflow、全部 workflow action 的 immutable SHA 检查；新增 Web、Android 边界和版本/发布门禁测试。
+- 验证：`uv run --no-sync python -m unittest discover -s tests -v` 为 301 项通过、1 项按设计跳过（未配置 PostgreSQL 集成地址）；`uv run pip-audit` 对同步服务和桌面解析依赖均报告无已知漏洞；`tools/version.py --check`、`tools/dependency_check.py`、`tools/release_check.py`、OpenAPI check、协议校验、`compileall` 和 `git diff --check` 通过。
+- 剩余风险：本机没有 `JAVA_HOME` 或 Java，未能运行 Android Gradle、lint 和 instrumentation；PostgreSQL 集成仍需在 CI 或配置数据库的环境验证。历史 `v0.3.0` 文档保留不变，下一个 tag 必须先更新 `pyproject.toml` 和对应发行说明，使版本门禁通过。
+
 ## 2026-08-04：Android 首帧初始化与视觉验收修复
 
 - 目标：执行 Android 模拟器验收计划，消除首帧前同步初始化、首屏输入提示、签到选项横向裁切和冲突页技术化操作文案等已确认阻断项；不改变领域数据格式、同步合并规则或 API Key 边界。
