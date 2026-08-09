@@ -12,6 +12,12 @@
 - 验证：Python 3.13.14、uv 0.8.22 隔离候选副本中，两个输出均为 30,357 字节、1,158 个 LF、0 个 CRLF，SHA-256 均为 `5798b82c626918dd92058e655421577dd129a390f624a0ae4990b440b91d6939`；专项 unittest、干净/污染 `--check`、协议、依赖、发布检查和 `git diff --check` 均退出 0。
 - 限制：本轮未运行全量 Python、PostgreSQL、Android 或 Web 渲染验证；现有 `server.py` 和 `tests/test_mealcircuit.py` 脏改动保持不变。
 
+## 2026-08-09：Web fact-only 与 nullable target 渲染合同
+
+- 改动：Web 结果渲染按 `analysis_mode` 区分 fact-only 与 advisory；历史缺少该字段的结果按 advisory 处理；fact-only 页面只呈现事实、营养、缺口、风险和未知项；复盘页面对 `protein_target_g = null` 显示“未知”。
+- 验证：Python 3.13.14、uv 0.8.22 隔离候选副本中，RenderContract 3 项、photo/material 3 项、AdaptiveDomain fact-only 1 项、`compileall` 和 `git diff --check` 均退出 0。
+- 限制：本轮未运行全量 Python、PostgreSQL、Android 或 Web 浏览器验证；`AndroidBoundaryTest` 和 Android 文件保持独立、未暂存。
+
 > 项目于 2026-07-02 从 DietOS 更名为 MealCircuit（食回路）。以下旧名称保留为真实历史记录。
 
 > 本文件只记录开发历史，不是 Agent 的需求输入。当前行为以代码、测试、`AGENTS.md`、`README.md` 和 `docs/agent-workbench.md` 为准。
