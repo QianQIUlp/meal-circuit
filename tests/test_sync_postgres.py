@@ -44,6 +44,21 @@ class SyncPostgresTest(unittest.TestCase):
                         "ciphertext": "AQ==",
                     },
                 }
+                blocked = client.post("/v1/sync/push", headers=headers, json={"operations": [operation]})
+                self.assertEqual(blocked.status_code, 409, blocked.text)
+                recovery = client.put(
+                    "/v1/key-envelopes/recovery",
+                    headers=headers,
+                    json={
+                        "envelope": {
+                            "version": 1,
+                            "key_version": 1,
+                            "nonce": "opaque",
+                            "ciphertext": "opaque",
+                        }
+                    },
+                )
+                self.assertEqual(recovery.status_code, 200, recovery.text)
                 first = client.post("/v1/sync/push", headers=headers, json={"operations": [operation]})
                 duplicate = client.post("/v1/sync/push", headers=headers, json={"operations": [operation]})
                 self.assertEqual(first.status_code, 200, first.text)
