@@ -1,5 +1,12 @@
 # 开发过程记忆
 
+## 2026-08-09：Windows 冻结包版本资源接缝
+
+- 原因：`mealcircuit.__init__` 在冻结环境没有 distribution metadata 时，按既定版本语义回退读取项目根 `pyproject.toml`；PyInstaller spec 原先只携带静态资源，导致 clean Windows EXE smoke 缺少 `_internal/pyproject.toml`。短路径 locked sync 已成功，因此未修改 proxy-tools、pywebview、pyproject 依赖或 `uv.lock`。
+- 选择与改动：在 spec 中携带项目根 `pyproject.toml`，继续使用单一项目版本源；没有改为依赖 distribution metadata，因为该元数据不是当前 spec 的稳定跨桌面资源合同，且 PyInstaller spec CLI 不接受直接的 metadata 复制选项。新增 Windows 桌面专项回归断言，防止资源接缝回归。
+- 文件：`packaging/mealcircuit.spec`、`tests/test_windows_desktop.py`、`DEVELOPMENT.md`。
+- 验证：任务目录临时 spec 加同一资源项后，clean PyInstaller EXE smoke exit 0；隔离 clone 的 `tests.test_windows_desktop` 为 9/9 通过；`tools/dependency_check.py`、`tools/release_check.py`、desktop `pip-audit --requirement requirements/desktop.lock` 均 exit 0，后者报告无已知漏洞；依赖使用 uv 0.8.22 locked sync，`proxy-tools==0.1.0` 正常构建。
+
 ## 2026-08-09：Web RenderContract UTF-8 index 修复
 
 - 改动：仅将 `RenderContractTest` 的 mojibake 字符串恢复为当前工作树中的正确 UTF-8 字节；未修改 `server.py`，也未将独立的 `AndroidBoundaryTest` 纳入 index。

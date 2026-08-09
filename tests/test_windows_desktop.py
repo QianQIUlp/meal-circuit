@@ -32,6 +32,7 @@ class WindowsDesktopStartupFailureTest(unittest.TestCase):
         installer = (root / "packaging" / "windows" / "MealCircuit.iss").read_text(encoding="utf-8")
         self.assertIn('windows_icon = str(root / "packaging" / "windows" / "MealCircuit.ico")', spec)
         self.assertIn("icon=windows_icon", spec)
+        self.assertIn('(str(root / "pyproject.toml"), "."),', spec)
         self.assertIn("SetupIconFile=MealCircuit.ico", installer)
 
     def test_http_access_log_tolerates_windowed_executable_without_stderr(self):

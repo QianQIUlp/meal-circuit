@@ -39,6 +39,7 @@ datas = [
     (str(root / "rules"), "rules"),
     (str(root / "templates"), "templates"),
     (str(root / "protocol"), "protocol"),
+    (str(root / "pyproject.toml"), "."),
 ]
 
 a = Analysis(
