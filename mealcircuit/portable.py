@@ -41,6 +41,7 @@ from .storage import (
     create_secure_directory,
     data_home_identity,
     db_path,
+    ensure_no_reparse_components,
     ensure_secure_directory,
     managed_asset_root,
     private_doctrine_path,
@@ -1014,12 +1015,19 @@ def _zip_path(source: Path, recovery_key: str | None) -> Iterator[Path]:
 @contextlib.contextmanager
 def _snapshot_import_source(source: Path) -> Iterator[Path]:
     root = _portable_temp_root()
+    ensure_no_reparse_components(root, Path(root.anchor))
     _cleanup_stale_portable_temp(root)
+    root = ensure_secure_directory(root)
+    ensure_no_reparse_components(root, Path(root.anchor))
     fd, temporary_name = tempfile.mkstemp(
         prefix="mealcircuit-source-", suffix=".portable", dir=root
     )
     temporary = Path(temporary_name)
     try:
+        ensure_no_reparse_components(temporary, root)
+        temporary_stat = temporary.lstat()
+        if not stat.S_ISREG(temporary_stat.st_mode):
+            raise ValidationError(f"Portable Data 临时文件无效：{temporary}")
         raw_output = os.fdopen(fd, "wb")
         fd = -1
         with raw_output as output_stream:
@@ -1035,6 +1043,9 @@ def _snapshot_import_source(source: Path) -> Iterator[Path]:
                     output_stream.write(chunk)
                 output_stream.flush()
                 os.fsync(output_stream.fileno())
+        ensure_no_reparse_components(temporary, root)
+        if not stat.S_ISREG(temporary.lstat().st_mode):
+            raise ValidationError(f"Portable Data 临时文件无效：{temporary}")
         yield temporary
     finally:
         if fd >= 0:
@@ -1043,12 +1054,20 @@ def _snapshot_import_source(source: Path) -> Iterator[Path]:
 
 
 def _portable_temp_root() -> Path:
-    home = app_home().resolve()
+    configured_home = os.environ.get("MEALCIRCUIT_HOME")
+    home_candidate = (
+        Path(os.path.abspath(os.fspath(Path(configured_home).expanduser())))
+        if configured_home
+        else app_home()
+    )
+    home = ensure_secure_directory(home_candidate)
+    ensure_no_reparse_components(home, Path(home.anchor))
     identity = hashlib.sha256(str(home).encode("utf-8")).hexdigest()[:16]
     root = home.parent / f".mealcircuit-portable-temp-{identity}"
-    if root.exists() and (root.is_symlink() or not root.is_dir()):
+    root = ensure_secure_directory(root)
+    ensure_no_reparse_components(root, Path(root.anchor))
+    if not stat.S_ISDIR(root.lstat().st_mode):
         raise ValidationError(f"Portable Data 临时根无效：{root}")
-    root.mkdir(parents=True, mode=0o700, exist_ok=True)
     return root
 
 

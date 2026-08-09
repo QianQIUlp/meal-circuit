@@ -209,6 +209,74 @@ class DomainAndPortableTest(unittest.TestCase):
         else:
             os.environ["MEALCIRCUIT_DB"] = self.old_db
 
+    def _symlink_directory(self, link: Path, target: Path) -> None:
+        try:
+            link.symlink_to(target, target_is_directory=True)
+        except (OSError, NotImplementedError) as exc:
+            self.skipTest(f"directory symlink unavailable: {exc}")
+
+    def test_portable_temp_root_accepts_only_an_ordinary_directory(self) -> None:
+        home = Path(self.temp.name) / "portable-home"
+        configure_home(home)
+        root = portable_module._portable_temp_root()
+        self.assertTrue(root.is_dir())
+        self.assertEqual(root.parent, home.parent)
+
+    def test_portable_temp_root_rejects_symlinked_home_and_final_root(self) -> None:
+        real_home = Path(self.temp.name) / "real-home"
+        configure_home(real_home)
+        root = portable_module._portable_temp_root()
+        external = Path(self.temp.name) / "external"
+        external.mkdir()
+        root.rmdir()
+        self._symlink_directory(root, external)
+        with self.assertRaises(ValidationError):
+            portable_module._portable_temp_root()
+
+        linked_home = Path(self.temp.name) / "linked-home"
+        self._symlink_directory(linked_home, real_home)
+        os.environ["MEALCIRCUIT_HOME"] = str(linked_home)
+        with self.assertRaises(ValidationError):
+            portable_module._portable_temp_root()
+
+    def test_portable_snapshot_rejects_a_replaced_external_temp_file(self) -> None:
+        home = Path(self.temp.name) / "race-home"
+        configure_home(home)
+        source = Path(self.temp.name) / "source.portable"
+        source.write_bytes(b"source")
+        external = Path(self.temp.name) / "external-temp"
+        external.mkdir()
+        real_mkstemp = portable_module.tempfile.mkstemp
+
+        def external_mkstemp(*args, **kwargs):
+            kwargs["dir"] = external
+            return real_mkstemp(*args, **kwargs)
+
+        with patch.object(portable_module.tempfile, "mkstemp", side_effect=external_mkstemp):
+            with self.assertRaises(ValidationError):
+                with portable_module._snapshot_import_source(source):
+                    pass
+        self.assertEqual(list(external.iterdir()), [])
+
+    def test_portable_temp_root_fails_closed_when_replaced_after_creation(self) -> None:
+        home = Path(self.temp.name) / "replacement-home"
+        configure_home(home)
+        external = Path(self.temp.name) / "replacement-target"
+        external.mkdir()
+        real_ensure = portable_module.ensure_secure_directory
+
+        def replace_root(path):
+            result = real_ensure(path)
+            candidate = Path(path)
+            if candidate.name.startswith(".mealcircuit-portable-temp-"):
+                candidate.rmdir()
+                self._symlink_directory(candidate, external)
+            return result
+
+        with patch.object(portable_module, "ensure_secure_directory", side_effect=replace_root):
+            with self.assertRaises(ValidationError):
+                portable_module._portable_temp_root()
+
     def test_domain_revision_and_three_way_merge(self) -> None:
         revision = make_revision(
             "food_item",
