@@ -1,5 +1,11 @@
 # 开发过程记忆
 
+## 2026-08-09：依赖规范锁与 canonical OpenAPI checkpoint
+
+- 改动：提交 `7e14d8e` 使用 uv 0.8.22 从 HEAD 机械生成规范锁并升级 `cryptography` 到 50.0.0；随后提交 canonical OpenAPI 生成器、环境污染专项回归和生成件。
+- 验证：Python 3.13、uv 0.8.22 下 `uv lock --check`、OpenAPI 专项 unittest、干净/污染 `MEALCIRCUIT_SYNC_*` 的 `generate_openapi.py --check`、`dependency_check.py`、`validate_protocol.py`、`release_check.py` 以及 desktop/sync-server 两套 `pip-audit` 均退出 0；`uv.lock` SHA-256 为 `6a50bf318713e708c67099982c819e4aaa89738a6fe43888b203128b31d9fbf7`，canonical OpenAPI SHA-256 为 `770f304570b7afb9ed4151af8dd78084d3c4e769d7b3db2b1f802fcc3af01365`。
+- 限制：本合同未运行全量 Python、PostgreSQL、Android Gradle 或 API 35 instrumentation；现有 Web/Android 未提交改动保持未暂存且未纳入本次提交。
+
 > 项目于 2026-07-02 从 DietOS 更名为 MealCircuit（食回路）。以下旧名称保留为真实历史记录。
 
 > 本文件只记录开发历史，不是 Agent 的需求输入。当前行为以代码、测试、`AGENTS.md`、`README.md` 和 `docs/agent-workbench.md` 为准。
