@@ -62,7 +62,8 @@ def main() -> None:
             raise SystemExit("protocol/sync-v1.openapi.json is stale; run tools/generate_openapi.py")
         print("OpenAPI contract is current")
     else:
-        destination.write_text(generated, encoding="utf-8")
+        with destination.open("w", encoding="utf-8", newline="\n") as stream:
+            stream.write(generated)
         print(destination.resolve())
 
 

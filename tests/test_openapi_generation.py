@@ -11,7 +11,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 GENERATOR = ROOT / "tools/generate_openapi.py"
-CANONICAL_SHA256 = "770f304570b7afb9ed4151af8dd78084d3c4e769d7b3db2b1f802fcc3af01365"
+CANONICAL_SHA256 = "5798b82c626918dd92058e655421577dd129a390f624a0ae4990b440b91d6939"
+CANONICAL_LF_COUNT = 1158
+CANONICAL_CRLF_COUNT = 0
 
 
 class OpenAPIGenerationTest(unittest.TestCase):
@@ -28,6 +30,13 @@ class OpenAPIGenerationTest(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    def _assert_canonical_bytes(self, destination: Path) -> bytes:
+        raw = destination.read_bytes()
+        self.assertEqual(hashlib.sha256(raw).hexdigest(), CANONICAL_SHA256)
+        self.assertEqual(raw.count(b"\n"), CANONICAL_LF_COUNT)
+        self.assertEqual(raw.count(b"\r\n"), CANONICAL_CRLF_COUNT)
+        return raw
+
     def test_sync_environment_cannot_change_canonical_output(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             clean = Path(temporary) / "clean.json"
@@ -41,8 +50,9 @@ class OpenAPIGenerationTest(unittest.TestCase):
                 MEALCIRCUIT_SYNC_MAX_ENTITIES="1",
             )
 
-            self.assertEqual(hashlib.sha256(clean.read_bytes()).hexdigest(), CANONICAL_SHA256)
-            self.assertEqual(clean.read_bytes(), polluted.read_bytes())
+            clean_bytes = self._assert_canonical_bytes(clean)
+            polluted_bytes = self._assert_canonical_bytes(polluted)
+            self.assertEqual(clean_bytes, polluted_bytes)
 
 
 if __name__ == "__main__":

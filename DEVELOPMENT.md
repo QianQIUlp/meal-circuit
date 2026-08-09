@@ -3,8 +3,14 @@
 ## 2026-08-09：依赖规范锁与 canonical OpenAPI checkpoint
 
 - 改动：提交 `7e14d8e` 使用 uv 0.8.22 从 HEAD 机械生成规范锁并升级 `cryptography` 到 50.0.0；随后提交 canonical OpenAPI 生成器、环境污染专项回归和生成件。
-- 验证：Python 3.13、uv 0.8.22 下 `uv lock --check`、OpenAPI 专项 unittest、干净/污染 `MEALCIRCUIT_SYNC_*` 的 `generate_openapi.py --check`、`dependency_check.py`、`validate_protocol.py`、`release_check.py` 以及 desktop/sync-server 两套 `pip-audit` 均退出 0；`uv.lock` SHA-256 为 `6a50bf318713e708c67099982c819e4aaa89738a6fe43888b203128b31d9fbf7`，canonical OpenAPI SHA-256 为 `770f304570b7afb9ed4151af8dd78084d3c4e769d7b3db2b1f802fcc3af01365`。
+- 验证：Python 3.13、uv 0.8.22 下 `uv lock --check`、OpenAPI 专项 unittest、干净/污染 `MEALCIRCUIT_SYNC_*` 的 `generate_openapi.py --check`、`dependency_check.py`、`validate_protocol.py`、`release_check.py` 以及 desktop/sync-server 两套 `pip-audit` 均退出 0；`uv.lock` SHA-256 为 `6a50bf318713e708c67099982c819e4aaa89738a6fe43888b203128b31d9fbf7`；此前 Windows 工作树 OpenAPI 输出的 `770f304570b7afb9ed4151af8dd78084d3c4e769d7b3db2b1f802fcc3af01365` 是 CRLF 表示，不作为跨平台 canonical 哈希。
 - 限制：本合同未运行全量 Python、PostgreSQL、Android Gradle 或 API 35 instrumentation；现有 Web/Android 未提交改动保持未暂存且未纳入本次提交。
+
+## 2026-08-09：OpenAPI canonical bytes 跨平台修复
+
+- 改动：`generate_openapi.py` 的 `--output` 以 UTF-8/LF 写出；专项回归同时检查干净与污染 `MEALCIRCUIT_SYNC_*` 环境的原始字节、SHA-256 和换行数量。
+- 验证：Python 3.13.14、uv 0.8.22 隔离候选副本中，两个输出均为 30,357 字节、1,158 个 LF、0 个 CRLF，SHA-256 均为 `5798b82c626918dd92058e655421577dd129a390f624a0ae4990b440b91d6939`；专项 unittest、干净/污染 `--check`、协议、依赖、发布检查和 `git diff --check` 均退出 0。
+- 限制：本轮未运行全量 Python、PostgreSQL、Android 或 Web 渲染验证；现有 `server.py` 和 `tests/test_mealcircuit.py` 脏改动保持不变。
 
 > 项目于 2026-07-02 从 DietOS 更名为 MealCircuit（食回路）。以下旧名称保留为真实历史记录。
 
