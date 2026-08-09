@@ -145,12 +145,8 @@ fun CaptureScreen(viewModel: MainViewModel) {
             },
             enabled = materials.isNotBlank(),
         ) { Text(if (selectedInputId == null) "创建任务" else "保存输入修订") }
-        SectionTitle("本机任务输入")
-        OutlinedButton(
-            onClick = viewModel::generateLatestTask,
-            enabled = inputs.isNotEmpty(),
-            modifier = Modifier.fillMaxWidth(),
-        ) { Text("使用本设备配置的 AI 处理最新任务") }
+        SectionTitle("任务输入")
+        Text("任务会同步到 Python 端，由统一的七阶段流程处理；本机只保存事实和校正。")
         RecordList(inputs.take(20), "还没有任务", "拍照或填写原材料后会立即保存在本机。") { record ->
             val payload = Json.parseToJsonElement(record.payloadJson).jsonObject
             selectedInputId = record.entityId

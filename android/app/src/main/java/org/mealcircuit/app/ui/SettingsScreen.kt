@@ -12,14 +12,10 @@ import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
-import androidx.compose.material3.ExposedDropdownMenuBox
-import androidx.compose.material3.ExposedDropdownMenuAnchorType
-import androidx.compose.material3.ExposedDropdownMenuDefaults
-import androidx.compose.material3.DropdownMenuItem
-import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.FilterChip
@@ -38,20 +34,14 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import org.mealcircuit.app.MainViewModel
-import org.mealcircuit.app.ai.AiProvider
 import org.mealcircuit.app.domain.EntityKind
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun SettingsScreen(viewModel: MainViewModel) {
-    var provider by rememberSaveable { mutableStateOf(AiProvider.OPENAI) }
-    var expanded by rememberSaveable { mutableStateOf(false) }
-    // Secrets intentionally stay outside SavedState and are discarded with the process.
-    var key by remember { mutableStateOf("") }
-    var model by rememberSaveable { mutableStateOf("") }
+    var showLegacyAiCleanupDialog by rememberSaveable { mutableStateOf(false) }
     var importUri by rememberSaveable { mutableStateOf<Uri?>(null) }
     var importRecovery by remember { mutableStateOf("") }
     var merge by rememberSaveable { mutableStateOf(false) }
@@ -152,40 +142,29 @@ fun SettingsScreen(viewModel: MainViewModel) {
             )
         }
         Button(onClick = { viewModel.saveCheckinModules(selectedModules) }) { Text("保存模块设置") }
-        SectionTitle("设备内 AI 接入", "API Key 仅由 Android Keystore 包装，不进入 Room、同步或导出。")
-        ExposedDropdownMenuBox(expanded, { expanded = !expanded }) {
-            OutlinedTextField(
-                provider.name, {}, readOnly = true,
-                label = { Text("供应商") },
-                trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded) },
-                modifier = Modifier
-                    .menuAnchor(ExposedDropdownMenuAnchorType.PrimaryNotEditable)
-                    .fillMaxWidth(),
+        SectionTitle("旧版设备 AI 配置", "历史 API Key 不会被静默删除；清理只会在你明确确认后执行，且不会调用模型。")
+        OutlinedButton(
+            onClick = { showLegacyAiCleanupDialog = true },
+            modifier = Modifier.fillMaxWidth(),
+        ) { Text("清理旧版设备 AI 配置") }
+        if (showLegacyAiCleanupDialog) {
+            AlertDialog(
+                onDismissRequest = { showLegacyAiCleanupDialog = false },
+                title = { Text("确认清理旧版设备 AI 配置？") },
+                text = { Text("这会删除旧版设备中保存的 AI API Key、供应商和模型设置，且无法恢复。") },
+                confirmButton = {
+                    Button(
+                        onClick = {
+                            showLegacyAiCleanupDialog = false
+                            viewModel.clearLegacyAiConfiguration()
+                        },
+                    ) { Text("确认清理") }
+                },
+                dismissButton = {
+                    OutlinedButton(onClick = { showLegacyAiCleanupDialog = false }) { Text("取消") }
+                },
             )
-            ExposedDropdownMenu(expanded, { expanded = false }) {
-                AiProvider.entries.forEach { item ->
-                    DropdownMenuItem(
-                        text = { Text(item.name) },
-                        onClick = { provider = item; expanded = false },
-                    )
-                }
-            }
         }
-        OutlinedTextField(
-            model, { model = it }, Modifier.fillMaxWidth(),
-            label = { Text("模型名") }, singleLine = true,
-        )
-        OutlinedTextField(
-            key, { key = it }, Modifier.fillMaxWidth(),
-            label = { Text("API Key") },
-            visualTransformation = PasswordVisualTransformation(),
-            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
-            singleLine = true,
-        )
-        Button(
-            onClick = { viewModel.saveAiKey(provider, model, key) { key = "" } },
-            enabled = key.isNotBlank() && model.isNotBlank(),
-        ) { Text("安全保存到本设备") }
         SectionTitle("Portable Data", "加密 .mcx 的导入导出入口将在系统文件选择器中操作，不授予整盘权限。")
         Text("数据包不包含 API Key、设备密钥、同步令牌或恢复密钥。", modifier = Modifier.fillMaxWidth())
         Button(
