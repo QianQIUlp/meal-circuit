@@ -1,8 +1,64 @@
 # 开发过程记忆
 
+## 2026-08-12：v0.3.1 发布基线清障（仅 Windows x64 + Android）
+
+- 目标与范围：按当前产品范围只维护 Windows x64 与 Android；本轮清除已知发布阻碍并补齐可重复门禁，不执行提交、推送、打 tag 或公开发布，也不要求在本机生成已签名的最终六项资产。Python Web/CLI 属于 Windows 实现，Android 继续只消费经 Windows/Python 七阶段流程审查并发布的计划。
+- 安装与首次使用：修复 wheel/sdist 缺少 `rules/`、`templates/`、协议和法律资料的问题，统一源码、冻结包与 wheel 的资源定位；新安装模板允许蛋白目标在 onboarding 前保持未知，`init` 后 `doctor` 不再误报。发布门会真实构建 wheel/sdist、拒绝 `pyc/__pycache__`，隔离安装后再运行 `init/doctor`。构建后端固定为支持 PEP 639 的 `setuptools==83.0.0`。
+- 产品与边界：修复“我的”页 390px 主题控件横向溢出；README、v0.3.1 发行说明、中英文站点、安全与威胁模型统一说明无捆绑规划模型、模型 API Key 仅存当前 Python 进程、Android 不执行本地每日生成；公开下载范围固定为 Windows portable/setup、Android APK/AAB，加 SBOM 与 SHA256 共六项。
+- 发布门：tag 会等待同一 tag/commit 的完整测试 workflow，私密漏洞报告、Windows Authenticode、Android 四项签名凭据均 fail closed；Android APK 与 keystore alias 必须延续公开 v0.3.0 证书 SHA-256，AAB 严格验签；release 只下载四个最终平台产物并生成锁文件派生的 CycloneDX SBOM 与校验和。Windows 包从实际锁定环境收集项目、Python 与每个分发包的许可证并在冻结包、便携包、安装目录复验；Android 在应用内提供六份法律文本，并直接打开最终 APK/AAB 核验法律资产、许可证全文及 ZIP 安全边界。
+- Windows 真实窗口：新增隐藏的 `--ui-smoke-test`，使用一次性数据目录真正创建 pywebview/WebView2 窗口，等待首个页面加载后关闭，且有 45 秒加载上限与进程级 watchdog；发布 workflow 对冻结 EXE 单独执行 70 秒有界的真实 WebView 门禁。当前源码 WebView 与重新构建的 PyInstaller EXE 均实跑成功，冻结 EXE UI smoke 约 30.59 秒退出 0；此前也以隔离 home 人工检查过实际原生窗口和首次设置页。
+- Android 法律与构建：新增 installed-app instrumentation 法律资产测试和最终 APK/AAB 标准库检查器；Android 源码法律门与恶意 ZIP/篡改/缺失回归通过。当前轮隔离 JDK 17 / SDK 36 验证中，JVM 单测 30/30 通过，生成的 debug APK 为 `org.mealcircuit.app`、`versionCode=30001`、`versionName=0.3.1` 并包含全部六份法律资产，androidTest Kotlin 也已编译；按用户缩小验收目标后中止长跑，因此本轮未完成 lint、设备 instrumentation 或 release 构建，没有把未完成的签名成品当作已发布证据。
+- 验证：当前稳定快照的 Python 全量在发布范围收敛前为 333 通过、0 失败、1 项因本机未配置 PostgreSQL URL 跳过；随后发布/法律/真实 GUI 增量定向 48/48 通过。另有发布策略/版本/站点/SBOM等 39 项通过（1 项 actionlint 本地跳过，独立 actionlint 已通过）、资源/桌面/Android 24 项通过；`tools/dependency_check.py`、OpenAPI、协议、版本、`release_check`、两种 uv 的 lock check、wheel/sdist 隔离安装、SBOM 239 components、Windows 与 sync 两套 `pip-audit` 均通过并报告无已知漏洞；`git diff --check` 通过。浏览器实测 390px `/me` 的 document/body scrollWidth 均为 375、主题控件边界 45.33–329.33；桌面产品站 1440px 无溢出。
+- 未执行的外部动作与当前外部阻塞：仓库的 private vulnerability reporting 仍未开启，Windows Authenticode secrets 尚未配置，v0.3.1 本地变更尚未形成提交/推送/tag，公开 v0.3.1 Release 尚不存在。因此不要先把 README/站点中的 v0.3.1 链接部署到 `main`；正确顺序是先配置管理员门禁与签名材料，再提交并跑绿同 tag CI、生成并核验 Release，最后上线对应站点链接。本轮没有改写或丢弃共享的 `tests/test_mealcircuit.py`；其 SHA-256 保持 `07E3561607A6690741385D241B36E356362A3B0FF1D62F195875FA136F812D47`。
+
+## 2026-08-09：Windows 冻结包版本资源接缝
+
+- 原因：`mealcircuit.__init__` 在冻结环境没有 distribution metadata 时，按既定版本语义回退读取项目根 `pyproject.toml`；PyInstaller spec 原先只携带静态资源，导致 clean Windows EXE smoke 缺少 `_internal/pyproject.toml`。短路径 locked sync 已成功，因此未修改 proxy-tools、pywebview、pyproject 依赖或 `uv.lock`。
+- 选择与改动：在 spec 中携带项目根 `pyproject.toml`，继续使用单一项目版本源；没有改为依赖 distribution metadata，因为该元数据不是当前 spec 的稳定跨桌面资源合同，且 PyInstaller spec CLI 不接受直接的 metadata 复制选项。新增 Windows 桌面专项回归断言，防止资源接缝回归。
+- 文件：`packaging/mealcircuit.spec`、`tests/test_windows_desktop.py`、`DEVELOPMENT.md`。
+- 验证：任务目录临时 spec 加同一资源项后，clean PyInstaller EXE smoke exit 0；隔离 clone 的 `tests.test_windows_desktop` 为 9/9 通过；`tools/dependency_check.py`、`tools/release_check.py`、desktop `pip-audit --requirement requirements/desktop.lock` 均 exit 0，后者报告无已知漏洞；依赖使用 uv 0.8.22 locked sync，`proxy-tools==0.1.0` 正常构建。
+
+## 2026-08-09：Web RenderContract UTF-8 index 修复
+
+- 改动：仅将 `RenderContractTest` 的 mojibake 字符串恢复为当前工作树中的正确 UTF-8 字节；未修改 `server.py`，也未将独立的 `AndroidBoundaryTest` 纳入 index。
+- 验证：Python 3.13.14、uv 0.8.22 的隔离 staged-tree 中，RenderContract 3 项、photo/material 3 项、AdaptiveDomain fact-only 1 项、`compileall` 和 `git diff --check` 均退出 0；测试文件 SHA-256 为 `ee476cca2795820e968649f343515cdbee4ba555f3cbab33afbfb3e4c24c291b`，RenderContract 片段 SHA-256 为 `d4862e9cba278e489c456b48a765d4c12b616420c5e10e0d1695f774f20b62a1`。
+- 限制：提交后需从最终 HEAD 隔离导出复核同一专项矩阵；AndroidBoundaryTest 仍作为原有未暂存改动保留。
+
+## 2026-08-09：依赖规范锁与 canonical OpenAPI checkpoint
+
+- 改动：提交 `7e14d8e` 使用 uv 0.8.22 从 HEAD 机械生成规范锁并升级 `cryptography` 到 50.0.0；随后提交 canonical OpenAPI 生成器、环境污染专项回归和生成件。
+- 验证：Python 3.13、uv 0.8.22 下 `uv lock --check`、OpenAPI 专项 unittest、干净/污染 `MEALCIRCUIT_SYNC_*` 的 `generate_openapi.py --check`、`dependency_check.py`、`validate_protocol.py`、`release_check.py` 以及 desktop/sync-server 两套 `pip-audit` 均退出 0；`uv.lock` SHA-256 为 `6a50bf318713e708c67099982c819e4aaa89738a6fe43888b203128b31d9fbf7`；此前 Windows 工作树 OpenAPI 输出的 `770f304570b7afb9ed4151af8dd78084d3c4e769d7b3db2b1f802fcc3af01365` 是 CRLF 表示，不作为跨平台 canonical 哈希。
+- 限制：本合同未运行全量 Python、PostgreSQL、Android Gradle 或 API 35 instrumentation；现有 Web/Android 未提交改动保持未暂存且未纳入本次提交。
+
+## 2026-08-09：OpenAPI canonical bytes 跨平台修复
+
+- 改动：`generate_openapi.py` 的 `--output` 以 UTF-8/LF 写出；专项回归同时检查干净与污染 `MEALCIRCUIT_SYNC_*` 环境的原始字节、SHA-256 和换行数量。
+- 验证：Python 3.13.14、uv 0.8.22 隔离候选副本中，两个输出均为 30,357 字节、1,158 个 LF、0 个 CRLF，SHA-256 均为 `5798b82c626918dd92058e655421577dd129a390f624a0ae4990b440b91d6939`；专项 unittest、干净/污染 `--check`、协议、依赖、发布检查和 `git diff --check` 均退出 0。
+- 限制：本轮未运行全量 Python、PostgreSQL、Android 或 Web 渲染验证；现有 `server.py` 和 `tests/test_mealcircuit.py` 脏改动保持不变。
+
+## 2026-08-09：Web fact-only 与 nullable target 渲染合同
+
+- 改动：Web 结果渲染按 `analysis_mode` 区分 fact-only 与 advisory；历史缺少该字段的结果按 advisory 处理；fact-only 页面只呈现事实、营养、缺口、风险和未知项；复盘页面对 `protein_target_g = null` 显示“未知”。
+- 验证：Python 3.13.14、uv 0.8.22 隔离候选副本中，RenderContract 3 项、photo/material 3 项、AdaptiveDomain fact-only 1 项、`compileall` 和 `git diff --check` 均退出 0。
+- 限制：本轮未运行全量 Python、PostgreSQL、Android 或 Web 浏览器验证；`AndroidBoundaryTest` 和 Android 文件保持独立、未暂存。
+
 > 项目于 2026-07-02 从 DietOS 更名为 MealCircuit（食回路）。以下旧名称保留为真实历史记录。
 
 > 本文件只记录开发历史，不是 Agent 的需求输入。当前行为以代码、测试、`AGENTS.md`、`README.md` 和 `docs/agent-workbench.md` 为准。
+
+## 2026-08-09：发布契约、Android 权威边界与 Portable 安全修复
+
+- 目标：完成发布 workflow 语法/语义门禁、单一版本来源、PostgreSQL recovery 初始化、Android 远端复盘权威边界和 Portable 临时路径加固；保留历史设备 AI Key，只有显式确认动作才会清理。
+- 改动：`release.yml` 与 `test.yml` 新增独立 contract job，固定 actionlint 1.7.12、`setup-uv 0.8.22`、Action SHA 及容器 digest；`pyproject.toml` 成为版本源，Android 以 SemVer 计算 `versionCode`，Windows/Inno Setup 和发行产物消费 contract output；PostgreSQL 集成测试先验证未配置 recovery 返回 409，再验证幂等 push；Android 删除本地模型客户端和 daily review 路径；Portable 临时目录复用 secure/reparse 校验并增加竞态测试。
+- 已验证：actionlint 解析两个 workflow，故意破坏缩进的回归测试失败；版本、发布策略、Android 权威边界、Portable 竞态、SQLite sync server、adaptive 模块、OpenAPI、协议、`release_check`、`dependency_check`、`compileall`、`uv lock --check` 通过；当前环境的 `cryptography` 为 `50.0.0`。
+- 未完成的环境验收：本机没有 Java/JAVA_HOME 或 Docker，Android Gradle/instrumentation 和真实 PostgreSQL 不能本地运行；完整 `unittest discover` 在 10 分钟上限内未完成，因此不能标记为全量 Python 测试通过。CI 的 PostgreSQL job 已改为强制配置 URL，并单独运行 `test_sync_postgres`，避免无声跳过。
+
+## 2026-08-09：发布阻塞、安全边界与渲染稳定性修复
+
+- 目标：执行发布前修复方案，消除已知的 `cryptography` 漏洞、OpenAPI 漂移、Web 空值崩溃和 Android 本地 Agent 越过 Python 七阶段工作流的问题；同时收紧 CI action 引用并让 tag 版本参与发布产物命名。
+- 改动：将 `cryptography` 升级到 `50.0.0`，刷新 `uv.lock` 和桌面依赖锁；重新生成冻结的 `protocol/sync-v1.openapi.json`；Web 事实型任务允许建议字段缺失，复盘页面对未知蛋白目标显示“未知”；Android 移除本地任务生成入口，继续只保存事实、校正和已发布计划；新增版本一致性检查、tag 版本注入 Android/release workflow、全部 workflow action 的 immutable SHA 检查；新增 Web、Android 边界和版本/发布门禁测试。
+- 验证：`uv run --no-sync python -m unittest discover -s tests -v` 为 301 项通过、1 项按设计跳过（未配置 PostgreSQL 集成地址）；`uv run pip-audit` 对同步服务和桌面解析依赖均报告无已知漏洞；`tools/version.py --check`、`tools/dependency_check.py`、`tools/release_check.py`、OpenAPI check、协议校验、`compileall` 和 `git diff --check` 通过。
+- 剩余风险：本机没有 `JAVA_HOME` 或 Java，未能运行 Android Gradle、lint 和 instrumentation；PostgreSQL 集成仍需在 CI 或配置数据库的环境验证。历史 `v0.3.0` 文档保留不变，下一个 tag 必须先更新 `pyproject.toml` 和对应发行说明，使版本门禁通过。
 
 ## 2026-08-04：Android 首帧初始化与视觉验收修复
 

@@ -1,6 +1,6 @@
 # Third-party dependency inventory
 
-This is the human-readable direct-dependency inventory for MealCircuit 0.3.0. The release workflow also emits a CycloneDX SBOM containing resolved transitive packages and versions. The upstream license text distributed with each binary remains authoritative.
+This is the human-readable direct-dependency inventory for the current MealCircuit release. The release workflow also emits a lock-derived CycloneDX SBOM containing resolved Python and Android packages and versions. The upstream license text distributed with each binary remains authoritative.
 
 | Component | Use | Upstream license |
 |---|---|---|
@@ -22,9 +22,9 @@ This is the human-readable direct-dependency inventory for MealCircuit 0.3.0. Th
 | ZXing Android Embedded | Android QR scanning | Apache-2.0 |
 | tzdata | IANA timezone database on Windows | Apache-2.0 |
 | setuptools | Python build backend | MIT |
-| uv | Cross-platform Python dependency lock/install tooling | Apache-2.0 OR MIT |
+| uv | Python dependency lock/install tooling | Apache-2.0 OR MIT |
 | jsonschema | Protocol contract validation in development/CI | MIT |
 | pip-audit | Python dependency vulnerability audit in development/CI | Apache-2.0 |
 | Lucide icons | Desktop Web UI icons | ISC; bundled notice is in `mealcircuit/static/icons/LUCIDE_LICENSE.txt` |
 
-No third-party dependency changes MealCircuit's MIT project license. LGPL components are dynamically used as unmodified libraries; PyInstaller's exception permits distribution of generated executables under the application license.
+No third-party dependency changes MealCircuit's MIT project license. LGPL components are distributed with their applicable license text. PyInstaller's exception permits distribution of generated executables under the application license.

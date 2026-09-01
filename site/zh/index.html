@@ -45,14 +45,14 @@
     <main id="main">
       <section class="page-shell hero" aria-labelledby="hero-title">
         <div class="hero-copy">
-          <p class="eyebrow">本地优先 · 开放源码 · 0.3 正式版</p>
+          <p class="eyebrow">本地优先 · 开放源码 · 0.3.1 正式版</p>
           <h1 id="hero-title">饮食不是一场打分。<strong>它是你的<em>反馈回路。</em></strong></h1>
           <p class="hero-body">MealCircuit 把你实际吃了什么、当天真实感受、临时发生的变化和下一步能做到什么连接起来；每项判断都保留来源，最终由你决定是否接受。</p>
           <div class="hero-actions">
-            <a class="button button--primary" href="https://github.com/QianQIUlp/meal-circuit/releases/tag/v0.3.0" target="_blank" rel="noreferrer">下载 v0.3.0 <span aria-hidden="true">↗</span></a>
+            <a class="button button--primary" href="https://github.com/QianQIUlp/meal-circuit/releases/tag/v0.3.1" target="_blank" rel="noreferrer">下载 v0.3.1 <span aria-hidden="true">↗</span></a>
             <a class="button button--secondary" href="https://github.com/QianQIUlp/meal-circuit" target="_blank" rel="noreferrer">查看源代码 <span aria-hidden="true">↗</span></a>
           </div>
-          <p class="release-note"><span aria-hidden="true">i</span> 桌面端和 Android 端均离线优先；可选同步服务由用户自行托管。</p>
+          <p class="release-note"><span aria-hidden="true">i</span> 当前支持 Windows x64 与 Android。记录保留在本地；生成计划需要你的 Agent 或主动配置模型 Key。</p>
         </div>
 
         <figure class="circuit-board" aria-label="饮食记录、个人上下文、审查后的计划和真实执行结果构成反馈回路">
@@ -163,7 +163,7 @@
               <span class="privacy-card__icon" aria-hidden="true">本地</span>
               <div>
                 <h3>默认本地运行</h3>
-                <p>桌面端和 Android 端只读写各自本地数据库，核心功能离线可用。</p>
+                <p>Windows 桌面端和 Android 端只读写各自本地数据库，核心功能离线可用。</p>
               </div>
               <span class="privacy-card__status">默认启用</span>
             </article>
@@ -240,6 +240,11 @@
           </article>
           <article class="boundary-card">
             <span aria-hidden="true">×</span>
+            <h3>不捆绑规划模型</h3>
+            <p>没有你的 Agent 或主动配置的模型 API Key 时，MealCircuit 会记录上下文但不会生成明日安排；Android 只消费 Python/Windows 桌面流程审查后的计划。</p>
+          </article>
+          <article class="boundary-card">
+            <span aria-hidden="true">×</span>
             <h3>不静默发布计划</h3>
             <p>通过审查的草案仍可替换，只有用户明确接受后才成为正式计划。</p>
           </article>
@@ -261,11 +266,11 @@
           <dl class="source-meta">
             <div>
               <dt>当前版本</dt>
-              <dd>v0.3.0</dd>
+              <dd>v0.3.1</dd>
             </div>
             <div>
               <dt>客户端</dt>
-              <dd>桌面端 · Android</dd>
+              <dd>Windows x64 · Android</dd>
             </div>
             <div>
               <dt>开源许可</dt>

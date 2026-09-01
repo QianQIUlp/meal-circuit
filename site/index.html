@@ -45,14 +45,14 @@
     <main id="main">
       <section class="page-shell hero" aria-labelledby="hero-title">
         <div class="hero-copy">
-          <p class="eyebrow">LOCAL-FIRST · OPEN SOURCE · RELEASE 0.3</p>
+          <p class="eyebrow">LOCAL-FIRST · OPEN SOURCE · RELEASE 0.3.1</p>
           <h1 id="hero-title">Your meals are not a score. <strong>They are a <em>feedback loop.</em></strong></h1>
           <p class="hero-body">MealCircuit connects what you ate, how the day actually felt, what changed, and what you can realistically do next—then keeps every conclusion traceable and yours to accept.</p>
           <div class="hero-actions">
-            <a class="button button--primary" href="https://github.com/QianQIUlp/meal-circuit/releases/tag/v0.3.0" target="_blank" rel="noreferrer">Download v0.3.0 <span aria-hidden="true">↗</span></a>
+            <a class="button button--primary" href="https://github.com/QianQIUlp/meal-circuit/releases/tag/v0.3.1" target="_blank" rel="noreferrer">Download v0.3.1 <span aria-hidden="true">↗</span></a>
             <a class="button button--secondary" href="https://github.com/QianQIUlp/meal-circuit" target="_blank" rel="noreferrer">Inspect the source <span aria-hidden="true">↗</span></a>
           </div>
-          <p class="release-note"><span aria-hidden="true">i</span> Desktop and Android clients are offline-first. Optional sync remains self-hosted.</p>
+          <p class="release-note"><span aria-hidden="true">i</span> Windows x64 and Android are the supported clients. Records stay local; plan generation needs your agent or an opt-in model key.</p>
         </div>
 
         <figure class="circuit-board" aria-label="A feedback loop connecting meal capture, personal context, reviewed plans, and real-world outcomes">
@@ -163,7 +163,7 @@
               <span class="privacy-card__icon" aria-hidden="true">L</span>
               <div>
                 <h3>Local by default</h3>
-                <p>Desktop and Android read and write their own local database. Core features work offline.</p>
+                <p>Windows desktop and Android read and write their own local database. Core features work offline.</p>
               </div>
               <span class="privacy-card__status">ACTIVE</span>
             </article>
@@ -240,6 +240,11 @@
           </article>
           <article class="boundary-card">
             <span aria-hidden="true">×</span>
+            <h3>No bundled planner model</h3>
+            <p>Without your agent or an explicitly configured model API key, MealCircuit records context but does not generate tomorrow’s plan. Android consumes reviewed plans from the Python/Windows desktop workflow.</p>
+          </article>
+          <article class="boundary-card">
+            <span aria-hidden="true">×</span>
             <h3>No silent publishing</h3>
             <p>A reviewed draft remains replaceable until the user explicitly accepts it as the formal plan.</p>
           </article>
@@ -261,11 +266,11 @@
           <dl class="source-meta">
             <div>
               <dt>CURRENT RELEASE</dt>
-              <dd>v0.3.0</dd>
+              <dd>v0.3.1</dd>
             </div>
             <div>
               <dt>CLIENTS</dt>
-              <dd>Desktop · Android</dd>
+              <dd>Windows x64 · Android</dd>
             </div>
             <div>
               <dt>LICENSE</dt>

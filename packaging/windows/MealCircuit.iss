@@ -1,5 +1,5 @@
 #ifndef MyAppVersion
-#define MyAppVersion "0.3.0"
+#error MyAppVersion must be supplied by the release workflow
 #endif
 #ifndef SourceDir
 #define SourceDir "..\..\dist\MealCircuit"

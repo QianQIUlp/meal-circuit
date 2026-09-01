@@ -30,7 +30,7 @@ from mealcircuit.portable import ImportRollbackError
 from mealcircuit.secret_store import SecretStorageError
 from mealcircuit.server import Handler, ThreadingHTTPServer, origin_matches_host, parse_host_endpoint
 from mealcircuit.storage import db_path, resolve_data_path, upload_root
-from mealcircuit.validation import ValidationError, validate_daily_review_result
+from mealcircuit.validation import ValidationError, validate_daily_review_result, validate_result
 from tools.release_check import scan as release_scan
 
 
@@ -1518,6 +1518,99 @@ class DesktopEntryPointTest(unittest.TestCase):
             self.assertEqual(completed.returncode, 0, completed.stderr)
             self.assertTrue((home / "profile.md").is_file())
             self.assertTrue((home / "settings.json").is_file())
+
+
+class RenderContractTest(unittest.TestCase):
+    @staticmethod
+    def nutrition():
+        return {
+            "energy_kcal": [100, 200],
+            "protein_g": [10, 20],
+            "carbs_g": [15, 25],
+            "fat_g": [5, 10],
+        }
+
+    def test_fact_only_task_results_render_without_advisory_fields(self):
+        photo = {
+            "analysis_mode": "fact_only",
+            "summary": "只记录可见事实",
+            "candidates": [{
+                "name": "鸡蛋",
+                "portion_range": "1–2 个",
+                "nutrition": self.nutrition(),
+                "confidence": 0.8,
+            }],
+            "unknowns": ["油量未知"],
+        }
+        material = {
+            "analysis_mode": "fact_only",
+            "summary": "只记录可见事实",
+            "observed_items": ["鸡蛋 2 个"],
+            "batch_nutrition": self.nutrition(),
+            "per_serving_nutrition": self.nutrition(),
+            "gaps": ["品牌未知"],
+            "risks": ["调味量未知"],
+            "unknowns": ["烹调油未知"],
+        }
+        validate_result("photo", photo, fact_only=True)
+        validate_result("material", material, fact_only=True)
+        photo_page = web_server.render_result("photo", photo)
+        material_page = web_server.render_result("material", material)
+        self.assertIn("只记录可见事实", photo_page)
+        self.assertIn("鸡蛋", photo_page)
+        self.assertIn("油量未知", photo_page)
+        self.assertNotIn("综合建议", photo_page)
+        for text in ("鸡蛋 2 个", "品牌未知", "调味量未知", "烹调油未知", "整批营养估算", "单份营养估算"):
+            self.assertIn(text, material_page)
+        self.assertNotIn("可做组合 / 菜品方向", material_page)
+        self.assertNotIn("最小调整", material_page)
+
+    def test_historical_advisory_results_keep_advisory_fields_and_titles(self):
+        photo = {
+            "summary": "完整分析结果",
+            "candidates": [{
+                "name": "米饭",
+                "portion_range": "半碗",
+                "nutrition": self.nutrition(),
+                "confidence": 0.9,
+            }],
+            "unknowns": [],
+            "advice": ["按当前份量记录"],
+        }
+        material = {
+            "summary": "完整原材料分析",
+            "combinations": ["米饭配鸡蛋"],
+            "batch_nutrition": self.nutrition(),
+            "per_serving_nutrition": self.nutrition(),
+            "gaps": [],
+            "risks": [],
+            "minimal_adjustments": ["补充蔬菜"],
+        }
+        validate_result("photo", photo)
+        validate_result("material", material)
+        photo_page = web_server.render_result("photo", photo)
+        material_page = web_server.render_result("material", material)
+        self.assertIn("综合建议", photo_page)
+        self.assertIn("按当前份量记录", photo_page)
+        self.assertIn("可做组合 / 菜品方向", material_page)
+        self.assertIn("最小调整", material_page)
+        self.assertIn("补充蔬菜", material_page)
+
+    def test_daily_review_render_allows_unknown_protein_target(self):
+        result = daily_review_result(date.today().isoformat())
+        result["tomorrow_menu"]["protein_target_g"] = None
+        validate_daily_review_result(result)
+        page = web_server.render_daily_review_result(result)
+        self.assertIn("蛋白目标 未知", page)
+
+
+class AndroidBoundaryTest(unittest.TestCase):
+    def test_android_does_not_expose_local_task_generation(self):
+        root = Path(__file__).resolve().parents[1]
+        view_model = (root / "android/app/src/main/java/org/mealcircuit/app/MainViewModel.kt").read_text(encoding="utf-8")
+        capture_screen = (root / "android/app/src/main/java/org/mealcircuit/app/ui/CaptureScreen.kt").read_text(encoding="utf-8")
+        self.assertNotIn("fun generateLatestTask", view_model)
+        self.assertNotIn("使用本设备配置的 AI 处理最新任务", capture_screen)
 
 
 class WebAppTest(unittest.TestCase):

@@ -13,6 +13,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
 
+from .resources import resource_path
 from .validation import ValidationError
 
 
@@ -1144,7 +1145,7 @@ def private_doctrine_path() -> Path:
 
 
 def core_rules_path() -> Path:
-    return ROOT / "rules" / "core.md"
+    return resource_path("rules", "core.md")
 
 
 def exports_root() -> Path:

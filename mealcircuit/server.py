@@ -1836,6 +1836,7 @@ def render_nutrition(value: dict) -> str:
 
 def render_result(task_type: str, result: dict) -> str:
     summary = f'<p class="notice card"><strong>综合判断：</strong>{esc(result["summary"])}</p>'
+    fact_only = result.get("analysis_mode", "advisory") == "fact_only"
     if task_type == "photo":
         candidates = []
         for candidate in result["candidates"]:
@@ -1849,19 +1850,33 @@ def render_result(task_type: str, result: dict) -> str:
         friendly = (
             summary + '<h3>候选食物</h3><div class="grid">' + "".join(candidates) + "</div>"
             + '<h3>未知项</h3>' + render_list(result["unknowns"])
-            + '<h3>综合建议</h3>' + render_list(result["advice"])
         )
+        if not fact_only:
+            friendly += '<h3>综合建议</h3>' + render_list(result["advice"])
     else:
-        friendly = (
-            summary + '<h3>可做组合 / 菜品方向</h3>' + render_list(result["combinations"])
-            + '<div class="grid"><section class="card"><h3>整批营养估算</h3>'
+        nutrition = (
+            '<div class="grid"><section class="card"><h3>整批营养估算</h3>'
             + render_nutrition(result["batch_nutrition"])
             + '</section><section class="card"><h3>单份营养估算</h3>'
             + render_nutrition(result["per_serving_nutrition"])
-            + '</section></div><h3>当前缺口</h3>' + render_list(result["gaps"])
-            + '<h3>肠胃 / 执行风险</h3>' + render_list(result["risks"])
-            + '<h3>最小调整</h3>' + render_list(result["minimal_adjustments"])
+            + "</section></div>"
         )
+        if fact_only:
+            friendly = (
+                summary + '<h3>观察到的事实</h3>' + render_list(result["observed_items"])
+                + nutrition
+                + '<h3>当前缺口</h3>' + render_list(result["gaps"])
+                + '<h3>肠胃 / 执行风险</h3>' + render_list(result["risks"])
+                + '<h3>未知项</h3>' + render_list(result["unknowns"])
+            )
+        else:
+            friendly = (
+                summary + '<h3>可做组合 / 菜品方向</h3>' + render_list(result["combinations"])
+                + nutrition
+                + '<h3>当前缺口</h3>' + render_list(result["gaps"])
+                + '<h3>肠胃 / 执行风险</h3>' + render_list(result["risks"])
+                + '<h3>最小调整</h3>' + render_list(result["minimal_adjustments"])
+            )
     raw = esc(json.dumps(result, ensure_ascii=False, indent=2))
     return friendly + f'<details><summary>查看原始 JSON</summary><pre>{raw}</pre></details>'
 
@@ -1942,6 +1957,11 @@ def render_home_cooking_menu(menu: dict) -> str:
 def render_daily_review_result(result: dict) -> str:
     status_labels = {"stable": "稳定", "observe": "观察", "adjust": "需要调整", "risk": "风险上升"}
     menu = result["tomorrow_menu"]
+    protein_target = menu.get("protein_target_g")
+    protein_label = (
+        f"{esc(protein_target[0])}–{esc(protein_target[1])}g"
+        if protein_target is not None else "未知"
+    )
     meals = []
     for meal in menu["meals"]:
         protein = meal["protein_g"]
@@ -1983,7 +2003,7 @@ def render_daily_review_result(result: dict) -> str:
         + '<div class="report-section"><h2>需要留意</h2>' + render_list(result["risk_signals"]) + '</div>'
         + '<div class="report-section"><h2>食材安排</h2>' + priority_html + '</div></section>'
         + f'<aside class="panel report-aside"><p class="subtle-label">{esc(menu["date"])}</p><h2>明天怎么吃</h2>'
-        + f'<p class="muted small">{esc(menu["environment"])} · 蛋白目标 {esc(menu["protein_target_g"][0])}–{esc(menu["protein_target_g"][1])}g</p>'
+        + f'<p class="muted small">{esc(menu["environment"])} · 蛋白目标 {protein_label}</p>'
         + '<ol class="meal-timeline">' + ''.join(meals) + '</ol>'
         + '<div class="report-section"><h3>条件加餐</h3>'
         + f'<p>{esc(snack["condition"])}</p>{render_list(snack["options"])}</div>'

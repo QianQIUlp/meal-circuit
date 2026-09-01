@@ -36,7 +36,7 @@ import kotlinx.serialization.json.jsonPrimitive
 
 private enum class MoreTab(val label: String) {
     OVERVIEW("概览"), TASKS("照片与食材"), FOODS("食品库"), HISTORY("历史"), MEMORY("理解与调整"),
-    SETTINGS("设置"), SYNC("同步"), CONFLICTS("冲突")
+    SETTINGS("设置"), LEGAL("法律与隐私"), SYNC("同步"), CONFLICTS("冲突")
 }
 
 @OptIn(ExperimentalLayoutApi::class)
@@ -63,6 +63,7 @@ fun MoreScreen(viewModel: MainViewModel) {
                 MoreTab.HISTORY -> HistoryScreen(viewModel)
                 MoreTab.MEMORY -> MemoryScreen(viewModel)
                 MoreTab.SETTINGS -> SettingsScreen(viewModel)
+                MoreTab.LEGAL -> LegalScreen()
                 MoreTab.SYNC -> SyncSettingsScreen(viewModel)
                 MoreTab.CONFLICTS -> ConflictScreen(viewModel)
             }

@@ -588,6 +588,13 @@ summary { width: fit-content; color: var(--accent-strong); font-weight: 650; cur
   .signal-card { align-items: flex-start; flex-direction: column; gap: 8px; }
   .settings-row { grid-template-columns: 1fr auto; }
   .settings-row select, .move-actions { grid-column: 1 / -1; }
+  .interface-settings .settings-row { grid-template-columns: minmax(0, 1fr); }
+  .interface-settings .settings-row select {
+    width: 100%;
+    min-width: 0;
+    max-width: 100%;
+    justify-self: stretch;
+  }
   .quiz-card { padding: 20px; }
   .quiz-actions { align-items: stretch; flex-direction: column-reverse; }
   .quiz-actions button { width: 100%; }

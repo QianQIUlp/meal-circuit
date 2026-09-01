@@ -31,8 +31,6 @@ import kotlinx.serialization.json.add
 import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.doubleOrNull
 import kotlinx.serialization.SerializationException
-import org.mealcircuit.app.ai.AiClient
-import org.mealcircuit.app.ai.AiProvider
 import org.mealcircuit.app.data.ManagedAssetEntity
 import org.mealcircuit.app.data.MaterializedRecordEntity
 import org.mealcircuit.app.data.EntityHeadEntity
@@ -41,7 +39,6 @@ import org.mealcircuit.app.domain.DomainRevision
 import org.mealcircuit.app.domain.EntityKind
 import org.mealcircuit.app.domain.CheckinContract
 import org.mealcircuit.app.domain.normalize
-import org.mealcircuit.app.domain.ResultSchemas
 import org.mealcircuit.app.domain.canonicalizeLogicalPayload
 import org.mealcircuit.app.domain.preferenceId
 import org.mealcircuit.app.domain.taskInputId
@@ -79,20 +76,6 @@ data class PortableImportUi(
 private val ASSET_EXTENSIONS = mapOf(
     "image/jpeg" to ".jpg", "image/png" to ".png",
     "image/gif" to ".gif", "image/webp" to ".webp",
-)
-
-private data class TaskGenerationSnapshot(
-    val input: MaterializedRecordEntity,
-    val task: MaterializedRecordEntity,
-    val inputHeadRevisionId: String,
-    val taskHeadRevisionId: String,
-    val recentRecords: List<MaterializedRecordEntity>,
-    val recentCheckins: List<MaterializedRecordEntity>,
-    val foodLibrary: List<MaterializedRecordEntity>,
-    val memories: List<MaterializedRecordEntity>,
-    val adjustments: List<MaterializedRecordEntity>,
-    val domainPreferences: List<MaterializedRecordEntity>,
-    val sourceHeads: List<EntityHeadEntity>,
 )
 
 internal fun canReuseManagedAsset(
@@ -151,6 +134,11 @@ class SettingsEditorState {
     var settingsSource by mutableStateOf<String?>(null)
 }
 private const val EXPORT_RECOVERY_KEY = "portable.export_recovery_key"
+internal val LEGACY_AI_SECRET_NAMES = listOf(
+    "ai.openai",
+    "ai.anthropic",
+    "ai.deepseek",
+)
 
 private fun zoneIdOrNull(value: String?): ZoneId? = value
     ?.trim()
@@ -167,7 +155,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     val repository = app.repository
     private val accounts = lazy { SyncAccountManager(repository, app.vault) }
     private val keyRotation = lazy { KeyRotationManager(application, repository, app.vault) }
-    private val ai = lazy { AiClient(app.vault) }
     private val portable = lazy { PortableData(application, repository) }
     private val checkinContract = lazy { CheckinContract.load(application) }
     val settingsEditor = SettingsEditorState()
@@ -868,520 +855,21 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         SyncWorker.enqueue(getApplication())
     }
 
-    fun saveAiKey(
-        provider: AiProvider,
-        model: String,
-        key: String,
-        onSuccess: () -> Unit = {},
-    ) = launchAction(
-        "AI 配置已保存；API Key 已由 Android Keystore 包装",
-        actionKey = "ai",
+    fun clearLegacyAiConfiguration(onSuccess: () -> Unit = {}) = launchAction(
+        "旧版设备 AI 配置已清理",
+        actionKey = "legacy-ai-cleanup",
         onSuccess = onSuccess,
     ) {
-        require(model.isNotBlank())
         withContext(Dispatchers.IO) {
-            ai.value.saveKey(provider, key)
-            check(preferences.edit().putString("ai_provider", provider.name).putString("ai_model", model.trim()).commit())
-        }
-    }
-
-    fun generateLatestTask() = launchAction("任务分析已保存到本机", actionKey = "ai") {
-        val today = LocalDate.now(currentZoneId())
-        val start = today.minusDays(13)
-        val snapshot = repository.mutateTransaction {
-            val capturedInput = records(EntityKind.TASK_INPUT).firstOrNull() ?: error("没有任务输入")
-            val capturedInputPayload = Json.parseToJsonElement(capturedInput.payloadJson).jsonObject
-            val capturedTaskId = capturedInputPayload.getValue("task_id").jsonPrimitive.content
-            val capturedTask = record(capturedTaskId) ?: error("任务主体缺失")
-            val capturedRecentRecords = records(EntityKind.DAILY_RECORD).filter { record ->
-                runCatching { LocalDate.parse(Json.parseToJsonElement(record.payloadJson).jsonObject
-                    .getValue("record_date").jsonPrimitive.content) in start..today }.getOrDefault(false)
-            }
-            val capturedRecentCheckins = records(EntityKind.CHECKIN_DAY).filter { record ->
-                runCatching { LocalDate.parse(Json.parseToJsonElement(record.payloadJson).jsonObject
-                    .getValue("checkin").jsonObject.getValue("checkin_date").jsonPrimitive.content) in start..today }
-                    .getOrDefault(false) && record.publishedCheckinPayload() != null
-            }
-            val capturedFoodLibrary = records(EntityKind.FOOD_ITEM).filterNot { it.deleted }
-            val capturedMemories = records(EntityKind.MEMORY).filter { it.activePayload() }
-            val capturedAdjustments = records(EntityKind.ADJUSTMENT).filter { it.activePayload() }
-            val capturedPreferences = records(EntityKind.PREFERENCES)
-            val sourceIds = setOf(capturedTaskId, capturedInput.entityId) +
-                capturedRecentRecords.map { it.entityId } + capturedRecentCheckins.map { it.entityId } +
-                capturedFoodLibrary.map { it.entityId } + capturedMemories.map { it.entityId } +
-                capturedAdjustments.map { it.entityId } + capturedPreferences.map { it.entityId }
-            val capturedHeads = heads().filter { it.entityId in sourceIds }
-            require(capturedHeads.map { it.entityId }.toSet() == sourceIds) { "任务来源版本信息不完整" }
-            TaskGenerationSnapshot(
-                input = capturedInput,
-                task = capturedTask,
-                inputHeadRevisionId = requireNotNull(head(capturedInput.entityId)) { "任务输入版本缺失" }.revisionId,
-                taskHeadRevisionId = requireNotNull(head(capturedTaskId)) { "任务版本缺失" }.revisionId,
-                recentRecords = capturedRecentRecords,
-                recentCheckins = capturedRecentCheckins,
-                foodLibrary = capturedFoodLibrary,
-                memories = capturedMemories,
-                adjustments = capturedAdjustments,
-                domainPreferences = capturedPreferences,
-                sourceHeads = capturedHeads,
+            app.vault.deleteAll(LEGACY_AI_SECRET_NAMES)
+            check(
+                preferences.edit()
+                    .remove("ai_provider")
+                    .remove("ai_model")
+                    .commit()
             )
         }
-        val input = snapshot.input
-        val inputPayload = Json.parseToJsonElement(input.payloadJson).jsonObject
-        val taskId = inputPayload.getValue("task_id").jsonPrimitive.content
-        val task = snapshot.task
-        val taskPayload = Json.parseToJsonElement(task.payloadJson).jsonObject
-        val taskRow = taskPayload.getValue("task").jsonObject
-        if (taskRow["status"]?.jsonPrimitive?.content == "completed") error("最新任务已完成")
-        val taskType = taskRow.getValue("type").jsonPrimitive.content
-        val recentRecords = snapshot.recentRecords
-        val recentCheckins = snapshot.recentCheckins
-        val foodLibrary = snapshot.foodLibrary
-        val memories = snapshot.memories
-        val adjustments = snapshot.adjustments
-        val domainPreferences = snapshot.domainPreferences
-        val settings = domainPreferences.preferenceContent("settings")?.let {
-            runCatching { Json.parseToJsonElement(it).jsonObject }.getOrNull()
-        }
-        val doctrine = domainPreferences.preferenceContent("doctrine").orEmpty()
-        val source = sourceSnapshot(snapshot.sourceHeads)
-        val context = buildJsonObject {
-            put("task", taskRow)
-            put("task_input", inputPayload)
-            put("recent_days", 14)
-            put("doctrine", buildJsonObject {
-                put("mode", if (doctrine.isBlank()) "public_core" else "private_override")
-                put("sources", buildJsonArray { add(if (doctrine.isBlank()) "rules/core.md" else "doctrine.private.md") })
-                put("content", doctrine)
-            })
-            settings?.let { put("settings", it) }
-            put("source_revisions", source)
-            putJsonArray("recent_records") { recentRecords.forEach { add(Json.parseToJsonElement(it.payloadJson)) } }
-            putJsonArray("recent_checkins") { recentCheckins.forEach { add(requireNotNull(it.publishedCheckinPayload())) } }
-            putJsonArray("food_library_matches") { foodLibrary.forEach { add(Json.parseToJsonElement(it.payloadJson)) } }
-            putJsonArray("long_term_memories") { memories.forEach { add(Json.parseToJsonElement(it.payloadJson)) } }
-            putJsonArray("current_adjustments") { adjustments.forEach { add(Json.parseToJsonElement(it.payloadJson)) } }
-            putJsonArray("preferences") { domainPreferences.forEach { add(Json.parseToJsonElement(it.payloadJson)) } }
-            put("result_schema", ResultSchemas.task(taskType))
-            put("analysis_boundary", "照片与数量只能区间估算；不可伪造不可见油、酱汁、重量或品牌。")
-        }
-        val imageAsset = inputPayload["asset_id"]?.jsonPrimitive?.content?.let { repository.asset(it) }
-        val image = imageAsset?.relativePath?.let { relativePath ->
-            withContext(Dispatchers.IO) {
-                getApplication<Application>().filesDir.resolve(relativePath).inputStream().use {
-                    it.readBounded(MAX_MANAGED_ASSET_BYTES)
-                }
-            }
-        }
-        val result = ai.value.generate(aiConfiguration(), taskType, context, image, imageAsset?.mediaType)
-        org.mealcircuit.app.domain.ResultValidator.task(
-            taskType,
-            result,
-        )
-        val provenance = provenance(source, domainPreferences)
-        repository.mutateTransaction {
-            require(head(input.entityId)?.revisionId == snapshot.inputHeadRevisionId) {
-                "任务输入在分析期间已变化，请重新生成"
-            }
-            require(head(taskId)?.revisionId == snapshot.taskHeadRevisionId) {
-                "任务在分析期间已变化，请重新生成"
-            }
-            for (headRow in snapshot.sourceHeads) {
-                if (headRow.entityId == input.entityId || headRow.entityId == taskId) continue
-                require(head(headRow.entityId)?.revisionId == headRow.revisionId) {
-                    "分析期间相关数据已变化，请重新生成"
-                }
-            }
-            val currentInput = requireNotNull(record(input.entityId)) { "任务输入已不存在" }
-            val currentTask = requireNotNull(record(taskId)) { "任务主体已不存在" }
-            require(currentInput.entityKind == "task_input" && currentTask.entityKind == "task") {
-                "任务类型在分析期间已变化，请重新生成"
-            }
-            val currentInputPayload = Json.parseToJsonElement(currentInput.payloadJson).jsonObject
-            require(
-                currentInputPayload["input_version"]?.jsonPrimitive?.content ==
-                    inputPayload["input_version"]?.jsonPrimitive?.content
-            ) { "任务输入在分析期间已变化，请重新生成" }
-            val currentTaskRow = Json.parseToJsonElement(currentTask.payloadJson).jsonObject
-                .getValue("task").jsonObject
-            require(currentTaskRow["status"]?.jsonPrimitive?.content == "pending") {
-                "任务已被完成或修改，请重新检查"
-            }
-            save(
-                EntityKind.ANALYSIS_RESULT,
-                buildJsonObject {
-                    put("source_entity_id", taskId); put("source_kind", "task")
-                    put("result_version", 1); put("result", result); put("provenance", provenance)
-                },
-            )
-            save(
-                EntityKind.TASK,
-                buildJsonObject {
-                    put("task", JsonObject(currentTaskRow + mapOf(
-                        "status" to JsonPrimitive("completed"),
-                        "result_json" to result,
-                        "result_provenance_json" to provenance,
-                        "result_version" to JsonPrimitive(
-                            (currentTaskRow["result_version"]?.jsonPrimitive?.content?.toIntOrNull() ?: 0) + 1
-                        ),
-                        "completed_at" to JsonPrimitive(Instant.now().toString()),
-                    )))
-                },
-                taskId,
-            )
-        }
-        SyncWorker.enqueue(getApplication())
     }
-
-    // Android records execution evidence and renders plans already published by
-    // Windows. It must not create a competing daily review outside the shared
-    // seven-stage workflow.
-    @Deprecated("每日复盘仅由 Windows 的七阶段工作流发布", level = DeprecationLevel.ERROR)
-    private fun generateDailyReview() = launchAction("每日复盘请在 Windows 完成") {
-        val reviewDay = LocalDate.now(currentZoneId())
-        val windowStart = reviewDay.minusDays(13)
-        val records = repository.records(EntityKind.DAILY_RECORD).filter { record ->
-            runCatching { LocalDate.parse(Json.parseToJsonElement(record.payloadJson).jsonObject
-                .getValue("record_date").jsonPrimitive.content) in windowStart..reviewDay }.getOrDefault(false)
-        }
-        val checkins = repository.records(EntityKind.CHECKIN_DAY).filter { record ->
-            runCatching { LocalDate.parse(Json.parseToJsonElement(record.payloadJson).jsonObject
-                .getValue("checkin").jsonObject.getValue("checkin_date").jsonPrimitive.content) in windowStart..reviewDay }
-                .getOrDefault(false) && record.publishedCheckinPayload() != null
-        }
-        val foods = repository.records(EntityKind.FOOD_ITEM)
-        val memories = repository.records(EntityKind.MEMORY).filter { it.activePayload() }
-        val adjustments = repository.records(EntityKind.ADJUSTMENT).filter { it.activePayload() }
-        val preferences = repository.records(EntityKind.PREFERENCES)
-        val previousReviews = repository.records(EntityKind.DAILY_REVIEW).filter { record ->
-            runCatching {
-                val value = LocalDate.parse(Json.parseToJsonElement(record.payloadJson).jsonObject
-                    .getValue("review").jsonObject.getValue("review_date").jsonPrimitive.content)
-                value >= windowStart && value < reviewDay
-            }.getOrDefault(false)
-        }
-        val settings = preferences.firstNotNullOfOrNull { record ->
-            runCatching {
-                val outer = Json.parseToJsonElement(record.payloadJson).jsonObject
-                if (outer["kind"]?.jsonPrimitive?.content != "settings") null
-                else Json.parseToJsonElement(outer.getValue("content").jsonPrimitive.content).jsonObject
-            }.getOrNull()
-        }
-        val doctrine = preferences.preferenceContent("doctrine").orEmpty()
-        val priorityFoodIds = foods.mapNotNull { record ->
-            val food = runCatching {
-                Json.parseToJsonElement(record.payloadJson).jsonObject.getValue("food").jsonObject
-            }.getOrNull() ?: return@mapNotNull null
-            if (food["menu_priority"]?.jsonPrimitive?.content == "high") record.entityId else null
-        }.toSet()
-        val carryovers = carryoverObligations(previousReviews, reviewDay)
-        val carryoverIds = carryovers.map { it.jsonObject.getValue("id").jsonPrimitive.content }.toSet()
-        val recentHomeMenus = previousReviews.mapNotNull { record ->
-            runCatching {
-                Json.parseToJsonElement(record.payloadJson).jsonObject.getValue("review").jsonObject
-                    .getValue("result_json").jsonObject.getValue("tomorrow_menu").jsonObject
-            }.getOrNull()
-        }
-        val previousRotation = recentHomeMenus.firstNotNullOfOrNull { it["rotation"] as? JsonObject }
-        val targetReview = repository.records(EntityKind.DAILY_REVIEW).firstNotNullOfOrNull { record ->
-            runCatching {
-                Json.parseToJsonElement(record.payloadJson).jsonObject.takeIf { payload ->
-                    payload.getValue("review").jsonObject.getValue("review_date").jsonPrimitive.content == reviewDay.toString()
-                }
-            }.getOrNull()
-        }
-        require(targetReview != null) { "今天没有可复盘的饮食记录或已发布状态" }
-        require(targetReview.getValue("review").jsonObject.getValue("status").jsonPrimitive.content == "pending") {
-            "今日复盘已经完成；新增记录或发布新状态后才会重新排队"
-        }
-        val targetCheckin = checkins.firstNotNullOfOrNull { record ->
-            record.publishedCheckinPayload()?.takeIf { payload ->
-                payload.getValue("checkin").jsonObject.getValue("checkin_date").jsonPrimitive.content == reviewDay.toString()
-            }
-        }
-        val targetModules = targetCheckin?.get("modules")?.jsonArray.orEmpty()
-        val publishedKeys = targetModules.map { element ->
-            element.jsonObject.getValue("module").jsonObject.getValue("module_key").jsonPrimitive.content
-        }.toSet()
-        val dueModules = _checkinModules.value.sorted()
-        val sourceCheckinVersions = buildJsonObject {
-            targetModules.forEach { element ->
-                val module = element.jsonObject.getValue("module").jsonObject
-                put(module.getValue("module_key").jsonPrimitive.content, module.getValue("version"))
-            }
-        }
-        val targetModuleSummaries = buildJsonArray {
-            targetModules.forEach { element ->
-                val module = element.jsonObject.getValue("module").jsonObject
-                val status = module.getValue("status").jsonPrimitive.content
-                add(buildJsonObject {
-                    put("module_key", module.getValue("module_key")); put("status", status)
-                    put("version", module.getValue("version"))
-                    put("answers", module["answers_json"] ?: JsonNull)
-                    put(
-                        "summary",
-                        if (status == "skipped") "用户选择今天不提供"
-                        else module["answers_json"]?.toString().orEmpty(),
-                    )
-                })
-            }
-        }
-        val sourceIds = records.map { it.entityId }.toSet() + checkins.map { it.entityId } + foods.map { it.entityId } +
-            memories.map { it.entityId } + adjustments.map { it.entityId } + preferences.map { it.entityId } +
-            previousReviews.map { it.entityId }
-        val source = sourceSnapshot(repository.heads().filter { it.entityId in sourceIds })
-        val context = buildJsonObject {
-            put("recent_days", 14)
-            put("daily_review", targetReview.getValue("review"))
-            put("doctrine", buildJsonObject {
-                put("mode", if (doctrine.isBlank()) "public_core" else "private_override")
-                put("sources", buildJsonArray { add(if (doctrine.isBlank()) "rules/core.md" else "doctrine.private.md") })
-                put("content", doctrine)
-            })
-            put("source_revisions", source)
-            putJsonArray("recent_records") {
-                records.forEach { add(Json.parseToJsonElement(it.payloadJson)) }
-            }
-            putJsonArray("recent_checkins") {
-                checkins.forEach { record ->
-                    val payload = requireNotNull(record.publishedCheckinPayload())
-                    val checkinRow = payload.getValue("checkin").jsonObject
-                    payload.getValue("modules").jsonArray.forEach { element ->
-                        val module = element.jsonObject.getValue("module").jsonObject
-                        add(buildJsonObject {
-                            put("checkin_id", checkinRow.getValue("id"))
-                            put("checkin_date", checkinRow.getValue("checkin_date"))
-                            put("module_key", module.getValue("module_key")); put("status", module.getValue("status"))
-                            put("answers_json", module["answers_json"] ?: JsonObject(emptyMap()))
-                            put("version", module.getValue("version")); put("completed_at", module["completed_at"] ?: JsonNull)
-                        })
-                    }
-                }
-            }
-            put("target_checkin", buildJsonObject {
-                put("date", reviewDay.toString())
-                put("modules", targetModuleSummaries)
-            })
-            put("checkin_coverage", buildJsonObject {
-                put("due", dueModules.size); put("handled", publishedKeys.intersect(dueModules.toSet()).size)
-                put("missing", buildJsonArray { (dueModules - publishedKeys).forEach { add(it) } })
-            })
-            put(
-                "checkin_resolution_note",
-                "同日同模块仅使用最新已发布版本；草稿不进入上下文，明确跳过和缺失都保持未知。",
-            )
-            putJsonArray("food_library") {
-                foods.forEach { add(Json.parseToJsonElement(it.payloadJson)) }
-            }
-            putJsonArray("priority_foods") {
-                foods.filter { it.entityId in priorityFoodIds }.forEach { add(Json.parseToJsonElement(it.payloadJson)) }
-            }
-            put("ingredient_carryover_obligations", carryovers)
-            put("recent_home_dinners", buildJsonArray { recentHomeMenus.take(14).forEach { add(it) } })
-            put("recent_online_categories", buildJsonArray {
-                recentHomeMenus.take(14).flatMap { menu -> menu["online_options"]?.jsonArray.orEmpty() }
-                    .mapNotNull { it.jsonObject["category"]?.jsonPrimitive?.content }
-                    .distinct().forEach { add(it) }
-            })
-            put("home_cooking_generation_protocol", buildJsonObject {
-                put("breakfast", "quick_assembly"); put("lunch", "eat_out")
-                put("dinner", "home_cook beginner card within configured time and cookware limits")
-                put("rotation", "reuse ingredients while rotating dish and primary flavor")
-            })
-            putJsonArray("long_term_memories") {
-                memories.filterNot { it.deleted }.forEach { add(Json.parseToJsonElement(it.payloadJson)) }
-            }
-            putJsonArray("current_adjustments") {
-                adjustments.filterNot { it.deleted }.forEach { add(Json.parseToJsonElement(it.payloadJson)) }
-            }
-            putJsonArray("preferences") {
-                preferences.forEach { add(Json.parseToJsonElement(it.payloadJson)) }
-            }
-            settings?.let { put("settings", it) }
-            put("home_cooking_preferences", settings?.get("home_cooking") ?: buildJsonObject { put("enabled", false) })
-            put("result_schema", ResultSchemas.daily(
-                reviewDay.plusDays(1),
-                settings?.get("meal_environment")?.jsonPrimitive?.content ?: "用户自行配置",
-                settings?.get("protein_target_g")?.jsonArray ?: buildJsonArray { add(50); add(65) },
-                priorityFoodIds,
-                settings?.get("home_cooking")?.jsonObject,
-                carryovers,
-            ))
-        }
-        val result = ai.value.generate(aiConfiguration(), "daily", context)
-        org.mealcircuit.app.domain.ResultValidator.daily(
-            result,
-            reviewDay.plusDays(1),
-            expectedPriorityFoodIds = priorityFoodIds,
-            expectedEnvironment = settings?.get("meal_environment")?.jsonPrimitive?.content,
-            expectedProteinTarget = settings?.get("protein_target_g")?.jsonArray,
-            expectedCarryoverIds = carryoverIds,
-            homeCooking = settings?.get("home_cooking")?.jsonObject,
-            previousRotation = previousRotation,
-        )
-        val provenance = provenance(source, preferences)
-        val day = reviewDay.toString()
-        val existingRecord = repository.records(EntityKind.DAILY_REVIEW).firstOrNull { record ->
-            runCatching {
-                Json.parseToJsonElement(record.payloadJson).jsonObject.getValue("review").jsonObject
-                    .getValue("review_date").jsonPrimitive.content == day
-            }.getOrDefault(false)
-        }
-        val existing = existingRecord?.let { Json.parseToJsonElement(it.payloadJson).jsonObject }
-        val previousReview = existing?.get("review")?.jsonObject
-        val reviewId = existingRecord?.entityId ?: DomainRevision.id("review")
-        val timestamp = Instant.now().toString()
-        val resultVersion = (previousReview?.get("result_version")?.jsonPrimitive?.content?.toIntOrNull() ?: 0) + 1
-        val sourceRecordIds = buildJsonArray {
-            records.filter { record ->
-                runCatching {
-                    Json.parseToJsonElement(record.payloadJson).jsonObject
-                        .getValue("record_date").jsonPrimitive.content == day
-                }.getOrDefault(false)
-            }.map { it.entityId }.sorted().forEach { add(JsonPrimitive(it)) }
-        }
-        val previousResult = previousReview?.get("result_json")
-        repository.save(
-            EntityKind.DAILY_REVIEW,
-            buildJsonObject {
-                put("review", buildJsonObject {
-                    put("id", reviewId); put("review_date", day); put("status", "completed")
-                    put("source_record_ids_json", sourceRecordIds); put("result_json", result)
-                    put("source_checkin_versions_json", sourceCheckinVersions)
-                    put("result_provenance_json", provenance)
-                    put("result_version", resultVersion)
-                    put("created_at", previousReview?.get("created_at") ?: JsonPrimitive(timestamp))
-                    put("updated_at", timestamp); put("completed_at", timestamp)
-                })
-                put("history", buildJsonArray {
-                    existing?.get("history")?.jsonArray?.forEach { add(it) }
-                    if (previousReview != null && previousResult != null && previousResult !is JsonNull) {
-                        add(buildJsonObject {
-                            put("id", DomainRevision.id("review_history")); put("review_id", reviewId)
-                            put("version", previousReview["result_version"] ?: JsonPrimitive(1))
-                            put("source_record_ids_json", previousReview["source_record_ids_json"] ?: buildJsonArray {})
-                            put("result_json", previousResult)
-                            previousReview["result_provenance_json"]?.let { put("result_provenance_json", it) }
-                            put("completed_at", previousReview["completed_at"] ?: JsonNull)
-                            put("archived_at", timestamp); put("archive_reason", "new_source")
-                        })
-                    }
-                })
-            },
-            reviewId,
-        )
-        repository.save(
-            EntityKind.ANALYSIS_RESULT,
-            buildJsonObject {
-                put("source_entity_id", reviewId); put("source_kind", "daily_review")
-                put("result_version", resultVersion); put("result", result); put("provenance", provenance)
-            },
-        )
-        SyncWorker.enqueue(getApplication())
-    }
-
-    private fun sourceSnapshot(heads: List<EntityHeadEntity>) = buildJsonArray {
-        heads.forEach { head ->
-            add(buildJsonObject {
-                put("entity_id", head.entityId); put("entity_kind", head.entityKind); put("revision_id", head.revisionId)
-            })
-        }
-    }
-
-    private fun carryoverObligations(
-        reviews: List<org.mealcircuit.app.data.MaterializedRecordEntity>,
-        reviewDay: LocalDate,
-    ) = buildJsonArray {
-        val target = reviewDay.plusDays(1)
-        reviews.forEach { record ->
-            val review = runCatching {
-                Json.parseToJsonElement(record.payloadJson).jsonObject.getValue("review").jsonObject
-            }.getOrNull() ?: return@forEach
-            if (review["status"]?.jsonPrimitive?.content != "completed") return@forEach
-            val reviewDate = runCatching { LocalDate.parse(review.getValue("review_date").jsonPrimitive.content) }.getOrNull()
-                ?: return@forEach
-            if (!reviewDate.isBefore(reviewDay)) return@forEach
-            val result = review["result_json"] as? JsonObject ?: return@forEach
-            val menu = result["tomorrow_menu"] as? JsonObject ?: return@forEach
-            val menuDate = runCatching { LocalDate.parse(menu.getValue("date").jsonPrimitive.content) }.getOrNull()
-                ?: return@forEach
-            val reuse = menu["reuse_plan"] as? JsonObject ?: return@forEach
-            val horizon = reuse["horizon_days"]?.jsonPrimitive?.content?.toIntOrNull() ?: return@forEach
-            if (reviewDay > menuDate.plusDays((horizon - 1).toLong())) return@forEach
-            val shopping = menu["shopping_list"]?.jsonArray.orEmpty()
-            reuse["items"]?.jsonArray?.forEachIndexed { index, element ->
-                val item = element.jsonObject
-                val ingredient = item["ingredient"]?.jsonPrimitive?.content?.trim().orEmpty()
-                if (ingredient.isEmpty()) return@forEachIndexed
-                val reuseText = buildString {
-                    append(ingredient); append(' ')
-                    append(item["tomorrow_use"]?.jsonPrimitive?.content.orEmpty()); append(' ')
-                    append(item["storage"]?.jsonPrimitive?.content.orEmpty()); append(' ')
-                    item["later_uses"]?.jsonArray.orEmpty().forEach { use ->
-                        append(use.jsonObject["use"]?.jsonPrimitive?.content.orEmpty()); append(' ')
-                    }
-                }.lowercase()
-                val hasRequiredPurchase = shopping.any { purchase ->
-                    val value = purchase.jsonObject
-                    val name = value["name"]?.jsonPrimitive?.content.orEmpty()
-                    value["required"]?.jsonPrimitive?.booleanOrNull == true &&
-                        (reuseText.contains(name.lowercase()) || name.contains(ingredient, ignoreCase = true))
-                }
-                if (!hasRequiredPurchase) return@forEachIndexed
-                val planned = item["later_uses"]?.jsonArray.orEmpty().mapNotNull { use ->
-                    val value = use.jsonObject
-                    val date = runCatching { LocalDate.parse(value.getValue("date").jsonPrimitive.content) }.getOrNull()
-                        ?: return@mapNotNull null
-                    if (date < reviewDay || date > target || date > menuDate.plusDays((horizon - 1).toLong())) null else value
-                }.minByOrNull { it.getValue("date").jsonPrimitive.content } ?: return@forEachIndexed
-                val raw = "${record.entityId}|${menuDate}|$index|$ingredient"
-                val id = "carryover_${MessageDigest.getInstance("SHA-256").digest(raw.toByteArray()).hex().take(12)}"
-                add(buildJsonObject {
-                    put("id", id); put("source_review_date", reviewDate.toString())
-                    put("source_menu_date", menuDate.toString()); put("ingredient", ingredient)
-                    put("planned_use_date", planned.getValue("date")); put("planned_use", planned.getValue("use"))
-                    put("storage", item["storage"] ?: JsonPrimitive(""))
-                })
-            }
-        }
-    }
-
-    private fun provenance(
-        source: kotlinx.serialization.json.JsonArray,
-        preferenceRecords: List<MaterializedRecordEntity>,
-    ) = buildJsonObject {
-        fun document(kind: String): Pair<String?, String?> {
-            val record = preferenceRecords.firstOrNull { item ->
-                runCatching {
-                    Json.parseToJsonElement(item.payloadJson).jsonObject["kind"]?.jsonPrimitive?.content == kind
-                }.getOrDefault(false)
-            } ?: return null to null
-            val content = Json.parseToJsonElement(record.payloadJson).jsonObject
-                .getValue("content").jsonPrimitive.content
-            val revision = source.firstOrNull { element ->
-                element.jsonObject["entity_id"]?.jsonPrimitive?.content == record.entityId
-            }?.jsonObject?.get("revision_id")?.jsonPrimitive?.content
-            return revision to MessageDigest.getInstance("SHA-256").digest(content.toByteArray()).hex()
-        }
-        val settings = document("settings")
-        val doctrine = document("doctrine")
-        put("schema_version", 1); put("source_revisions", source); put("result_schema_version", 1)
-        put("settings_revision_id", settings.first?.let(::JsonPrimitive) ?: JsonNull)
-        put("settings_sha256", settings.second?.let(::JsonPrimitive) ?: JsonNull)
-        put("doctrine_revision_id", doctrine.first?.let(::JsonPrimitive) ?: JsonNull)
-        put("doctrine_sha256", doctrine.second?.let(::JsonPrimitive) ?: JsonNull)
-        put("generator", buildJsonObject {
-            put("provider", preferences.getString("ai_provider", "") ?: "")
-            put("model", preferences.getString("ai_model", "") ?: "")
-            put("generated_at", Instant.now().toString())
-        })
-    }
-
-    private fun aiConfiguration() = org.mealcircuit.app.ai.AiConfiguration(
-        AiProvider.valueOf(preferences.getString("ai_provider", null) ?: error("请先配置 AI provider")),
-        preferences.getString("ai_model", null) ?: error("请先配置模型"),
-    )
-
     fun saveTimezone(value: String) = launchAction("时区已保存") {
         val normalized = requireZoneId(value).id
         val entityId = preferenceId("settings")

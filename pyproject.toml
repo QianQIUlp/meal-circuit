@@ -1,14 +1,15 @@
 [build-system]
-requires = ["setuptools>=75"]
+requires = ["setuptools==83.0.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "mealcircuit"
-version = "0.3.0"
+version = "0.3.1"
 description = "Local-first long-horizon meal feedback workbench"
 readme = "README.md"
 requires-python = ">=3.11"
-license = { text = "MIT" }
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [{ name = "MealCircuit contributors" }]
 dependencies = [
   "tzdata>=2026.3,<2027; platform_system == 'Windows'"
@@ -16,11 +17,11 @@ dependencies = [
 
 [project.optional-dependencies]
 sync = [
-  "cryptography>=45,<50",
+  "cryptography>=50,<51",
   "keyring>=25,<27"
 ]
 desktop = [
-  "cryptography>=45,<50",
+  "cryptography>=50,<51",
   "keyring>=25,<27",
   "pywebview>=5.4,<7",
   "pyinstaller>=6.20,<7"
@@ -53,12 +54,24 @@ include = ["mealcircuit*", "sync_server*"]
 
 [tool.setuptools.package-data]
 mealcircuit = ["static/**/*"]
-sync_server = ["alembic.ini", "Caddyfile", "alembic/**/*"]
+sync_server = ["alembic.ini", "Caddyfile", "alembic/script.py.mako"]
 
 [tool.setuptools.data-files]
+"share/mealcircuit/rules" = ["rules/core.md"]
+"share/mealcircuit/templates" = [
+  "templates/profile.md",
+  "templates/settings.json"
+]
 "share/mealcircuit/protocol" = [
   "protocol/checkin-modules-v1.json",
   "protocol/domain-v1.schema.json",
   "protocol/state-machines-v1.json",
   "protocol/sync-v1.openapi.json"
+]
+"share/mealcircuit/legal" = [
+  "LICENSE",
+  "THIRD_PARTY_LICENSES.md",
+  "PRIVACY.md",
+  "SECURITY.md",
+  "DISCLAIMER.md"
 ]

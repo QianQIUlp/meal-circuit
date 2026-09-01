@@ -547,7 +547,9 @@ class AdaptiveDomainTest(unittest.TestCase):
                 "source": "注册营养师书面计划",
                 "summary": "按个人情况维持规律三餐并使用给定蛋白范围。",
                 "confirmed_on": "2026-07-10",
-                "valid_until": "2026-08-10",
+                # Keep this fixture current independently of the wall clock;
+                # expiry behavior is covered by the dedicated test above.
+                "valid_until": "2099-12-31",
             },
         )
         current = personalization.complete_onboarding(
