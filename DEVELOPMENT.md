@@ -1,5 +1,16 @@
 # 开发过程记忆
 
+## 2026-08-12：v0.3.1 发布基线清障（仅 Windows x64 + Android）
+
+- 目标与范围：按当前产品范围只维护 Windows x64 与 Android；本轮清除已知发布阻碍并补齐可重复门禁，不执行提交、推送、打 tag 或公开发布，也不要求在本机生成已签名的最终六项资产。Python Web/CLI 属于 Windows 实现，Android 继续只消费经 Windows/Python 七阶段流程审查并发布的计划。
+- 安装与首次使用：修复 wheel/sdist 缺少 `rules/`、`templates/`、协议和法律资料的问题，统一源码、冻结包与 wheel 的资源定位；新安装模板允许蛋白目标在 onboarding 前保持未知，`init` 后 `doctor` 不再误报。发布门会真实构建 wheel/sdist、拒绝 `pyc/__pycache__`，隔离安装后再运行 `init/doctor`。构建后端固定为支持 PEP 639 的 `setuptools==83.0.0`。
+- 产品与边界：修复“我的”页 390px 主题控件横向溢出；README、v0.3.1 发行说明、中英文站点、安全与威胁模型统一说明无捆绑规划模型、模型 API Key 仅存当前 Python 进程、Android 不执行本地每日生成；公开下载范围固定为 Windows portable/setup、Android APK/AAB，加 SBOM 与 SHA256 共六项。
+- 发布门：tag 会等待同一 tag/commit 的完整测试 workflow，私密漏洞报告、Windows Authenticode、Android 四项签名凭据均 fail closed；Android APK 与 keystore alias 必须延续公开 v0.3.0 证书 SHA-256，AAB 严格验签；release 只下载四个最终平台产物并生成锁文件派生的 CycloneDX SBOM 与校验和。Windows 包从实际锁定环境收集项目、Python 与每个分发包的许可证并在冻结包、便携包、安装目录复验；Android 在应用内提供六份法律文本，并直接打开最终 APK/AAB 核验法律资产、许可证全文及 ZIP 安全边界。
+- Windows 真实窗口：新增隐藏的 `--ui-smoke-test`，使用一次性数据目录真正创建 pywebview/WebView2 窗口，等待首个页面加载后关闭，且有 45 秒加载上限与进程级 watchdog；发布 workflow 对冻结 EXE 单独执行 70 秒有界的真实 WebView 门禁。当前源码 WebView 与重新构建的 PyInstaller EXE 均实跑成功，冻结 EXE UI smoke 约 30.59 秒退出 0；此前也以隔离 home 人工检查过实际原生窗口和首次设置页。
+- Android 法律与构建：新增 installed-app instrumentation 法律资产测试和最终 APK/AAB 标准库检查器；Android 源码法律门与恶意 ZIP/篡改/缺失回归通过。当前轮隔离 JDK 17 / SDK 36 验证中，JVM 单测 30/30 通过，生成的 debug APK 为 `org.mealcircuit.app`、`versionCode=30001`、`versionName=0.3.1` 并包含全部六份法律资产，androidTest Kotlin 也已编译；按用户缩小验收目标后中止长跑，因此本轮未完成 lint、设备 instrumentation 或 release 构建，没有把未完成的签名成品当作已发布证据。
+- 验证：当前稳定快照的 Python 全量在发布范围收敛前为 333 通过、0 失败、1 项因本机未配置 PostgreSQL URL 跳过；随后发布/法律/真实 GUI 增量定向 48/48 通过。另有发布策略/版本/站点/SBOM等 39 项通过（1 项 actionlint 本地跳过，独立 actionlint 已通过）、资源/桌面/Android 24 项通过；`tools/dependency_check.py`、OpenAPI、协议、版本、`release_check`、两种 uv 的 lock check、wheel/sdist 隔离安装、SBOM 239 components、Windows 与 sync 两套 `pip-audit` 均通过并报告无已知漏洞；`git diff --check` 通过。浏览器实测 390px `/me` 的 document/body scrollWidth 均为 375、主题控件边界 45.33–329.33；桌面产品站 1440px 无溢出。
+- 未执行的外部动作与当前外部阻塞：仓库的 private vulnerability reporting 仍未开启，Windows Authenticode secrets 尚未配置，v0.3.1 本地变更尚未形成提交/推送/tag，公开 v0.3.1 Release 尚不存在。因此不要先把 README/站点中的 v0.3.1 链接部署到 `main`；正确顺序是先配置管理员门禁与签名材料，再提交并跑绿同 tag CI、生成并核验 Release，最后上线对应站点链接。本轮没有改写或丢弃共享的 `tests/test_mealcircuit.py`；其 SHA-256 保持 `07E3561607A6690741385D241B36E356362A3B0FF1D62F195875FA136F812D47`。
+
 ## 2026-08-09：Windows 冻结包版本资源接缝
 
 - 原因：`mealcircuit.__init__` 在冻结环境没有 distribution metadata 时，按既定版本语义回退读取项目根 `pyproject.toml`；PyInstaller spec 原先只携带静态资源，导致 clean Windows EXE smoke 缺少 `_internal/pyproject.toml`。短路径 locked sync 已成功，因此未修改 proxy-tools、pywebview、pyproject 依赖或 `uv.lock`。

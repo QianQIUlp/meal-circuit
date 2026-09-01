@@ -24,6 +24,10 @@ class DesktopAlreadyRunningError(RuntimeError):
     pass
 
 
+UI_SMOKE_TIMEOUT_SECONDS = 45.0
+UI_SMOKE_SHUTDOWN_GRACE_SECONDS = 5.0
+
+
 class _DesktopHTTPServer(ThreadingHTTPServer):
     def handle_error(self, request, client_address) -> None:
         _write_startup_error_log(
@@ -117,6 +121,66 @@ def _probe_loopback_server(port: int) -> None:
         connection.close()
 
 
+def _run_ui_smoke(webview, address: str, *, timeout: float) -> None:
+    """Open the real embedded browser and close it after its first page load."""
+    window = webview.create_window("MealCircuit", address, min_size=(360, 640))
+    result: dict[str, object] = {"loaded": False}
+
+    def close_after_load() -> None:
+        try:
+            result["loaded"] = window.events.loaded.wait(timeout)
+            window.destroy()
+        except Exception as exc:
+            result["error"] = exc
+
+    # Window.destroy normally returns the native event loop. A final process
+    # watchdog keeps this purpose-built CLI check bounded even if the WebView
+    # runtime itself hangs while starting or shutting down.
+    hard_timeout = threading.Timer(
+        timeout + UI_SMOKE_SHUTDOWN_GRACE_SECONDS,
+        os._exit,
+        args=(1,),
+    )
+    hard_timeout.daemon = True
+    hard_timeout.start()
+
+    # pywebview runs this callback outside the GUI thread after the native
+    # event loop has started. Waiting on ``loaded`` therefore exercises the
+    # selected Windows WebView backend instead of only probing the HTTP server.
+    try:
+        webview.start(close_after_load, private_mode=True)
+    finally:
+        hard_timeout.cancel()
+    error = result.get("error")
+    if isinstance(error, BaseException):
+        raise RuntimeError("desktop UI smoke test could not close its window") from error
+    if not result["loaded"]:
+        raise RuntimeError(
+            f"desktop UI smoke test timed out after {timeout:g} seconds"
+        )
+
+
+@contextlib.contextmanager
+def _isolated_ui_smoke_home(enabled: bool) -> Iterator[None]:
+    if not enabled:
+        yield
+        return
+    names = ("MEALCIRCUIT_HOME", "MEALCIRCUIT_DB", "DIETOS_DB")
+    previous = {name: os.environ.get(name) for name in names}
+    with tempfile.TemporaryDirectory(prefix="mealcircuit-ui-smoke-") as temp_name:
+        os.environ["MEALCIRCUIT_HOME"] = str(Path(temp_name) / "home")
+        os.environ.pop("MEALCIRCUIT_DB", None)
+        os.environ.pop("DIETOS_DB", None)
+        try:
+            yield
+        finally:
+            for name, value in previous.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
+
+
 def _run_application(args: argparse.Namespace) -> None:
     initialize_private_home()
     init_db()
@@ -136,8 +200,14 @@ def _run_application(args: argparse.Namespace) -> None:
         try:
             import webview
         except ImportError:
+            if args.ui_smoke_test:
+                raise RuntimeError("desktop UI smoke test requires pywebview") from None
             webbrowser.open(address)
             worker.join()
+            return
+        if args.ui_smoke_test:
+            _probe_loopback_server(server.server_address[1])
+            _run_ui_smoke(webview, address, timeout=UI_SMOKE_TIMEOUT_SECONDS)
             return
         try:
             webview.create_window("MealCircuit", address, min_size=(360, 640))
@@ -150,22 +220,32 @@ def _run_application(args: argparse.Namespace) -> None:
     finally:
         server.shutdown()
         server.server_close()
+        worker.join(timeout=5)
 
 
 def _run() -> None:
     parser = argparse.ArgumentParser(description="启动 MealCircuit 桌面客户端")
     parser.add_argument("--browser", action="store_true", help="使用系统浏览器作为故障回退")
     parser.add_argument("--smoke-test", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--ui-smoke-test", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
-    with _single_instance():
-        _run_application(args)
+    with _isolated_ui_smoke_home(args.ui_smoke_test):
+        with _single_instance():
+            _run_application(args)
+
+
+def _smoke_mode_requested() -> bool:
+    return any(
+        argument in {"--smoke-test", "--ui-smoke-test"}
+        for argument in sys.argv[1:]
+    )
 
 
 def main() -> None:
     try:
         _run()
     except DesktopAlreadyRunningError as exc:
-        if "--smoke-test" not in sys.argv[1:] and sys.platform == "win32":
+        if not _smoke_mode_requested() and sys.platform == "win32":
             try:
                 _show_windows_error(str(exc))
             except (AttributeError, OSError):
@@ -175,7 +255,7 @@ def main() -> None:
         raise SystemExit(2) from None
     except Exception:
         log_path = _write_startup_error_log(traceback.format_exc())
-        _show_startup_error(log_path, use_dialog="--smoke-test" not in sys.argv[1:])
+        _show_startup_error(log_path, use_dialog=not _smoke_mode_requested())
         raise SystemExit(1) from None
 
 

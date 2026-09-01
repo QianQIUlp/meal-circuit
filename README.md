@@ -5,7 +5,7 @@
 **Local-first long-horizon meal feedback workbench. Capture facts. Keep the context. Calibrate the next choice.**
 
 <p>
-  <a href="https://github.com/QianQIUlp/meal-circuit/releases/tag/v0.3.0"><img src="https://img.shields.io/badge/release-v0.3.0-8DB8A4?style=flat-square&labelColor=202321" alt="Release version 0.3.0"></a>
+  <a href="https://github.com/QianQIUlp/meal-circuit/releases/tag/v0.3.1"><img src="https://img.shields.io/badge/release-v0.3.1-8DB8A4?style=flat-square&labelColor=202321" alt="Release version 0.3.1"></a>
   <img src="https://img.shields.io/badge/Python-3.11%2B-8DB8A4?style=flat-square&labelColor=202321" alt="Python 3.11 or newer">
   <a href="https://github.com/QianQIUlp/meal-circuit/actions/workflows/test.yml"><img src="https://github.com/QianQIUlp/meal-circuit/actions/workflows/test.yml/badge.svg" alt="CI status"></a>
   <a href="LICENSE"><img src="https://img.shields.io/github/license/QianQIUlp/meal-circuit?style=flat-square&labelColor=202321&color=8DB8A4" alt="MIT license"></a>
@@ -19,6 +19,7 @@ MealCircuit is a **local-first, agent-in-the-loop** workbench for long-horizon m
 
 > [!IMPORTANT]
 > MealCircuit does not require an API key by default. It stores facts, assembles context, and validates results; Codex, Claude Code, or another agent can still perform the analysis. Optionally, you can configure your own OpenAI, Anthropic, or DeepSeek API key in environment variables and manually trigger built-in generation for pending work.
+> Without an external agent or an explicitly configured model API key, the app remains useful for local records and personal context, but it does not generate a next-day plan by itself. The Android app consumes reviewed plans produced by the Python/Windows desktop workflow; it does not run the seven-stage planner on-device.
 
 ## More Than Calorie Logging
 
@@ -28,7 +29,7 @@ MealCircuit is a **local-first, agent-in-the-loop** workbench for long-horizon m
 
 ## Get Running in Three Minutes
 
-Requirements: **Python 3.11+**. Install the base package in a virtual environment; on Windows this also supplies the IANA timezone database used by non-UTC profiles. Sync, desktop packaging and the reference server remain separate optional dependency sets.
+Requirements: **Windows x64 and Python 3.11+**. Install the base package in a virtual environment; this also supplies the IANA timezone database used by non-UTC profiles. The Python Web UI and CLI are the source implementation of the supported Windows desktop client, not an additional operating-system support promise. Sync, desktop packaging and the reference server remain separate optional dependency sets.
 
 ```powershell
 git clone https://github.com/QianQIUlp/meal-circuit.git
@@ -44,18 +45,16 @@ python -m mealcircuit.agent_cli doctor
 
 Open [http://127.0.0.1:8765](http://127.0.0.1:8765). The first run guides you through goals, safety boundaries, training needs, and per-meal preparation preferences. `doctor` shows the private data location; stop the server with `Ctrl+C`.
 
-## Install v0.3.0
+## Install v0.3.1
 
-Prebuilt applications are available from the [v0.3.0 release](https://github.com/QianQIUlp/meal-circuit/releases/tag/v0.3.0). Choose the asset for your platform rather than trying to run an Android bundle or a Linux AppImage on another system.
+Prebuilt applications are published from the [v0.3.1 release](https://github.com/QianQIUlp/meal-circuit/releases/tag/v0.3.1) only after the full test matrix, Windows and Android packaging, required signatures, checksums, licenses, and SBOM gates pass. The maintained release targets are Windows x64 and Android only.
 
 | Platform | Asset | What to do |
 | :--- | :--- | :--- |
-| Windows x64 | `MealCircuit-0.3.0-windows-x64-setup.exe` or `MealCircuit-0.3.0-windows-x64-portable.zip` | Run the installer, or extract the ZIP and launch `MealCircuit.exe`. The current Windows artifacts are runnable but not Authenticode-signed, so Windows may show `Unknown Publisher`. |
-| Linux x86_64 | `MealCircuit-0.3.0-linux-x86_64.AppImage` | Download it, run `chmod +x MealCircuit-0.3.0-linux-x86_64.AppImage`, then launch it. |
+| Windows x64 | `MealCircuit-0.3.1-windows-x64-setup.exe` or `MealCircuit-0.3.1-windows-x64-portable.zip` | Run the Authenticode-signed installer, or extract the ZIP and launch its signed `MealCircuit.exe`. Verify the publisher before continuing. |
 | Android 8.0+ | `app-release.apk` or `app-release.aab` | Install the signed APK directly. The AAB is for Play Console or another bundle distributor and is not installed directly on a device. |
-| macOS | `MealCircuit-0.3.0-macos-universal.dmg` | The universal DMG supports Apple silicon and Intel Macs. It is ad-hoc signed and not notarized, so Gatekeeper may require a deliberate user override. |
 
-Download `SHA256SUMS.txt` with the asset and verify it before opening the file. On Linux, run `sha256sum -c SHA256SUMS.txt --ignore-missing` in the download directory; on Windows, compare `Get-FileHash <file> -Algorithm SHA256` with the matching entry. See the [full v0.3.0 release notes](docs/releases/v0.3.0.md) for signing and recovery boundaries.
+The release contains exactly those four platform artifacts plus `SHA256SUMS.txt` and `MealCircuit-v0.3.1.cdx.json`. Download the checksum file with the asset and verify it before opening or sideloading the package. On Windows, compare `Get-FileHash <file> -Algorithm SHA256` with the matching entry. See the [full v0.3.1 release notes](docs/releases/v0.3.1.md) for signing and recovery boundaries.
 
 ## How It Works
 
@@ -90,9 +89,9 @@ A next-day per-meal answer can temporarily override those defaults for one date.
 
 ## Independent Devices and Optional Sync
 
-MealCircuit 0.3 adds a full native Android client while keeping the Python desktop client. Both are offline-first: their local SQLite/Room database is the only UI read/write source, and all features remain usable without an account or sync server. Android does not embed Python.
+MealCircuit 0.3 adds a native Android client while keeping the Python-based Windows desktop client. Both are offline-first: their local SQLite/Room database is the only UI read/write source, and recording, review, local history and settings remain usable without an account or sync server. Daily generation is authoritative only in the Python/Windows desktop seven-stage workflow; Android does not embed Python and displays plans after they have been reviewed and published there.
 
-Users may optionally enter any compatible self-hosted Sync v1 HTTPS URL. The open-source FastAPI/PostgreSQL service stores only opaque account/device metadata, encrypted revisions and encrypted photo chunks; business logic, AI calls, conflict resolution and materialized views stay on devices. Each device configures its own model provider and API key.
+Users may optionally enter any compatible self-hosted Sync v1 HTTPS URL. The open-source FastAPI/PostgreSQL service stores only opaque account/device metadata, encrypted revisions and encrypted photo chunks; business logic, AI calls, conflict resolution and materialized views stay on clients. Model providers and API keys are configured only in the Python/Windows desktop planning workflow.
 
 ```powershell
 # Encrypted portable backup (prints a separate one-time recovery string)
@@ -183,10 +182,9 @@ Runtime data is never written into the source repository:
 | System | Default private data directory |
 | :--- | :--- |
 | Windows | `%LOCALAPPDATA%\MealCircuit` |
-| macOS | `~/Library/Application Support/MealCircuit` |
-| Linux | `$XDG_DATA_HOME/mealcircuit` or `~/.local/share/mealcircuit` |
+| Android | App-private storage managed by Android |
 
-Use `MEALCIRCUIT_HOME` to move the entire private directory, or `MEALCIRCUIT_DB` and `MEALCIRCUIT_PORT` to override the database path and port separately.
+On Windows, use `MEALCIRCUIT_HOME` to move the entire private directory, or `MEALCIRCUIT_DB` and `MEALCIRCUIT_PORT` to override the database path and port separately. Android keeps this storage app-private.
 
 <details>
 <summary><strong>Migrate safely from legacy DietOS</strong></summary>
@@ -246,6 +244,7 @@ MealCircuit 是一个**本地优先、Agent-in-the-loop** 的长期饮食反馈�
 
 > [!IMPORTANT]
 > MealCircuit 默认不要求 API Key。它负责保存事实、组装上下文和校验结果；Codex、Claude Code 或其他 Agent 仍可负责分析。你也可以选择在环境变量中配置自己的 OpenAI、Anthropic 或 DeepSeek API Key，并手动触发内置生成来处理待办。
+> 没有外部 Agent 或用户主动配置的模型 API Key 时，应用仍可完成本地记录与个人上下文管理，但不会自行生成下一日安排。Android 端只消费 Python/Windows 桌面流程审查并发布的计划，不在设备上运行完整七阶段规划。
 
 ## 不只是卡路里记录
 
@@ -255,7 +254,7 @@ MealCircuit 是一个**本地优先、Agent-in-the-loop** 的长期饮食反馈�
 
 ## 三分钟启动
 
-环境要求：**Python 3.11+**。先在虚拟环境中安装基础包；Windows 会同时安装非 UTC 档案所需的 IANA 时区数据库。同步、桌面打包与参考服务仍是分开的可选依赖组。
+环境要求：**Windows x64 与 Python 3.11+**。先在虚拟环境中安装基础包，同时会安装非 UTC 档案所需的 IANA 时区数据库。Python Web 界面与 CLI 是受支持 Windows 桌面端的源码实现，不代表新增其他操作系统支持。同步、桌面打包与参考服务仍是分开的可选依赖组。
 
 ```powershell
 git clone https://github.com/QianQIUlp/meal-circuit.git
@@ -271,18 +270,16 @@ python -m mealcircuit.agent_cli doctor
 
 打开 [http://127.0.0.1:8765](http://127.0.0.1:8765)。首次使用会进入可恢复的目标与安全初始化；原有记录入口不会因初始化门禁消失。`doctor` 仍可查看私人数据位置；停止服务使用 `Ctrl+C`。
 
-## 安装 v0.3.0
+## 安装 v0.3.1
 
-预编译应用见 [v0.3.0 Release](https://github.com/QianQIUlp/meal-circuit/releases/tag/v0.3.0)。请按系统选择对应资产，不要尝试在其他系统上直接运行 Android bundle 或 Linux AppImage。
+预编译应用只会在完整测试矩阵、Windows 与 Android 打包、必要签名、校验和、许可证与 SBOM 门禁全部通过后发布到 [v0.3.1 Release](https://github.com/QianQIUlp/meal-circuit/releases/tag/v0.3.1)。当前只维护 Windows x64 与 Android 两个发布目标。
 
 | 平台 | 资产 | 使用方式 |
 | :--- | :--- | :--- |
-| Windows x64 | `MealCircuit-0.3.0-windows-x64-setup.exe` 或 `MealCircuit-0.3.0-windows-x64-portable.zip` | 运行安装器，或解压 ZIP 后启动 `MealCircuit.exe`。当前 Windows 产物可运行但没有 Authenticode 签名，Windows 可能提示 `Unknown Publisher`。 |
-| Linux x86_64 | `MealCircuit-0.3.0-linux-x86_64.AppImage` | 下载后执行 `chmod +x MealCircuit-0.3.0-linux-x86_64.AppImage`，再启动它。 |
+| Windows x64 | `MealCircuit-0.3.1-windows-x64-setup.exe` 或 `MealCircuit-0.3.1-windows-x64-portable.zip` | 运行 Authenticode 签名安装器，或解压 ZIP 后启动其中已签名的 `MealCircuit.exe`；继续前请核对发布者。 |
 | Android 8.0+ | `app-release.apk` 或 `app-release.aab` | 直接安装已签名的 APK。AAB 用于上传 Play Console 或其他 bundle 分发渠道，不能直接安装到设备。 |
-| macOS | `MealCircuit-0.3.0-macos-universal.dmg` | 通用 DMG 同时支持 Apple silicon 与 Intel Mac。它仅 ad-hoc 签名、未 notarize，Gatekeeper 可能要求用户明确放行。 |
 
-请同时下载 `SHA256SUMS.txt`，并在打开文件前校验。Linux 可在下载目录运行 `sha256sum -c SHA256SUMS.txt --ignore-missing`；Windows 可用 `Get-FileHash <文件> -Algorithm SHA256` 对照对应条目。签名与恢复边界见 [v0.3.0 完整发行说明](docs/releases/v0.3.0.md)。
+正式 Release 只包含上述四个平台产物，以及 `SHA256SUMS.txt` 和 `MealCircuit-v0.3.1.cdx.json`。请同时下载校验和文件，并在打开或侧载安装包前校验；Windows 可用 `Get-FileHash <文件> -Algorithm SHA256` 对照对应条目。签名与恢复边界见 [v0.3.1 完整发行说明](docs/releases/v0.3.1.md)。
 
 ## 它如何工作
 
@@ -317,9 +314,9 @@ flowchart LR
 
 ## 多端独立运行与可选同步
 
-MealCircuit 0.3 新增完整 Kotlin 原生 Android 客户端，同时保留 Python 桌面客户端。两端都以本机 SQLite/Room 为唯一读写源：不注册、不联网、不同步也能完整使用；Android 不嵌入 Python。
+MealCircuit 0.3 新增 Kotlin 原生 Android 客户端，同时保留基于 Python 的 Windows 桌面客户端。两端都以本机 SQLite/Room 为唯一读写源：不注册、不联网、不同步也能记录、回看历史和管理设置。每日生成只由 Python/Windows 桌面的七阶段流程负责；Android 不嵌入 Python，只展示在那里完成审查并发布的计划。
 
-用户可以自行填写任意兼容 Sync v1 的自托管 HTTPS 地址。开源 FastAPI/PostgreSQL 服务只保存不透明的账户/设备元数据、加密 revision 和加密照片分块；业务规则、AI 调用、冲突解决和界面投影都留在设备。每台设备独立配置模型 provider 与 API Key。
+用户可以自行填写任意兼容 Sync v1 的自托管 HTTPS 地址。开源 FastAPI/PostgreSQL 服务只保存不透明的账户/设备元数据、加密 revision 和加密照片分块；业务规则、AI 调用、冲突解决和界面投影都留在客户端。模型 provider 与 API Key 只在 Python/Windows 桌面规划流程中配置。
 
 ```powershell
 # 加密便携备份；命令会另外显示一次性恢复字符串
@@ -412,10 +409,9 @@ DeepSeek 走其 OpenAI-compatible Chat API。按当前官方 DeepSeek API 文档
 | 系统 | 默认私人数据目录 |
 | :--- | :--- |
 | Windows | `%LOCALAPPDATA%\MealCircuit` |
-| macOS | `~/Library/Application Support/MealCircuit` |
-| Linux | `$XDG_DATA_HOME/mealcircuit` 或 `~/.local/share/mealcircuit` |
+| Android | 由 Android 管理的应用私有存储 |
 
-可用 `MEALCIRCUIT_HOME` 修改整个私人目录，或分别通过 `MEALCIRCUIT_DB` 与 `MEALCIRCUIT_PORT` 覆盖数据库路径和端口。
+Windows 端可用 `MEALCIRCUIT_HOME` 修改整个私人目录，或分别通过 `MEALCIRCUIT_DB` 与 `MEALCIRCUIT_PORT` 覆盖数据库路径和端口；Android 始终使用应用私有存储。
 
 <details>
 <summary><strong>从旧版 DietOS 安全迁移</strong></summary>

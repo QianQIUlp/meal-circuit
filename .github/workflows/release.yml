@@ -13,9 +13,6 @@ concurrency:
 permissions:
   contents: read
 
-env:
-  APPIMAGETOOL_X86_64_SHA256: a6d71e2b6cd66f8e8d16c37ad164658985e0cf5fcaa950c90a482890cb9d13e0
-
 jobs:
   contract:
     runs-on: ubuntu-latest
@@ -55,7 +52,60 @@ jobs:
       - run: uv run python tools/dependency_check.py
       - run: uv run python tools/generate_openapi.py --check
       - run: uv run python tools/validate_protocol.py
+      - run: uv run python tools/distribution_check.py
+      - run: uv run python tools/generate_sbom.py --output "$RUNNER_TEMP/mealcircuit-locks.cdx.json"
       - run: uv run python -m unittest tests.test_release_workflow -v
+      - run: uv run python -m unittest tests.test_release_sbom -v
+
+  quality-gate:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: contract
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Require private vulnerability reporting for tagged releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          enabled=$(gh api "repos/$GITHUB_REPOSITORY/private-vulnerability-reporting" --jq '.enabled')
+          if [[ "$enabled" != "true" ]]; then
+            echo "Tagged releases require GitHub private vulnerability reporting to be enabled." >&2
+            exit 1
+          fi
+      - name: Wait for the complete test workflow on this tag commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          deadline=$((SECONDS + 10800))
+          while (( SECONDS < deadline )); do
+            result=$(gh run list \
+              --repo "$GITHUB_REPOSITORY" \
+              --workflow test.yml \
+              --commit "$GITHUB_SHA" \
+              --event push \
+              --limit 20 \
+              --json status,conclusion,url,createdAt,headBranch \
+              --jq 'map(select(.headBranch == env.GITHUB_REF_NAME)) | if length == 0 then "" else (sort_by(.createdAt) | reverse | .[0] | [.status, (.conclusion // ""), .url] | @tsv) end')
+            if [[ -z "$result" ]]; then
+              echo "Waiting for the tag-triggered test workflow to appear for $GITHUB_SHA"
+              sleep 15
+              continue
+            fi
+            IFS=$'\t' read -r status conclusion url <<< "$result"
+            echo "Complete test workflow: status=$status conclusion=${conclusion:-pending} url=$url"
+            if [[ "$status" == "completed" ]]; then
+              [[ "$conclusion" == "success" ]] && exit 0
+              echo "The complete test workflow did not succeed: $conclusion" >&2
+              exit 1
+            fi
+            sleep 15
+          done
+          echo "Timed out waiting for the complete test workflow for $GITHUB_SHA" >&2
+          exit 1
 
   windows:
     needs: contract
@@ -65,11 +115,11 @@ jobs:
       WINDOWS_SIGNING_AVAILABLE: ${{ secrets.WINDOWS_CERTIFICATE_BASE64 != '' && secrets.WINDOWS_CERTIFICATE_PASSWORD != '' }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - name: Warn when Windows tagged release is unsigned
+      - name: Require Authenticode secrets for tagged releases
         if: startsWith(github.ref, 'refs/tags/v') && env.WINDOWS_SIGNING_AVAILABLE != 'true'
         shell: pwsh
         run: |
-          Write-Output "::warning::Windows portable ZIP and installer will be published unsigned; Windows may show Unknown Publisher."
+          throw "Tagged releases require complete Windows Authenticode signing secrets."
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.13"
@@ -78,6 +128,12 @@ jobs:
           version: "0.8.22"
           enable-cache: true
       - run: uv sync --locked --extra desktop --no-dev
+      - name: Collect locked desktop license texts
+        shell: pwsh
+        run: |
+          $legalBundle = Join-Path $env:RUNNER_TEMP "desktop-legal"
+          .\.venv\Scripts\python.exe tools\desktop_licenses.py collect --project-root . --output $legalBundle
+          Add-Content -Path $env:GITHUB_ENV -Value "MEALCIRCUIT_LEGAL_BUNDLE=$legalBundle" -Encoding utf8
       - run: .\.venv\Scripts\pyinstaller.exe --noconfirm --clean packaging/mealcircuit.spec
       - name: Smoke test packaged executable
         shell: pwsh
@@ -85,6 +141,16 @@ jobs:
           $env:MEALCIRCUIT_HOME = Join-Path $env:RUNNER_TEMP "desktop-smoke"
           $process = Start-Process -FilePath ".\dist\MealCircuit\MealCircuit.exe" -ArgumentList "--smoke-test" -Wait -PassThru
           if ($process.ExitCode -ne 0) { throw "Packaged smoke test failed with exit code $($process.ExitCode)" }
+          .\.venv\Scripts\python.exe tools\desktop_licenses.py verify --project-root . --artifact-root .\dist\MealCircuit
+      - name: Exercise the packaged Windows WebView
+        shell: pwsh
+        run: |
+          $process = Start-Process -FilePath ".\dist\MealCircuit\MealCircuit.exe" -ArgumentList "--ui-smoke-test" -PassThru
+          if (-not $process.WaitForExit(70000)) {
+            Stop-Process -Id $process.Id -Force
+            throw "Packaged Windows WebView smoke test exceeded 70 seconds"
+          }
+          if ($process.ExitCode -ne 0) { throw "Packaged Windows WebView smoke test failed with exit code $($process.ExitCode)" }
       - name: Authenticode sign packaged executable when configured
         if: env.WINDOWS_SIGNING_AVAILABLE == 'true'
         shell: pwsh
@@ -106,6 +172,7 @@ jobs:
           $env:MEALCIRCUIT_HOME = Join-Path $env:RUNNER_TEMP "portable-home"
           $process = Start-Process -FilePath "$portableRoot\MealCircuit\MealCircuit.exe" -ArgumentList "--smoke-test" -Wait -PassThru
           if ($process.ExitCode -ne 0) { throw "Portable ZIP smoke test failed with exit code $($process.ExitCode)" }
+          .\.venv\Scripts\python.exe tools\desktop_licenses.py verify --project-root . --artifact-root "$portableRoot\MealCircuit"
       - name: Build installer
         shell: pwsh
         run: |
@@ -146,6 +213,7 @@ jobs:
           $env:MEALCIRCUIT_HOME = Join-Path $env:RUNNER_TEMP "installed-home"
           $application = Start-Process -FilePath "$installDir\MealCircuit.exe" -ArgumentList "--smoke-test" -Wait -PassThru
           if ($application.ExitCode -ne 0) { throw "Installed application smoke test failed with exit code $($application.ExitCode)" }
+          .\.venv\Scripts\python.exe tools\desktop_licenses.py verify --project-root . --artifact-root $installDir
           $uninstaller = Start-Process -FilePath "$installDir\unins000.exe" -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART" -Wait -PassThru
           if ($uninstaller.ExitCode -ne 0) { throw "Uninstaller smoke test failed with exit code $($uninstaller.ExitCode)" }
           for ($attempt = 0; $attempt -lt 40 -and (Test-Path $installDir); $attempt++) { Start-Sleep -Milliseconds 250 }
@@ -158,161 +226,20 @@ jobs:
             dist/MealCircuit-*-windows-x64-portable.zip
             dist/MealCircuit-*-windows-x64-setup.exe
 
-  macos-build:
-    needs: contract
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: arm64
-            runner: macos-15
-          - arch: x86_64
-            runner: macos-15-intel
-    runs-on: ${{ matrix.runner }}
-    env:
-      VERSION: ${{ needs.contract.outputs.version }}
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - name: Install python.org universal2 Python
-        run: |
-          curl --fail --location --retry 5 -o "$RUNNER_TEMP/python.pkg" https://www.python.org/ftp/python/3.13.5/python-3.13.5-macos11.pkg
-          pkgutil --check-signature "$RUNNER_TEMP/python.pkg" | grep -q "Python Software Foundation"
-          sudo installer -pkg "$RUNNER_TEMP/python.pkg" -target /
-          /Library/Frameworks/Python.framework/Versions/3.13/bin/python3 -c "import platform; print(platform.platform())"
-      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
-        with:
-          version: "0.8.22"
-          enable-cache: true
-      - name: Install locked dependencies
-        run: |
-          PY=/Library/Frameworks/Python.framework/Versions/3.13/bin/python3
-          uv sync --locked --extra desktop --no-dev --python "$PY"
-      - name: Build native app slice
-        env:
-          MEALCIRCUIT_TARGET_ARCH: ${{ matrix.arch }}
-        run: .venv/bin/pyinstaller --noconfirm --clean packaging/mealcircuit.spec
-      - name: Verify native slice and smoke test
-        run: |
-          file dist/MealCircuit.app/Contents/MacOS/MealCircuit | tee "$RUNNER_TEMP/file.txt"
-          grep -q "${{ matrix.arch }}" "$RUNNER_TEMP/file.txt"
-          MEALCIRCUIT_HOME="$RUNNER_TEMP/desktop-smoke" dist/MealCircuit.app/Contents/MacOS/MealCircuit --smoke-test
-      - name: Archive app slice
-        run: tar -C dist -czf "MealCircuit-${{ matrix.arch }}.tar.gz" MealCircuit.app
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: macos-app-${{ matrix.arch }}
-          path: MealCircuit-${{ matrix.arch }}.tar.gz
-
-  macos-universal:
-    needs: [contract, macos-build]
-    runs-on: macos-15
-    env:
-      VERSION: ${{ needs.contract.outputs.version }}
-      APPLE_SIGNING_AVAILABLE: ${{ secrets.APPLE_CERTIFICATE_BASE64 != '' && secrets.APPLE_CERTIFICATE_PASSWORD != '' && secrets.APPLE_SIGNING_IDENTITY != '' && secrets.APPLE_ID != '' && secrets.APPLE_APP_PASSWORD != '' && secrets.APPLE_TEAM_ID != '' }}
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - name: Warn when macOS tagged release lacks Developer ID signing
-        if: startsWith(github.ref, 'refs/tags/v') && env.APPLE_SIGNING_AVAILABLE != 'true'
-        run: |
-          echo "::warning::macOS DMG will contain an ad-hoc signed app without Apple Developer ID signing or notarization."
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          pattern: macos-app-*
-          path: slices
-      - name: Merge and verify universal2 app
-        run: |
-          mkdir -p "$RUNNER_TEMP/arm" "$RUNNER_TEMP/intel" dist
-          tar -C "$RUNNER_TEMP/arm" -xzf slices/macos-app-arm64/MealCircuit-arm64.tar.gz
-          tar -C "$RUNNER_TEMP/intel" -xzf slices/macos-app-x86_64/MealCircuit-x86_64.tar.gz
-          python3 packaging/macos/merge_universal.py "$RUNNER_TEMP/arm/MealCircuit.app" "$RUNNER_TEMP/intel/MealCircuit.app" dist/MealCircuit.app
-          file dist/MealCircuit.app/Contents/MacOS/MealCircuit | tee "$RUNNER_TEMP/file.txt"
-          grep -q x86_64 "$RUNNER_TEMP/file.txt"
-          grep -q arm64 "$RUNNER_TEMP/file.txt"
-      - name: Sign universal app
-        run: |
-          codesign --deep --force --sign - dist/MealCircuit.app
-          MEALCIRCUIT_HOME="$RUNNER_TEMP/universal-smoke" dist/MealCircuit.app/Contents/MacOS/MealCircuit --smoke-test
-      - name: Codesign with release identity when configured
-        if: env.APPLE_SIGNING_AVAILABLE == 'true'
-        env:
-          APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-        run: |
-          echo "$APPLE_CERTIFICATE_BASE64" | base64 --decode > "$RUNNER_TEMP/signing.p12"
-          security create-keychain -p temporary "$RUNNER_TEMP/build.keychain"
-          security import "$RUNNER_TEMP/signing.p12" -k "$RUNNER_TEMP/build.keychain" -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
-          security set-key-partition-list -S apple-tool:,apple: -s -k temporary "$RUNNER_TEMP/build.keychain"
-          security list-keychains -d user -s "$RUNNER_TEMP/build.keychain"
-          codesign --deep --force --options runtime --timestamp --sign "$APPLE_SIGNING_IDENTITY" dist/MealCircuit.app
-          codesign --verify --deep --strict --verbose=2 dist/MealCircuit.app
-      - name: Create DMG
-        run: hdiutil create -volname MealCircuit -srcfolder dist/MealCircuit.app -ov -format UDZO "dist/MealCircuit-$VERSION-macos-universal.dmg"
-      - name: Submit DMG for notarization
-        if: env.APPLE_SIGNING_AVAILABLE == 'true'
-        env:
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-        run: |
-          xcrun notarytool submit "dist/MealCircuit-$VERSION-macos-universal.dmg" --apple-id "$APPLE_ID" --password "$APPLE_APP_PASSWORD" --team-id "$APPLE_TEAM_ID" --wait
-          xcrun stapler staple "dist/MealCircuit-$VERSION-macos-universal.dmg"
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: desktop-macos
-          path: dist/MealCircuit-*-macos-universal.dmg
-
-  linux:
-    needs: contract
-    runs-on: ubuntu-22.04
-    env:
-      VERSION: ${{ needs.contract.outputs.version }}
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
-        with:
-          python-version: "3.13"
-      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
-        with:
-          version: "0.8.22"
-          enable-cache: true
-      - run: uv sync --locked --extra desktop --no-dev
-      - run: .venv/bin/pyinstaller --noconfirm --clean packaging/mealcircuit.spec
-      - run: MEALCIRCUIT_HOME="$RUNNER_TEMP/desktop-smoke" dist/MealCircuit/MealCircuit --smoke-test
-      - name: Build AppImage
-        run: |
-          APPDIR="$RUNNER_TEMP/MealCircuit.AppDir"
-          mkdir -p "$APPDIR/usr/bin" "$APPDIR/usr/share/applications" "$APPDIR/usr/share/icons/hicolor/scalable/apps"
-          cp -a dist/MealCircuit "$APPDIR/usr/bin/MealCircuit"
-          install -m 755 packaging/linux/AppRun "$APPDIR/AppRun"
-          install -m 644 packaging/linux/MealCircuit.desktop "$APPDIR/MealCircuit.desktop"
-          install -m 644 packaging/linux/MealCircuit.desktop "$APPDIR/usr/share/applications/MealCircuit.desktop"
-          install -m 644 mealcircuit/static/favicon.svg "$APPDIR/mealcircuit.svg"
-          install -m 644 mealcircuit/static/favicon.svg "$APPDIR/usr/share/icons/hicolor/scalable/apps/mealcircuit.svg"
-          curl --fail --location --retry 5 -o "$RUNNER_TEMP/appimagetool" https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
-          echo "$APPIMAGETOOL_X86_64_SHA256  $RUNNER_TEMP/appimagetool" | sha256sum --check --strict
-          chmod +x "$RUNNER_TEMP/appimagetool"
-          ARCH=x86_64 "$RUNNER_TEMP/appimagetool" --appimage-extract-and-run "$APPDIR" "dist/MealCircuit-$VERSION-linux-x86_64.AppImage"
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: desktop-linux
-          path: dist/MealCircuit-*-linux-x86_64.AppImage
-
   android:
     needs: contract
     runs-on: ubuntu-latest
     env:
       VERSION: ${{ needs.contract.outputs.version }}
       ANDROID_SIGNING_AVAILABLE: ${{ secrets.ANDROID_KEYSTORE_BASE64 != '' && secrets.ANDROID_KEYSTORE_PASSWORD != '' && secrets.ANDROID_KEY_ALIAS != '' && secrets.ANDROID_KEY_PASSWORD != '' }}
+      EXPECTED_ANDROID_SIGNER_SHA256: "1A:87:F4:05:CA:18:9B:1D:B2:63:44:A9:71:55:18:C9:12:4C:66:D5:D8:00:04:CA:75:A5:9F:EA:36:25:3C:37"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - name: Warn when Android assets are omitted from unsigned tagged release
+      - name: Require Android signing secrets for tagged releases
         if: startsWith(github.ref, 'refs/tags/v') && env.ANDROID_SIGNING_AVAILABLE != 'true'
         run: |
-          echo "::warning::Android APK and AAB are omitted from this tagged release because complete Android signing secrets are unavailable."
+          echo "Tagged releases require complete Android signing secrets." >&2
+          exit 1
       - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
         with:
           distribution: temurin
@@ -333,6 +260,18 @@ jobs:
           MEALCIRCUIT_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
           MEALCIRCUIT_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: ./gradlew --no-daemon -PmealcircuitVersion="$VERSION" testDebugUnitTest lintRelease assembleRelease bundleRelease
+      - name: Normalize the Android APK path for unsigned validation builds
+        if: env.ANDROID_SIGNING_AVAILABLE != 'true'
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            echo "A tagged release may not normalize an unsigned Android APK." >&2
+            exit 1
+          fi
+          unsigned_apk=android/app/build/outputs/apk/release/app-release-unsigned.apk
+          canonical_apk=android/app/build/outputs/apk/release/app-release.apk
+          [[ -f "$unsigned_apk" ]]
+          install -m 644 "$unsigned_apk" "$canonical_apk"
       - name: Verify release APK version
         shell: bash
         env:
@@ -342,25 +281,55 @@ jobs:
           expected_code=$((major * 1000000 + minor * 10000 + patch))
           "$ANDROID_HOME/build-tools/36.0.0/aapt" dump badging android/app/build/outputs/apk/release/app-release.apk \
             | grep -F "versionCode='$expected_code' versionName='$EXPECTED_VERSION'"
-      - name: Verify Android signatures when configured
+      - name: Verify Android signer continuity and AAB signature
         if: env.ANDROID_SIGNING_AVAILABLE == 'true'
         env:
           ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
           ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+        shell: bash
         run: |
-          "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --verbose android/app/build/outputs/apk/release/app-release.apk
+          expected_fingerprint=$(printf '%s' "$EXPECTED_ANDROID_SIGNER_SHA256" | tr -d ':' | tr '[:lower:]' '[:upper:]')
+          apk_cert_output=$("$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --verbose --print-certs android/app/build/outputs/apk/release/app-release.apk)
+          printf '%s\n' "$apk_cert_output"
+          mapfile -t apk_fingerprints < <(
+            printf '%s\n' "$apk_cert_output" \
+              | sed -n 's/^Signer #[0-9][0-9]* certificate SHA-256 digest: //p' \
+              | tr -d ':' \
+              | tr '[:lower:]' '[:upper:]'
+          )
+          if (( ${#apk_fingerprints[@]} != 1 )); then
+            echo "Expected exactly one APK signer certificate, found ${#apk_fingerprints[@]}." >&2
+            exit 1
+          fi
+          if [[ "${apk_fingerprints[0]}" != "$expected_fingerprint" ]]; then
+            echo "APK signer certificate does not match the trusted v0.3.0 release signer." >&2
+            exit 1
+          fi
+          keytool -exportcert \
+            -keystore "$RUNNER_TEMP/mealcircuit.jks" \
+            -storepass "$ANDROID_KEYSTORE_PASSWORD" \
+            -alias "$ANDROID_KEY_ALIAS" \
+            -file "$RUNNER_TEMP/android-release-cert.der"
+          keystore_fingerprint=$(sha256sum "$RUNNER_TEMP/android-release-cert.der" | awk '{print toupper($1)}')
+          if [[ "$keystore_fingerprint" != "$expected_fingerprint" ]]; then
+            echo "Restored keystore alias does not match the trusted v0.3.0 release signer." >&2
+            exit 1
+          fi
           jarsigner -verify -strict \
             -keystore "$RUNNER_TEMP/mealcircuit.jks" \
             -storepass "$ANDROID_KEYSTORE_PASSWORD" \
             android/app/build/outputs/bundle/release/app-release.aab "$ANDROID_KEY_ALIAS"
+      - name: Verify legal assets in final Android artifacts
+        run: |
+          python tools/android_artifact_legal_check.py --license LICENSE \
+            android/app/build/outputs/apk/release/app-release.apk \
+            android/app/build/outputs/bundle/release/app-release.aab
       - name: Stage Android release assets
-        if: ${{ !startsWith(github.ref, 'refs/tags/v') || env.ANDROID_SIGNING_AVAILABLE == 'true' }}
         run: |
           mkdir -p "$RUNNER_TEMP/android-release"
           install -m 644 android/app/build/outputs/apk/release/app-release.apk "$RUNNER_TEMP/android-release/app-release.apk"
           install -m 644 android/app/build/outputs/bundle/release/app-release.aab "$RUNNER_TEMP/android-release/app-release.aab"
       - name: Upload Android artifacts
-        if: ${{ !startsWith(github.ref, 'refs/tags/v') || env.ANDROID_SIGNING_AVAILABLE == 'true' }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: android-release
@@ -369,7 +338,7 @@ jobs:
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [contract, windows, macos-universal, linux, android]
+    needs: [contract, quality-gate, windows, android]
     runs-on: ubuntu-latest
     env:
       VERSION: ${{ needs.contract.outputs.version }}
@@ -379,14 +348,29 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
+          name: desktop-windows
           path: release-assets
-          merge-multiple: true
-      - uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
+          name: android-release
           path: release-assets
-          format: cyclonedx-json
-          output-file: release-assets/MealCircuit-v${{ needs.contract.outputs.version }}.cdx.json
-          artifact-name: release-sbom
+      - name: Verify the exact final artifact manifest
+        shell: bash
+        run: |
+          expected=(
+            "MealCircuit-$VERSION-windows-x64-portable.zip"
+            "MealCircuit-$VERSION-windows-x64-setup.exe"
+            "app-release.apk"
+            "app-release.aab"
+          )
+          printf '%s\n' "${expected[@]}" | sort > "$RUNNER_TEMP/expected-assets.txt"
+          find release-assets -maxdepth 1 -type f -printf '%f\n' | sort > "$RUNNER_TEMP/actual-assets.txt"
+          diff -u "$RUNNER_TEMP/expected-assets.txt" "$RUNNER_TEMP/actual-assets.txt"
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.13"
+      - name: Generate lock-derived CycloneDX SBOM
+        run: python tools/generate_sbom.py --output "release-assets/MealCircuit-v$VERSION.cdx.json"
       - name: Generate checksums
         run: cd release-assets && find . -maxdepth 1 -type f ! -name SHA256SUMS.txt -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS.txt
       - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2

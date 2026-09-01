@@ -7,9 +7,11 @@ import sys
 import tempfile
 import threading
 import unittest
+from contextlib import nullcontext
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 from mealcircuit import desktop
 from mealcircuit import server as server_module
@@ -33,6 +35,18 @@ class WindowsDesktopStartupFailureTest(unittest.TestCase):
         self.assertIn('windows_icon = str(root / "packaging" / "windows" / "MealCircuit.ico")', spec)
         self.assertIn("icon=windows_icon", spec)
         self.assertIn('(str(root / "pyproject.toml"), "."),', spec)
+        self.assertIn('legal_bundle_value = os.environ.get("MEALCIRCUIT_LEGAL_BUNDLE")', spec)
+        self.assertIn('(str(legal_bundle), "legal"),', spec)
+        for document in (
+            "LICENSE",
+            "THIRD_PARTY_LICENSES.md",
+            "PRIVACY.md",
+            "SECURITY.md",
+            "DISCLAIMER.md",
+            "manifest.json",
+        ):
+            with self.subTest(document=document):
+                self.assertIn(f'"{document}",', spec)
         self.assertIn("SetupIconFile=MealCircuit.ico", installer)
 
     def test_http_access_log_tolerates_windowed_executable_without_stderr(self):
@@ -130,6 +144,102 @@ class WindowsDesktopStartupFailureTest(unittest.TestCase):
             )
 
         show_windows_error.assert_not_called()
+
+    def test_ui_smoke_opens_real_webview_and_closes_after_page_load(self):
+        class LoadedEvent:
+            def wait(self, timeout):
+                self.timeout = timeout
+                return True
+
+        loaded = LoadedEvent()
+        window = SimpleNamespace(
+            events=SimpleNamespace(loaded=loaded),
+            destroy=Mock(),
+        )
+        webview = SimpleNamespace(
+            create_window=Mock(return_value=window),
+            start=Mock(side_effect=lambda callback, **kwargs: callback()),
+        )
+
+        timer = Mock()
+        with patch.object(desktop.threading, "Timer", return_value=timer) as make_timer:
+            desktop._run_ui_smoke(webview, "http://127.0.0.1:1234", timeout=7)
+
+        webview.create_window.assert_called_once_with(
+            "MealCircuit",
+            "http://127.0.0.1:1234",
+            min_size=(360, 640),
+        )
+        webview.start.assert_called_once()
+        self.assertTrue(webview.start.call_args.kwargs["private_mode"])
+        self.assertEqual(7, loaded.timeout)
+        window.destroy.assert_called_once_with()
+        make_timer.assert_called_once_with(12, desktop.os._exit, args=(1,))
+        self.assertTrue(timer.daemon)
+        timer.start.assert_called_once_with()
+        timer.cancel.assert_called_once_with()
+
+    def test_ui_smoke_timeout_closes_window_and_fails(self):
+        window = SimpleNamespace(
+            events=SimpleNamespace(loaded=SimpleNamespace(wait=Mock(return_value=False))),
+            destroy=Mock(),
+        )
+        webview = SimpleNamespace(
+            create_window=Mock(return_value=window),
+            start=Mock(side_effect=lambda callback, **kwargs: callback()),
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "timed out after 3 seconds"):
+            desktop._run_ui_smoke(webview, "http://127.0.0.1:1234", timeout=3)
+
+        window.events.loaded.wait.assert_called_once_with(3)
+        window.destroy.assert_called_once_with()
+
+    def test_ui_smoke_uses_and_removes_an_isolated_home(self):
+        captured: dict[str, str | None] = {}
+
+        def capture_environment(args):
+            self.assertTrue(args.ui_smoke_test)
+            captured["home"] = os.environ.get("MEALCIRCUIT_HOME")
+            captured["db"] = os.environ.get("MEALCIRCUIT_DB")
+            captured["legacy_db"] = os.environ.get("DIETOS_DB")
+
+        with (
+            patch.object(sys, "argv", ["mealcircuit-desktop", "--ui-smoke-test"]),
+            patch.dict(
+                os.environ,
+                {
+                    "MEALCIRCUIT_HOME": "C:/real-user-home",
+                    "MEALCIRCUIT_DB": "C:/real-user.db",
+                    "DIETOS_DB": "C:/legacy-user.db",
+                },
+            ),
+            patch.object(desktop, "_single_instance", return_value=nullcontext()),
+            patch.object(desktop, "_run_application", side_effect=capture_environment),
+        ):
+            desktop._run()
+            self.assertEqual("C:/real-user-home", os.environ["MEALCIRCUIT_HOME"])
+            self.assertEqual("C:/real-user.db", os.environ["MEALCIRCUIT_DB"])
+            self.assertEqual("C:/legacy-user.db", os.environ["DIETOS_DB"])
+
+        self.assertIsNotNone(captured["home"])
+        assert captured["home"] is not None
+        self.assertFalse(Path(captured["home"]).parent.exists())
+        self.assertIsNone(captured["db"])
+        self.assertIsNone(captured["legacy_db"])
+
+    def test_ui_smoke_failure_does_not_open_a_blocking_dialog(self):
+        with (
+            patch.object(sys, "argv", ["mealcircuit-desktop", "--ui-smoke-test"]),
+            patch.object(desktop, "_run", side_effect=RuntimeError("ui failed")),
+            patch.object(desktop, "_write_startup_error_log", return_value=None),
+            patch.object(desktop, "_show_startup_error") as show_startup_error,
+            self.assertRaises(SystemExit) as raised,
+        ):
+            desktop.main()
+
+        self.assertEqual(1, raised.exception.code)
+        show_startup_error.assert_called_once_with(None, use_dialog=False)
 
     def test_log_writer_falls_back_when_local_app_data_is_unwritable(self):
         with tempfile.TemporaryDirectory() as temp_name:

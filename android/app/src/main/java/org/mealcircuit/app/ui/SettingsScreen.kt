@@ -206,5 +206,6 @@ fun SettingsScreen(viewModel: MainViewModel) {
                 }
             }
         }
+        LegalSettingsEntry()
     }
 }

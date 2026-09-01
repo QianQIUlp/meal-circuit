@@ -3,6 +3,7 @@ name: test
 on:
   push:
     branches: [main]
+    tags: ["v*"]
   pull_request:
 
 concurrency:
@@ -51,7 +52,10 @@ jobs:
       - run: uv run python tools/dependency_check.py
       - run: uv run python tools/generate_openapi.py --check
       - run: uv run python tools/validate_protocol.py
+      - run: uv run python tools/distribution_check.py
+      - run: uv run python tools/generate_sbom.py --output "$RUNNER_TEMP/mealcircuit-locks.cdx.json"
       - run: uv run python -m unittest tests.test_release_workflow -v
+      - run: uv run python -m unittest tests.test_release_sbom -v
 
   python-base:
     needs: contract
@@ -220,9 +224,9 @@ jobs:
       - run: uv export --locked --extra desktop --no-dev --no-emit-project --format requirements-txt --output-file "$RUNNER_TEMP/desktop-resolved.txt"
       - run: uv run pip-audit --requirement "$RUNNER_TEMP/desktop-resolved.txt"
       - run: uv run python tools/dependency_check.py
-      - uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
+      - run: uv run python tools/generate_sbom.py --output mealcircuit-locks.cdx.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          path: .
-          format: cyclonedx-json
-          output-file: mealcircuit-source.cdx.json
-          artifact-name: mealcircuit-source-sbom
+          name: mealcircuit-lock-sbom
+          path: mealcircuit-locks.cdx.json
+          if-no-files-found: error

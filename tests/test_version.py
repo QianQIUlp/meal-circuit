@@ -10,8 +10,8 @@ from tools.version import android_version_code, check, project_version
 class VersionContractTest(unittest.TestCase):
     def test_pyproject_version_is_the_android_input(self) -> None:
         version = project_version()
-        self.assertEqual(version, "0.3.0")
-        self.assertEqual(android_version_code(version), 30000)
+        self.assertEqual(version, "0.3.1")
+        self.assertEqual(android_version_code(version), 30001)
         self.assertEqual(android_version_code("0.3.1"), 30001)
 
     def test_invalid_semver_is_rejected(self) -> None:
@@ -22,7 +22,7 @@ class VersionContractTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             output = Path(temp) / "github-output"
             check(f"v{project_version()}", output)
-            self.assertEqual(output.read_text(encoding="utf-8"), "version=0.3.0\n")
+            self.assertEqual(output.read_text(encoding="utf-8"), "version=0.3.1\n")
 
 
 if __name__ == "__main__":

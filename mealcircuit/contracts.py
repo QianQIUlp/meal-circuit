@@ -1,24 +1,16 @@
 from __future__ import annotations
 
 import json
-import sys
-import sysconfig
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
+from .resources import resource_roots
 from .validation import ValidationError
 
 
 def _contract_roots() -> tuple[Path, ...]:
-    roots = [Path(__file__).resolve().parent.parent / "protocol"]
-    frozen_root = getattr(sys, "_MEIPASS", None)
-    if frozen_root:
-        roots.append(Path(frozen_root) / "protocol")
-    data_root = sysconfig.get_path("data")
-    if data_root:
-        roots.append(Path(data_root) / "share" / "mealcircuit" / "protocol")
-    return tuple(dict.fromkeys(roots))
+    return resource_roots("protocol")
 
 
 @lru_cache(maxsize=None)

@@ -1,6 +1,6 @@
 # Threat model
 
-This document describes implemented security boundaries for MealCircuit 0.3.0. The design has not received an independent third-party cryptographic audit.
+This document describes the implemented security boundaries for the current MealCircuit release. The design has not received an independent third-party cryptographic audit.
 
 ## Protected assets
 
@@ -11,11 +11,11 @@ This document describes implemented security boundaries for MealCircuit 0.3.0. T
 
 ## Trust boundaries
 
-The local operating system and unlocked user session are trusted. Desktop secrets use the OS keyring; if no secure backend exists, they are session-only and the recovery string is required again. Android uses Android Keystore to wrap secrets; only wrapped ciphertext is stored in a backup-excluded private preference file. Local SQLite/Room and asset files rely on OS disk/application sandbox encryption and are not SQLCipher-encrypted.
+The local operating system and unlocked user session are trusted. Desktop sync recovery and authentication secrets use the OS keyring; if no secure backend exists, they are session-only and the recovery string is required again. Model-provider API keys remain only in the current Python process and are never persisted to that keyring. Android uses Android Keystore to wrap sync secrets; only wrapped ciphertext is stored in a backup-excluded private preference file. Local SQLite/Room and asset files rely on OS disk/application sandbox encryption and are not SQLCipher-encrypted.
 
 The sync host, database, blob volume, backups and reverse proxy are treated as honest-but-curious for confidentiality. TLS is still mandatory outside explicit localhost debug because E2EE does not hide tokens, account/device metadata or traffic patterns.
 
-Configured AI providers receive only the task/context the user explicitly sends from that device. API keys never enter Domain data, Portable Data or sync.
+Configured AI providers receive only the current task or Agent-stage context from that device, plus the uploaded image for a photo task. Transmission happens when the user invokes generation and, after the user has explicitly enabled and configured a provider, may also happen when new Today facts trigger the documented debounced draft refresh. API keys never enter Domain data, Portable Data or sync.
 
 ## Addressed threats
 
@@ -44,4 +44,4 @@ Configured AI providers receive only the task/context the user explicitly sends 
 - Metadata and plaintext may exist in OS swap, crash dumps, accessibility services or user-created screenshots outside application control.
 - During a Python Portable Data apply, sibling staging/rollback directories beside `MEALCIRCUIT_HOME` temporarily contain local SQLite/config snapshots and managed assets in plaintext. They inherit local user permissions, are removed after commit/recovery, and are protected only by the same OS boundary as the live local profile.
 
-Report vulnerabilities through the repository host's private advisory flow using only synthetic data. Do not publish exploit details containing real health records.
+Report vulnerabilities through the repository host's private advisory flow using only synthetic data. Tagged releases are blocked while that channel is disabled; never move vulnerability details to a public issue, and do not publish exploit details containing real health records.

@@ -95,11 +95,13 @@ def check_version_sources() -> None:
     gradle = (ROOT / "android" / "app" / "build.gradle.kts").read_text(encoding="utf-8")
     if 'providers.gradleProperty("mealcircuitVersion").orElse' in gradle:
         raise SystemExit("Android version must not have an independent default")
-    if "versionCode = 30000" in gradle or 'versionName = "0.3.0"' in gradle:
+    if re.search(r"\bversionCode\s*=\s*\d+\b", gradle) or re.search(
+        r'\bversionName\s*=\s*["\']\d+\.\d+\.\d+["\']', gradle
+    ):
         raise SystemExit("Android version must be derived from the contract output")
 
     inno = (ROOT / "packaging" / "windows" / "MealCircuit.iss").read_text(encoding="utf-8")
-    if '#define MyAppVersion "0.3.0"' in inno or "#error MyAppVersion" not in inno:
+    if re.search(r'^\s*#define\s+MyAppVersion\s+"\d+\.\d+\.\d+"', inno, re.MULTILINE) or "#error MyAppVersion" not in inno:
         raise SystemExit("Inno Setup must require the workflow-provided version")
 
     setup_uv = re.findall(
@@ -114,7 +116,11 @@ def check_version_sources() -> None:
         raise SystemExit(f"all setup-uv jobs must use 0.8.22, found: {setup_uv}")
 
     for workflow in sorted((ROOT / ".github" / "workflows").glob("*.y*ml")):
-        if re.search(r"^\s*VERSION:\s*0\.3\.0\s*$", workflow.read_text(encoding="utf-8"), re.MULTILINE):
+        if re.search(
+            r'^\s*VERSION:\s*["\']?v?\d+\.\d+\.\d+["\']?\s*$',
+            workflow.read_text(encoding="utf-8"),
+            re.MULTILINE,
+        ):
             raise SystemExit(f"{workflow}: workflow version must come from the contract job")
 
     for workflow in sorted((ROOT / ".github" / "workflows").glob("*.y*ml")):
@@ -149,22 +155,10 @@ def check_container_pins() -> None:
 
 def check_release_tools() -> None:
     workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
-    if not re.search(r"APPIMAGETOOL_X86_64_SHA256: [0-9a-f]{64}", workflow):
-        raise SystemExit("AppImage build tool SHA-256 is not pinned")
-    if "sha256sum --check --strict" not in workflow:
-        raise SystemExit("AppImage build tool checksum is not enforced")
     check_release_workflow(workflow)
 
 
 def check_release_workflow(workflow: str) -> None:
-    forbidden_desktop_gates = (
-        "Require Authenticode secrets for tagged releases",
-        "Require Apple signing secrets for tagged releases",
-    )
-    for name in forbidden_desktop_gates:
-        if name in workflow:
-            raise SystemExit(f"Desktop tagged releases must not hard-fail on missing signing credentials: {name}")
-
     windows_match = re.search(
         r"(?ms)^  windows:\n.*?(?=^  [A-Za-z0-9_-]+:\n)",
         workflow,
@@ -203,6 +197,13 @@ def check_release_workflow(workflow: str) -> None:
             "unins000.exe",
             "if (Test-Path $installDir) { throw",
         ),
+        "Windows packaged WebView is exercised": (
+            "- name: Exercise the packaged Windows WebView",
+            '-ArgumentList "--ui-smoke-test" -PassThru',
+            "$process.WaitForExit(70000)",
+            "Stop-Process -Id $process.Id -Force",
+            "Packaged Windows WebView smoke test failed with exit code",
+        ),
         "Windows artifact upload fails closed": (
             "name: desktop-windows",
             "if-no-files-found: error",
@@ -217,12 +218,6 @@ def check_release_workflow(workflow: str) -> None:
             "WINDOWS_SIGNING_AVAILABLE: ${{ secrets.WINDOWS_CERTIFICATE_BASE64 != '' "
             "&& secrets.WINDOWS_CERTIFICATE_PASSWORD != '' }}"
         ),
-        "APPLE_SIGNING_AVAILABLE": (
-            "APPLE_SIGNING_AVAILABLE: ${{ secrets.APPLE_CERTIFICATE_BASE64 != '' "
-            "&& secrets.APPLE_CERTIFICATE_PASSWORD != '' && secrets.APPLE_SIGNING_IDENTITY != '' "
-            "&& secrets.APPLE_ID != '' && secrets.APPLE_APP_PASSWORD != '' "
-            "&& secrets.APPLE_TEAM_ID != '' }}"
-        ),
         "ANDROID_SIGNING_AVAILABLE": (
             "ANDROID_SIGNING_AVAILABLE: ${{ secrets.ANDROID_KEYSTORE_BASE64 != '' "
             "&& secrets.ANDROID_KEYSTORE_PASSWORD != '' && secrets.ANDROID_KEY_ALIAS != '' "
@@ -234,29 +229,37 @@ def check_release_workflow(workflow: str) -> None:
             raise SystemExit(f"{variable} must require its complete credential set")
 
     required_snippets = {
-        "Windows unsigned tagged-release warning": (
-            "- name: Warn when Windows tagged release is unsigned",
+        "Windows signing is mandatory for tagged releases": (
+            "- name: Require Authenticode secrets for tagged releases",
             "if: startsWith(github.ref, 'refs/tags/v') && env.WINDOWS_SIGNING_AVAILABLE != 'true'",
+            'throw "Tagged releases require complete Windows Authenticode signing secrets."',
         ),
-        "Apple unsigned tagged-release warning": (
-            "- name: Warn when macOS tagged release lacks Developer ID signing",
-            "if: startsWith(github.ref, 'refs/tags/v') && env.APPLE_SIGNING_AVAILABLE != 'true'",
-        ),
-        "Android tagged-release omission policy": (
-            "- name: Warn when Android assets are omitted from unsigned tagged release",
+        "Android signing is mandatory for tagged releases": (
+            "- name: Require Android signing secrets for tagged releases",
             "if: startsWith(github.ref, 'refs/tags/v') && env.ANDROID_SIGNING_AVAILABLE != 'true'",
-            "Android APK and AAB are omitted from this tagged release",
-            "if: ${{ !startsWith(github.ref, 'refs/tags/v') || env.ANDROID_SIGNING_AVAILABLE == 'true' }}",
-            "if-no-files-found: error",
+            "Tagged releases require complete Android signing secrets.",
         ),
-        "Android strict AAB signer verification": (
-            "- name: Verify Android signatures when configured",
+        "Android signer continuity and strict AAB verification": (
+            "EXPECTED_ANDROID_SIGNER_SHA256: \"1A:87:F4:05:CA:18:9B:1D:B2:63:44:A9:71:55:18:C9:12:4C:66:D5:D8:00:04:CA:75:A5:9F:EA:36:25:3C:37\"",
+            "- name: Verify Android signer continuity and AAB signature",
             "ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}",
             "ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}",
+            "apksigner\" verify --verbose --print-certs",
+            'if [[ "${apk_fingerprints[0]}" != "$expected_fingerprint" ]];',
+            "keytool -exportcert \\",
+            "keystore_fingerprint=$(sha256sum",
+            '[[ "$keystore_fingerprint" != "$expected_fingerprint" ]]',
             "jarsigner -verify -strict \\",
             "-keystore \"$RUNNER_TEMP/mealcircuit.jks\" \\",
             "-storepass \"$ANDROID_KEYSTORE_PASSWORD\" \\",
             "android/app/build/outputs/bundle/release/app-release.aab \"$ANDROID_KEY_ALIAS\"",
+        ),
+        "unsigned Android validation builds cannot enter a tag": (
+            "- name: Normalize the Android APK path for unsigned validation builds",
+            "if: env.ANDROID_SIGNING_AVAILABLE != 'true'",
+            'if [[ "$GITHUB_REF" == refs/tags/v* ]]; then',
+            "app-release-unsigned.apk",
+            'install -m 644 "$unsigned_apk" "$canonical_apk"',
         ),
         "Android release assets are flattened": (
             "- name: Stage Android release assets",
@@ -265,13 +268,101 @@ def check_release_workflow(workflow: str) -> None:
             "install -m 644 android/app/build/outputs/bundle/release/app-release.aab \"$RUNNER_TEMP/android-release/app-release.aab\"",
             "path: ${{ runner.temp }}/android-release/*",
         ),
-        "release build dependencies": (
-            "needs: [contract, windows, macos-universal, linux, android]",
+        "final Android artifacts contain verified legal assets": (
+            "- name: Verify legal assets in final Android artifacts",
+            "python tools/android_artifact_legal_check.py --license LICENSE \\",
+            "android/app/build/outputs/apk/release/app-release.apk \\",
+            "android/app/build/outputs/bundle/release/app-release.aab",
+        ),
+        "maintained platform artifact uploads fail closed": (
+            "name: desktop-windows\n          if-no-files-found: error",
+            "name: android-release\n          if-no-files-found: error",
+        ),
+        "tagged release waits for the complete test workflow": (
+            "quality-gate:",
+            "Require private vulnerability reporting for tagged releases",
+            'gh api "repos/$GITHUB_REPOSITORY/private-vulnerability-reporting" --jq \'.enabled\'',
+            "Tagged releases require GitHub private vulnerability reporting to be enabled.",
+            "Wait for the complete test workflow on this tag commit",
+            "--workflow test.yml",
+            '--commit "$GITHUB_SHA"',
+            "--json status,conclusion,url,createdAt,headBranch",
+            "map(select(.headBranch == env.GITHUB_REF_NAME))",
+            '[[ "$conclusion" == "success" ]] && exit 0',
+            "deadline=$((SECONDS + 10800))",
+            "needs: [contract, quality-gate, windows, android]",
+        ),
+        "release downloads only final platform artifacts": (
+            "name: desktop-windows\n          path: release-assets",
+            "name: android-release\n          path: release-assets",
+            "Verify the exact final artifact manifest",
+            '"MealCircuit-$VERSION-windows-x64-portable.zip"',
+            '"MealCircuit-$VERSION-windows-x64-setup.exe"',
+            '"app-release.apk"',
+            '"app-release.aab"',
+        ),
+        "release uses the lock-derived SBOM": (
+            "Generate lock-derived CycloneDX SBOM",
+            'python tools/generate_sbom.py --output "release-assets/MealCircuit-v$VERSION.cdx.json"',
+        ),
+        "final desktop artifacts contain verified legal bundles and execute": (
+            "desktop_licenses.py collect",
+            "desktop_licenses.py verify",
+            'verify --project-root . --artifact-root "$portableRoot\\MealCircuit"',
+            "verify --project-root . --artifact-root $installDir",
         ),
     }
     for policy, snippets in required_snippets.items():
         if any(snippet not in workflow for snippet in snippets):
             raise SystemExit(f"Release workflow is missing required policy: {policy}")
+
+    if "merge-multiple: true" in workflow:
+        raise SystemExit("Release workflow must not merge intermediate artifacts into the release")
+    if "anchore/sbom-action" in workflow:
+        raise SystemExit("Release workflow must use the lock-derived SBOM, not artifact binary scanning")
+    if workflow.count("- name: Collect locked desktop license texts") != 1:
+        raise SystemExit("Release workflow must collect licenses from the maintained Windows environment")
+
+    obsolete_release_content = (
+        "  macos-build:\n",
+        "  macos-universal:\n",
+        "  linux:\n",
+        "APPLE_SIGNING_AVAILABLE",
+        "desktop-macos",
+        "desktop-linux",
+        "macos-universal.dmg",
+        "linux-x86_64.AppImage",
+        "APPIMAGETOOL_X86_64_SHA256",
+    )
+    if any(snippet in workflow for snippet in obsolete_release_content):
+        raise SystemExit("Release workflow must target only Windows x64 and Android")
+
+    manifest = re.search(
+        r'(?ms)- name: Verify the exact final artifact manifest\n.*?expected=\(\n(?P<assets>.*?)^\s*\)\n',
+        workflow,
+    )
+    if not manifest:
+        raise SystemExit("Release workflow is missing the exact final artifact manifest")
+    actual_assets = re.findall(r'^\s*"([^"]+)"\s*$', manifest.group("assets"), re.MULTILINE)
+    expected_assets = [
+        "MealCircuit-$VERSION-windows-x64-portable.zip",
+        "MealCircuit-$VERSION-windows-x64-setup.exe",
+        "app-release.apk",
+        "app-release.aab",
+    ]
+    if actual_assets != expected_assets:
+        raise SystemExit("Release artifact manifest must contain exactly Windows x64 and Android assets")
+
+    test_workflow = (ROOT / ".github" / "workflows" / "test.yml").read_text(encoding="utf-8")
+    if not re.search(r'(?ms)^\s*push:\s*\n\s*branches:\s*\[main\]\s*\n\s*tags:\s*\["v\*"\]', test_workflow):
+        raise SystemExit("The complete test workflow must run for release tags")
+    for required_gate in (
+        "tools/distribution_check.py",
+        "tools/generate_sbom.py",
+        "tests.test_release_sbom",
+    ):
+        if required_gate not in test_workflow or required_gate not in workflow:
+            raise SystemExit(f"Both tag paths must enforce the release gate: {required_gate}")
 
 
 def check_workflow_action_pins() -> None:

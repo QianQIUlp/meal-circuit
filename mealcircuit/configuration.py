@@ -8,8 +8,8 @@ from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .meal_modes import legacy_home_meal_modes, meal_modes_are_valid
+from .resources import resource_path
 from .storage import (
-    ROOT,
     app_home,
     core_rules_path,
     db_path,
@@ -219,8 +219,8 @@ def initialize_private_home() -> dict:
     created: list[str] = []
     skipped: list[str] = []
     templates = {
-        ROOT / "templates" / "profile.md": profile_path(),
-        ROOT / "templates" / "settings.json": settings_path(),
+        resource_path("templates", "profile.md"): profile_path(),
+        resource_path("templates", "settings.json"): settings_path(),
     }
     for source, target in templates.items():
         if target.exists():
@@ -241,7 +241,9 @@ def configuration_status() -> dict:
     settings_ok = False
     settings_error = None
     try:
-        load_settings()
+        # An unset protein target is an intentional onboarding state. Doctor
+        # should distinguish it from a malformed settings file.
+        load_settings(allow_missing_protein=True)
         settings_ok = True
     except ValidationError as exc:
         settings_error = str(exc)

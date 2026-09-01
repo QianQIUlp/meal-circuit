@@ -1604,6 +1604,15 @@ class RenderContractTest(unittest.TestCase):
         self.assertIn("蛋白目标 未知", page)
 
 
+class AndroidBoundaryTest(unittest.TestCase):
+    def test_android_does_not_expose_local_task_generation(self):
+        root = Path(__file__).resolve().parents[1]
+        view_model = (root / "android/app/src/main/java/org/mealcircuit/app/MainViewModel.kt").read_text(encoding="utf-8")
+        capture_screen = (root / "android/app/src/main/java/org/mealcircuit/app/ui/CaptureScreen.kt").read_text(encoding="utf-8")
+        self.assertNotIn("fun generateLatestTask", view_model)
+        self.assertNotIn("使用本设备配置的 AI 处理最新任务", capture_screen)
+
+
 class WebAppTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()

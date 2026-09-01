@@ -878,7 +878,7 @@ wheels = [
 
 [[package]]
 name = "mealcircuit"
-version = "0.3.0"
+version = "0.3.1"
 source = { editable = "." }
 dependencies = [
     { name = "tzdata", marker = "sys_platform == 'win32'" },

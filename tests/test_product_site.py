@@ -101,6 +101,25 @@ class ProductSiteTest(unittest.TestCase):
         self.assertTrue((SITE / "site.webmanifest").is_file())
         self.assertTrue((SITE / "favicon.svg").is_file())
 
+    def test_release_identity_and_planning_boundary_are_current(self):
+        english = (SITE / "index.html").read_text(encoding="utf-8")
+        chinese = (SITE / "zh" / "index.html").read_text(encoding="utf-8")
+        self.assertIn("releases/tag/v0.3.1", english)
+        self.assertIn("releases/tag/v0.3.1", chinese)
+        self.assertIn("RELEASE 0.3.1", english)
+        self.assertIn("0.3.1 正式版", chinese)
+        self.assertNotIn("releases/tag/v0.3.0", english)
+        self.assertNotIn("releases/tag/v0.3.0", chinese)
+        self.assertIn("No bundled planner model", english)
+        self.assertIn("不捆绑规划模型", chinese)
+        self.assertIn("Android consumes reviewed plans", english)
+        self.assertIn("Android 只消费", chinese)
+        self.assertIn("Windows x64 · Android", english)
+        self.assertIn("Windows x64 · Android", chinese)
+        for retired_platform in ("macOS", "Linux", "AppImage", ".dmg"):
+            self.assertNotIn(retired_platform, english)
+            self.assertNotIn(retired_platform, chinese)
+
 
 if __name__ == "__main__":
     unittest.main()
